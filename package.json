@@ -1,0 +1,32 @@
+{
+  "name": "resend-mail-api",
+  "version": "1.0.0",
+  "description": "Resend 邮件收件箱：入站 Webhook + D1 + R2 附件 + 简化 Gmail 风格网页",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "db:migrate": "wrangler d1 execute resend-webhooks-db --file=./schema.sql --remote",
+    "db:migrate:local": "wrangler d1 execute resend-webhooks-db --file=./schema.sql --local"
+  },
+  "keywords": [
+    "cloudflare",
+    "workers",
+    "resend",
+    "email",
+    "d1",
+    "r2"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260907.1",
+    "@types/node": "^26.4.1",
+    "typescript": "^7.0.2",
+    "wrangler": "^4.129.0"
+  },
+  "dependencies": {
+    "resend": "^6.26.0"
+  }
+}

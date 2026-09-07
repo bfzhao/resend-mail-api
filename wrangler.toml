@@ -1,0 +1,26 @@
+name = "resend-mail-api"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "resend-webhooks-db"
+database_id = "cc445fd1-20b6-44c5-872f-5acf78834313"
+
+[[r2_buckets]]
+binding = "BUCKET"
+bucket_name = "resend-mail-attachments"
+
+# SPA 静态目录：所有请求先到 Worker（做 Basic Auth），未命中 /api、/webhook、/health 时回退到静态资源
+[assets]
+directory = "./public"
+binding = "ASSETS"
+run_worker_first = true
+not_found_handling = "none"
+
+[vars]
+SEND_FROM_ADDRESS = "support@notionmanager.com"
+SEND_FROM_NAME = "support"
+
+[dev]
+port = 8787

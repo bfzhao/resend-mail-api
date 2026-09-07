@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="referrer" content="no-referrer" />
+  <title>收件箱</title>
+  <link rel="icon" href="data:," />
+  <link rel="stylesheet" href="/app.css" />
+</head>
+<body>
+  <div id="app">
+    <aside id="sidebar">
+      <button id="compose-btn" class="btn btn-primary compose-btn" type="button">写信</button>
+      <nav id="folder-nav"></nav>
+      <div id="sidebar-status" hidden>未连接 API</div>
+    </aside>
+
+    <main id="main">
+      <header id="topbar">
+        <div id="back-btn-wrap" class="hidden">
+          <button id="back-btn" class="btn" type="button">‹ 返回</button>
+        </div>
+        <div id="search-box">
+          <input id="search-input" type="search" placeholder="搜索邮件…" autocomplete="off" />
+        </div>
+        <div id="topbar-actions" class="hidden"></div>
+      </header>
+
+      <section id="view-list" class="view">
+        <div id="select-bar" class="hidden">
+          <label><input type="checkbox" id="select-all" /> 全选</label>
+          <span id="selected-count"></span>
+          <span id="bulk-actions" class="spacer"></span>
+        </div>
+        <div id="list" class="list"></div>
+        <div id="list-empty" class="empty hidden">这里还没有邮件</div>
+        <div id="list-more" class="list-more hidden"></div>
+      </section>
+
+      <section id="view-read" class="view hidden">
+        <div id="read-message"></div>
+      </section>
+    </main>
+  </div>
+
+  <div id="modal-mask" class="hidden">
+    <div id="composer" role="dialog" aria-label="写信">
+      <div id="composer-title">写信</div>
+      <label>收件人 <input id="f-to" type="text" placeholder="name@example.com" /></label>
+      <label>主题 <input id="f-subject" type="text" /></label>
+      <label>内容
+        <textarea id="f-body" rows="12" placeholder="在此输入邮件正文…"></textarea>
+      </label>
+      <div class="composer-actions">
+        <span id="composer-info"></span>
+        <button id="composer-cancel" class="btn" type="button">取消</button>
+        <button id="composer-send" class="btn btn-primary" type="button">发送</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="hidden"></div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
