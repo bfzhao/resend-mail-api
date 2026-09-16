@@ -4,3 +4,4 @@ dist/
 .devlogs/
 .dev.vars
 *.log
+.workbuddy-ai/

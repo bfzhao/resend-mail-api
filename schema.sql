@@ -6,7 +6,9 @@ CREATE TABLE IF NOT EXISTS messages (
     direction     TEXT NOT NULL CHECK (direction IN ('inbound','outbound')),
     message_id    TEXT,                             -- RFC5322 Message-ID
     in_reply_to   TEXT,                             -- 原信 Message-ID (回信时填充)
-    "references"  TEXT,                             -- 原始 References (留线程扩展位)
+    "references"  TEXT,                             -- 原始 References (线程归组用)
+    thread_id     TEXT,                             -- 会话根 id（References 最根 token）
+    mailbox       TEXT NOT NULL DEFAULT '',         -- 所属收件地址（如 support@example.com）
     from_name     TEXT,
     from_email    TEXT,
     to_emails     TEXT NOT NULL DEFAULT '[]',       -- JSON 数组
@@ -26,11 +28,15 @@ CREATE TABLE IF NOT EXISTS messages (
     updated_at    INTEGER NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_messages_inbox  ON messages(deleted, received_at DESC) WHERE direction='inbound';
-CREATE INDEX IF NOT EXISTS idx_messages_sent   ON messages(deleted, received_at DESC) WHERE direction='outbound';
+CREATE INDEX IF NOT EXISTS idx_messages_inbox  ON messages(mailbox, deleted, received_at DESC) WHERE direction='inbound';
+CREATE INDEX IF NOT EXISTS idx_messages_sent   ON messages(mailbox, deleted, received_at DESC) WHERE direction='outbound';
 CREATE INDEX IF NOT EXISTS idx_messages_star   ON messages(deleted, received_at DESC, starred) WHERE starred=1;
 CREATE INDEX IF NOT EXISTS idx_messages_trash  ON messages(deleted, received_at DESC) WHERE deleted=1;
 CREATE INDEX IF NOT EXISTS idx_messages_resend ON messages(resend_id) WHERE resend_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_id, received_at);
+CREATE INDEX IF NOT EXISTS idx_messages_mailbox ON messages(mailbox, received_at DESC);
+-- 同一封 Resend 收信(email_id)只入一条（并发/重复投递兜底）
+CREATE UNIQUE INDEX IF NOT EXISTS uq_messages_inbound_resend ON messages(resend_id) WHERE direction='inbound' AND resend_id IS NOT NULL;
 
 -- 附件元数据表（二进制内容在 R2）
 CREATE TABLE IF NOT EXISTS attachments (

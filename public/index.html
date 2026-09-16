@@ -12,50 +12,103 @@
   <div id="app">
     <aside id="sidebar">
       <button id="compose-btn" class="btn btn-primary compose-btn" type="button">写信</button>
+      <div id="mailbox-wrap" class="hidden">
+        <select id="mailbox-select" title="切换收件地址"></select>
+      </div>
       <nav id="folder-nav"></nav>
       <div id="sidebar-status" hidden>未连接 API</div>
     </aside>
 
-    <main id="main">
+    <div id="workspace">
       <header id="topbar">
-        <div id="back-btn-wrap" class="hidden">
-          <button id="back-btn" class="btn" type="button">‹ 返回</button>
-        </div>
         <div id="search-box">
           <input id="search-input" type="search" placeholder="搜索邮件…" autocomplete="off" />
         </div>
         <div id="topbar-actions" class="hidden"></div>
       </header>
 
-      <section id="view-list" class="view">
-        <div id="select-bar" class="hidden">
-          <label><input type="checkbox" id="select-all" /> 全选</label>
-          <span id="selected-count"></span>
-          <span id="bulk-actions" class="spacer"></span>
-        </div>
-        <div id="list" class="list"></div>
-        <div id="list-empty" class="empty hidden">这里还没有邮件</div>
-        <div id="list-more" class="list-more hidden"></div>
-      </section>
+      <div id="main-split">
+        <!-- 左：邮件清单 -->
+        <section id="list-pane">
+          <div id="list-head">
+            <div id="list-title"></div>
+            <label id="select-all-wrap" title="全选当前页">
+              <input type="checkbox" id="select-all" />
+              <span>全选本页</span>
+            </label>
+            <div id="list-bulk" class="hidden">
+              <span id="selected-count"></span>
+              <span id="bulk-actions"></span>
+            </div>
+          </div>
+          <div id="list" class="list"></div>
+          <div id="list-empty" class="empty hidden">这里还没有邮件</div>
+          <div id="list-more" class="list-more hidden"></div>
+        </section>
 
-      <section id="view-read" class="view hidden">
-        <div id="read-message"></div>
-      </section>
-    </main>
+        <!-- 右：邮件详情 -->
+        <section id="read-pane">
+          <div id="read-placeholder" class="read-placeholder">
+            <div class="ph-title">选择一封邮件以阅读</div>
+            <div class="ph-hint">从左侧列表中选择，或用 ↑ ↓ 键浏览</div>
+          </div>
+          <article id="read-message" class="read-message hidden"></article>
+        </section>
+      </div>
+    </div>
   </div>
 
   <div id="modal-mask" class="hidden">
     <div id="composer" role="dialog" aria-label="写信">
       <div id="composer-title">写信</div>
-      <label>收件人 <input id="f-to" type="text" placeholder="name@example.com" /></label>
+      <div class="composer-row">
+        <label class="grow">收件人 <input id="f-to" type="text" placeholder="name@example.com" /></label>
+        <label id="f-mailbox-label" class="auto-label hidden">发件人
+          <select id="f-mailbox"></select>
+        </label>
+      </div>
       <label>主题 <input id="f-subject" type="text" /></label>
-      <label>内容
+
+      <div class="composer-body-wrap">
+        <div id="rich-toolbar" class="rich-toolbar hidden">
+          <button type="button" data-cmd="bold" title="加粗"><b>B</b></button>
+          <button type="button" data-cmd="italic" title="斜体"><i>I</i></button>
+          <button type="button" data-cmd="underline" title="下划线"><u>U</u></button>
+          <span class="sep"></span>
+          <button type="button" data-cmd="insertUnorderedList" title="无序列表">• 列表</button>
+          <button type="button" data-cmd="insertOrderedList" title="有序列表">1. 列表</button>
+          <button type="button" data-cmd="createLink" title="插入链接">链接</button>
+          <span class="sep"></span>
+          <button type="button" data-cmd="removeFormat" title="清除格式">清除格式</button>
+        </div>
         <textarea id="f-body" rows="12" placeholder="在此输入邮件正文…"></textarea>
-      </label>
+        <div id="f-body-rich" class="rich-editor hidden" contenteditable="true" data-placeholder="在此输入邮件正文…"></div>
+      </div>
+
+      <div class="composer-row">
+        <button id="f-mode" class="btn" type="button">切换 HTML 富文本</button>
+        <button id="f-quote" class="btn hidden" type="button">引用原文</button>
+        <span class="grow"></span>
+        <label class="att-pick btn" title="添加附件">＋ 附件
+          <input id="f-attachments" type="file" multiple hidden />
+        </label>
+      </div>
+      <div id="f-attach-list" class="attach-list"></div>
+
       <div class="composer-actions">
         <span id="composer-info"></span>
         <button id="composer-cancel" class="btn" type="button">取消</button>
         <button id="composer-send" class="btn btn-primary" type="button">发送</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="confirm-mask" class="hidden">
+    <div id="confirm-box" role="dialog" aria-modal="true" aria-labelledby="confirm-text">
+      <div id="confirm-text"></div>
+      <div class="confirm-actions">
+        <button id="confirm-cancel" class="btn btn-primary" type="button">继续编辑</button>
+        <button id="confirm-ok" class="btn btn-danger" type="button">放弃</button>
       </div>
     </div>
   </div>

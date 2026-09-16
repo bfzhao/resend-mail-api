@@ -69,6 +69,24 @@ export function stripAngle(s: string | null | undefined): string | null {
   return t || null;
 }
 
+/**
+ * 会话根：References 链里最靠前的那条 Message-ID（整条线程共享），
+ * 取不到时回退到 in_reply_to / 自身 message_id。结果去掉尖括号便于归组。
+ */
+export function rootThreadId(opts: { references?: string | null; inReplyTo?: string | null; messageId?: string | null; fallback?: string }): string {
+  const refs = (opts.references || '').trim();
+  if (refs) {
+    const first = refs.split(/\s+/)[0];
+    const root = stripAngle(first);
+    if (root) return root;
+  }
+  const inReply = stripAngle(opts.inReplyTo);
+  if (inReply) return inReply;
+  const own = stripAngle(opts.messageId);
+  if (own) return own;
+  return opts.fallback ?? '';
+}
+
 /** 从 header 数组里按名称(大小写不敏感)取值，可能有多个重复名。 */
 export function headerValue(headers: unknown, name: string): string | null {
   if (!Array.isArray(headers)) return null;
@@ -81,6 +99,16 @@ export function headerValue(headers: unknown, name: string): string | null {
         if (v) return v;
       }
     }
+  }
+  return null;
+}
+
+/** 从 headers 对象(键名不定大小写)里取值。 */
+export function headerValueMap(headers: Record<string, unknown> | null | undefined, name: string): string | null {
+  if (!headers) return null;
+  const lname = name.toLowerCase();
+  for (const [k, v] of Object.entries(headers)) {
+    if (k.toLowerCase() === lname && v != null) return String(v);
   }
   return null;
 }

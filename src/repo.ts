@@ -12,7 +12,12 @@ export interface PreparedAttachment {
 
 export interface InboundInput {
   rowId: string;
+  resendId: string;                          // Resend 的 email_id（入站幂等/去重）
   messageId: string | null;
+  inReplyTo: string | null;
+  references: string | null;
+  threadId: string;
+  mailbox: string;
   fromName: string | null;
   fromEmail: string | null;
   to: string[];
@@ -30,6 +35,8 @@ export interface OutboundInput {
   messageId?: string | null;
   inReplyTo: string | null;
   references: string | null;
+  threadId: string;
+  mailbox: string;
   fromName: string | null;
   fromEmail: string | null;
   to: string[];
@@ -48,6 +55,7 @@ export interface ListOpts {
   folder: Folder;
   q?: string | null;
   unread?: boolean;
+  mailbox?: string;
   limit: number;
   offset: number;
 }
@@ -68,7 +76,12 @@ interface FolderRow {
 }
 
 /** 已存附件上传到 R2 后组装出的 DB 行参数已含于 attachments[]。 */
-function whereForFolder(folder: Folder, q: string | null | undefined, unread: boolean): { sql: string; params: unknown[] } {
+function whereForFolder(
+  folder: Folder,
+  q: string | null | undefined,
+  unread: boolean,
+  mailbox?: string
+): { sql: string; params: unknown[] } {
   const conds: string[] = [];
   const params: unknown[] = [];
   switch (folder) {
@@ -86,6 +99,10 @@ function whereForFolder(folder: Folder, q: string | null | undefined, unread: bo
       conds.push('deleted = 1');
       break;
   }
+  if (mailbox) {
+    conds.push('mailbox = ?');
+    params.push(mailbox);
+  }
   if (q) {
     const like = `%${q}%`;
     conds.push('(subject LIKE ? OR from_name LIKE ? OR from_email LIKE ? OR body_text LIKE ? OR to_emails LIKE ?)');
@@ -102,7 +119,7 @@ const LIST_SELECT = `SELECT
   FROM messages m`;
 
 export async function listFolder(env: Env, opts: ListOpts): Promise<{ items: FolderRow[]; total: number }> {
-  const w = whereForFolder(opts.folder, opts.q, opts.unread === true);
+  const w = whereForFolder(opts.folder, opts.q, opts.unread === true, opts.mailbox);
   const whereSql = w.sql ? `WHERE ${w.sql}` : '';
 
   const items = (
@@ -120,13 +137,20 @@ export async function listFolder(env: Env, opts: ListOpts): Promise<{ items: Fol
   return { items, total: totalRow };
 }
 
-export async function sidebarCounts(env: Env): Promise<{
+export async function sidebarCounts(env: Env, mailbox?: string): Promise<{
   inbox_unread: number;
   inbox_total: number;
   sent_total: number;
   starred_total: number;
   trash_total: number;
 }> {
+  const conds: string[] = [];
+  const params: unknown[] = [];
+  if (mailbox) {
+    conds.push('mailbox = ?');
+    params.push(mailbox);
+  }
+  const whereSql = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
   const row = await env.DB.prepare(
     `SELECT
       SUM(CASE WHEN direction='inbound' AND deleted=0 AND read=0 THEN 1 ELSE 0 END) AS inbox_unread,
@@ -134,8 +158,8 @@ export async function sidebarCounts(env: Env): Promise<{
       SUM(CASE WHEN direction='outbound' AND deleted=0 THEN 1 ELSE 0 END) AS sent_total,
       SUM(CASE WHEN starred=1 AND deleted=0 THEN 1 ELSE 0 END) AS starred_total,
       SUM(CASE WHEN deleted=1 THEN 1 ELSE 0 END) AS trash_total
-     FROM messages`
-  ).first<{ inbox_unread: number | null; inbox_total: number | null; sent_total: number | null; starred_total: number | null; trash_total: number | null }>();
+     FROM messages ${whereSql}`
+  ).bind(...params).first<{ inbox_unread: number | null; inbox_total: number | null; sent_total: number | null; starred_total: number | null; trash_total: number | null }>();
 
   return {
     inbox_unread: row?.inbox_unread ?? 0,
@@ -146,10 +170,77 @@ export async function sidebarCounts(env: Env): Promise<{
   };
 }
 
+/** 收件地址列表（含各地址未读数/总数），用于侧边栏切换。 */
+export async function mailboxes(env: Env): Promise<
+  Array<{ mailbox: string; inbox_unread: number; inbox_total: number; sent_total: number }>
+> {
+  const rows = await env.DB.prepare(
+    `SELECT
+       mailbox,
+       SUM(CASE WHEN direction='inbound' AND deleted=0 AND read=0 THEN 1 ELSE 0 END) AS inbox_unread,
+       SUM(CASE WHEN direction='inbound' AND deleted=0 THEN 1 ELSE 0 END) AS inbox_total,
+       SUM(CASE WHEN direction='outbound' AND deleted=0 THEN 1 ELSE 0 END) AS sent_total
+     FROM messages
+     WHERE mailbox IS NOT NULL AND mailbox != ''
+     GROUP BY mailbox
+     ORDER BY inbox_unread DESC, mailbox ASC`
+  ).all<{ mailbox: string; inbox_unread: number | null; inbox_total: number | null; sent_total: number | null }>();
+
+  const list = rows.results
+    .filter((r) => r.mailbox)
+    .map((r) => ({
+      mailbox: r.mailbox,
+      inbox_unread: r.inbox_unread ?? 0,
+      inbox_total: r.inbox_total ?? 0,
+      sent_total: r.sent_total ?? 0,
+    }));
+
+  // 无任何历史时给一个可用的默认地址（SEND_FROM_ADDRESS），前端隐藏选择器
+  return list;
+}
+
+/** 同一会话内的消息（升序），用于阅读视图上下文。 */
+export async function listThread(env: Env, threadId: string): Promise<
+  Array<{
+    id: string;
+    direction: string;
+    mailbox: string;
+    from_name: string | null;
+    from_email: string | null;
+    to_emails: string;
+    subject: string | null;
+    preview: string | null;
+    received_at: number;
+    read: number;
+    deleted: number;
+  }>
+> {
+  const rows = await env.DB.prepare(
+    `SELECT id, direction, mailbox, from_name, from_email, to_emails, subject,
+            substr(coalesce(NULLIF(body_text,''), ''), 1, 160) AS preview,
+            received_at, read, deleted
+     FROM messages
+     WHERE thread_id = ?
+     ORDER BY received_at ASC`
+  ).bind(threadId).all<{
+    id: string; direction: string; mailbox: string; from_name: string | null; from_email: string | null;
+    to_emails: string; subject: string | null; preview: string | null; received_at: number; read: number; deleted: number;
+  }>();
+  return rows.results;
+}
+
 export async function getMessage(env: Env, id: string): Promise<MessageRow | null> {
   return (
     (await env.DB.prepare('SELECT * FROM messages WHERE id = ?').bind(id).first<MessageRow>()) ?? null
   );
+}
+
+/** 按 Resend email_id 查找已入库的入站邮件（去重用）。 */
+export async function findInboundByResendId(env: Env, emailId: string): Promise<string | null> {
+  const row = await env.DB.prepare(
+    "SELECT id FROM messages WHERE direction = 'inbound' AND resend_id = ? LIMIT 1"
+  ).bind(emailId).first<{ id: string }>();
+  return row?.id ?? null;
 }
 
 export async function listAttachments(env: Env, messageId: string): Promise<AttachmentRow[]> {
@@ -272,6 +363,8 @@ function insertMessageStmt(env: Env, row: {
   messageId: string | null;
   inReplyTo: string | null;
   references: string | null;
+  threadId: string;
+  mailbox: string;
   fromName: string | null;
   fromEmail: string | null;
   to: string[];
@@ -287,16 +380,18 @@ function insertMessageStmt(env: Env, row: {
 }): D1PreparedStatement {
   return env.DB.prepare(
     `INSERT INTO messages
-      (id, direction, message_id, in_reply_to, "references", from_name, from_email,
-       to_emails, cc, bcc, reply_to, subject, body_html, body_text, received_at,
-       status, resend_id, read, starred, deleted, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?)`
+      (id, direction, message_id, in_reply_to, "references", thread_id, mailbox,
+       from_name, from_email, to_emails, cc, bcc, reply_to, subject, body_html,
+       body_text, received_at, status, resend_id, read, starred, deleted, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?)`
   ).bind(
     row.id,
     row.direction,
     row.messageId,
     row.inReplyTo,
     row.references,
+    row.threadId,
+    row.mailbox,
     row.fromName,
     row.fromEmail,
     JSON.stringify(row.to),
@@ -321,8 +416,10 @@ export async function saveInbound(env: Env, input: InboundInput, deliveryEventId
       id: input.rowId,
       direction: 'inbound',
       messageId: input.messageId,
-      inReplyTo: null,
-      references: null,
+      inReplyTo: input.inReplyTo,
+      references: input.references,
+      threadId: input.threadId,
+      mailbox: input.mailbox,
       fromName: input.fromName,
       fromEmail: input.fromEmail,
       to: input.to,
@@ -334,7 +431,7 @@ export async function saveInbound(env: Env, input: InboundInput, deliveryEventId
       text: input.text,
       receivedAt: input.receivedAt,
       status: 'received',
-      resendId: null,
+      resendId: input.resendId,
     }),
   ];
 
@@ -366,6 +463,8 @@ export async function saveOutbound(env: Env, input: OutboundInput): Promise<stri
     messageId,
     inReplyTo: input.inReplyTo,
     references: input.references,
+    threadId: input.threadId,
+    mailbox: input.mailbox,
     fromName: input.fromName,
     fromEmail: input.fromEmail,
     to: input.to,
@@ -380,6 +479,18 @@ export async function saveOutbound(env: Env, input: OutboundInput): Promise<stri
     resendId: input.resendId,
   }).run();
   return rowId;
+}
+
+/** 为某封邮件追加附件记录（出站附件已在 R2）。 */
+export async function insertOutboundAttachments(env: Env, messageId: string, files: Array<{ filename: string; contentType: string; size: number; r2Key: string }>): Promise<void> {
+  if (!files.length) return;
+  const stmts = files.map((f) =>
+    env.DB.prepare(
+      `INSERT INTO attachments (id, message_id, r2_key, filename, content_type, size, inline, content_id, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, 0, NULL, ?)`
+    ).bind(uuid(), messageId, f.r2Key, f.filename, f.contentType, f.size, nowSec())
+  );
+  await env.DB.batch(stmts);
 }
 
 /** 附件元数据表存在性（供代理读取用）。 */

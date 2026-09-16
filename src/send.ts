@@ -9,11 +9,30 @@ export function textToHtml(text: string): string {
     .join('<br>');
 }
 
-function buildFrom(env: Env): string {
+export function buildFrom(env: Env): string {
   const name = (env.SEND_FROM_NAME || '').trim();
   const addr = (env.SEND_FROM_ADDRESS || '').trim();
   if (!addr) return '';
   return name ? `${name} <${addr}>` : addr;
+}
+
+/** 按指定邮箱构建发件人；若该邮箱域名不属于默认发送域名则回退默认发件人。 */
+export function senderFromMailbox(env: Env, mailbox: string): string {
+  const addr = (mailbox || '').trim().toLowerCase();
+  const def = (env.SEND_FROM_ADDRESS || '').trim().toLowerCase();
+  const defDomain = def.split('@')[1];
+  const mboxDomain = addr.split('@')[1];
+  const name = (env.SEND_FROM_NAME || '').trim();
+  if (addr && defDomain && mboxDomain === defDomain) {
+    return name ? `${name} <${addr}>` : addr;
+  }
+  return buildFrom(env);
+}
+
+export interface ResendAttachment {
+  filename: string;
+  content: string; // base64
+  content_type?: string;
 }
 
 interface ResendRequest {
@@ -23,13 +42,16 @@ interface ResendRequest {
   html?: string;
   text?: string;
   headers?: Record<string, string>;
+  attachments?: ResendAttachment[];
+  /** 发件人覆盖（如按所选 mailbox 发信）；缺省用 env 默认 */
+  from?: string;
 }
 
 /** 通过 Resend HTTP API 发送邮件（避免在 Worker 引入 Node 依赖）。 */
 export async function resendSend(env: Env, req: ResendRequest): Promise<SendResult> {
   const apiKey = env.RESEND_API_KEY;
   if (!apiKey) return { ok: false, error: '未配置 RESEND_API_KEY' };
-  const from = buildFrom(env);
+  const from = req.from ?? buildFrom(env);
   if (!from) return { ok: false, error: '未配置 SEND_FROM_ADDRESS' };
   if (!req.to.length) return { ok: false, error: '缺少收件人' };
 
@@ -49,6 +71,7 @@ export async function resendSend(env: Env, req: ResendRequest): Promise<SendResu
         html: req.html,
         text: req.text,
         headers: req.headers,
+        attachments: req.attachments && req.attachments.length ? req.attachments : undefined,
       }),
     });
   } catch (err) {

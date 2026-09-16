@@ -21,6 +21,8 @@ export interface MessageRow {
   message_id: string | null;
   in_reply_to: string | null;
   references: string | null;
+  thread_id: string | null;
+  mailbox: string;
   from_name: string | null;
   from_email: string | null;
   to_emails: string;
