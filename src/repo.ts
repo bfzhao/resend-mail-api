@@ -411,13 +411,19 @@ function insertMessageStmt(env: Env, row: {
   receivedAt: number;
   status: string;
   resendId: string | null;
+  /** 已读态。缺省：**出站=1**（自己发出的邮件不存在「未读」语义），入站=0。 */
+  read?: number;
 }): D1PreparedStatement {
+  // 出站邮件默认已读：sent 文件夹里不该出现未读。
+  // 历史上 read 被硬编码成 0，导致全部已发送邮件在列表里显示未读、且点开也不会变
+  // （syncOpenedReadState 只处理入站），用户侧表现为「发件箱全是未读」。
+  const read = row.read ?? (row.direction === 'outbound' ? 1 : 0);
   return env.DB.prepare(
     `INSERT INTO messages
       (id, direction, message_id, in_reply_to, "references", thread_id, mailbox,
        from_name, from_email, to_emails, cc, bcc, reply_to, subject, body_html,
        body_text, received_at, status, resend_id, read, starred, deleted, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?)`
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)`
   ).bind(
     row.id,
     row.direction,
@@ -438,6 +444,7 @@ function insertMessageStmt(env: Env, row: {
     row.receivedAt,
     row.status,
     row.resendId,
+    read,
     nowSec(),
     nowSec()
   );

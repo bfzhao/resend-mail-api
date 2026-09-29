@@ -80,23 +80,31 @@ function eventIdFrom(request: Request, payload?: SvixEnvelope | null): string | 
 }
 
 /** 判断这封入站邮件属于哪个本地收件地址（mailbox）。 */
+/**
+ * 归一化收件人列表。
+ *
+ * ⚠️ webhook payload 的 `data.to` 与 Received Emails API 的 `email.to` **都可能是字符串**，
+ * 不一定是我们以为的数组。`parseAddressList()` 两种都吃（util.ts 里对 string 有专门分支），
+ * 但历史上这里各处手写 `Array.isArray(...)` 判断，口径与它不一致 —— 实测造成 11 封
+ * 实际发给 support@notionmanager.com 的邮件 `mailbox` 落成空串，在侧边栏显示为「(未识别)」。
+ * 统一走这个函数，不要再手写类型判断。
+ */
+function recipientList(email: ReceivedEmail, data: Record<string, unknown>): ReturnType<typeof parseAddressList> {
+  const fromApi = parseAddressList(email.to);
+  if (fromApi.length) return fromApi;
+  return parseAddressList(data['to']);
+}
+
 function pickMailbox(email: ReceivedEmail, data: Record<string, unknown>): string {
+  // 1) Resend 官方推荐：received_for 是本封邮件的实际投递地址
   const receivedFor = data['received_for'];
   if (Array.isArray(receivedFor) && receivedFor.length && typeof receivedFor[0] === 'string') {
     const m = receivedFor[0].trim();
     if (m) return m.toLowerCase();
   }
-  const candidates = (email.to?.length ? email.to : []) as Array<string | unknown>;
-  const firstRaw = candidates.find((x): x is string => typeof x === 'string' && x.includes('@'));
-  if (firstRaw) {
-    const parsed = parseAddress(firstRaw);
-    return (parsed?.email ?? firstRaw.trim()).toLowerCase();
-  }
-  const dataTo = data['to'];
-  if (Array.isArray(dataTo) && dataTo.length && typeof dataTo[0] === 'string') {
-    const parsed = parseAddress(dataTo[0]);
-    if (parsed?.email) return parsed.email.toLowerCase();
-  }
+  // 2) 退回 to（字符串/数组都要能处理，见 recipientList 的说明）
+  const tos = recipientList(email, data);
+  if (tos.length) return tos[0].email;
   return '';
 }
 
@@ -185,7 +193,7 @@ export async function handleInbound(request: Request, env: Env): Promise<Respons
     mailbox,
     fromName,
     fromEmail,
-    to: parseAddressList(email.to ?? data['to']).map((a) => a.email),
+    to: recipientList(email, data).map((a) => a.email),
     cc: parseAddressList(email.cc ?? data['cc']).map((a) => a.email),
     bcc: parseAddressList(email.bcc ?? data['bcc']).map((a) => a.email),
     replyTo: parseAddressList(email.reply_to ?? []).map((a) => a.email),

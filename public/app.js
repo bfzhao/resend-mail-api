@@ -41,6 +41,15 @@ const MSG_CACHE_BYTES = 2 * 1024 * 1024;
 /** 后端把 mailbox 为空/NULL 的行归入这个显式分组；必须与 src/repo.ts 的 UNKNOWN_MAILBOX 一致。 */
 const UNKNOWN_MAILBOX = '(未识别)';
 
+/*
+ * 后台预下载正文：列表渲染完成后，空闲时顺序把当前列表里**尚未缓存**的正文抓回来。
+ * 目的：用户点开时正文已经在本地，不再看到「正在下载」。
+ */
+const PREFETCH_MAX = 50;             // 一次预取上限（正好一页）
+const PREFETCH_START_DELAY_MS = 500; // 先让首屏的关键请求走完，再开始预取
+const PREFETCH_GAP_MS = 100;         // 每封之间留间隔，不与用户点击争抢
+const PREFETCH_PERSIST_EVERY = 5;    // 每预取 N 封落盘一次，中途离开也不会全丢
+
 const STATUS_LABEL = {
   sent: '已发送',
   delivered: '已送达',
@@ -224,6 +233,67 @@ function touchMessageCache(id) {
   if (!v) return;
   state.cache.messages.delete(id);
   state.cache.messages.set(id, v);
+}
+
+/* ---------------- 后台预下载正文 ---------------- */
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+let prefetchGen = 0;      // 递增即作废上一轮预取
+let prefetchActive = null; // 正在预取的视图 token（同视图不重复启动）
+
+/**
+ * 空闲时按顺序预取当前列表里尚未缓存的正文，写入消息 LRU（并随快照落盘）。
+ *
+ * 约束（每条都对应一个回归用例）：
+ *  - 只处理**当前列表** `state.items`，跳过已在缓存里的；上限 PREFETCH_MAX；
+ *  - 顺序执行 + 间隔，不与用户点击争抢；页面不可见（document.hidden）立即暂停；
+ *  - 视图切换（folder/mailbox/q）通过 token 比对立刻作废；
+ *  - **绝不触碰 state.openId / detailSeq / 右侧面板** —— 预取是纯后台行为，
+ *    不改变用户看到的任何东西。真正点开时走 openMessage 自己的路径。
+ */
+function prefetchBodies() {
+  if (document.hidden) return;
+  const token = folderKey();
+  if (prefetchActive === token) return; // 同一视图已在预取，不重开
+  prefetchActive = token;
+  const gen = ++prefetchGen;
+  void (async () => {
+    try {
+      await sleep(PREFETCH_START_DELAY_MS);
+      if (gen !== prefetchGen || token !== folderKey()) return;
+      // 用游标扫 state.items，而不是一开始拍一张快照：
+      // 「加载更多」会把新页追加进 state.items，游标扫描能自然把它们带上。
+      let cursor = 0;
+      let done = 0; // 只统计真正发起的请求数，用来卡上限
+      while (done < PREFETCH_MAX) {
+        if (gen !== prefetchGen || token !== folderKey()) return; // 视图已切换
+        if (document.hidden) return;                              // 页面不可见，暂停
+        const ids = state.items.map((it) => it.id);
+        if (cursor >= ids.length) break; // 当前列表已走完
+        const id = ids[cursor++];
+        if (state.cache.messages.has(id)) continue; // 已缓存（或期间被别的路径填上）
+        done++;
+        try {
+          const data = await api(`/api/messages/${encodeURIComponent(id)}`);
+          putMessageCache(id, {
+            message: data.message,
+            attachments: data.attachments || [],
+            thread: data.thread || [],
+            at: Date.now(),
+          });
+        } catch {
+          // 预取失败不打扰用户：真正点开时会重新请求并给出错误态
+        }
+        if (done % PREFETCH_PERSIST_EVERY === 0) persistSoon();
+        await sleep(PREFETCH_GAP_MS);
+      }
+      persistSoon();
+    } finally {
+      // 只在「仍是本轮」时清标记：被新视图 / 新预取顶替时，不能把后来者的标记清掉
+      if (prefetchGen === gen && prefetchActive === token) prefetchActive = null;
+    }
+  })();
 }
 
 /* ---------------- 本地持久化缓存（localStorage，防抖 + 全链路 try/catch） ---------------- */
@@ -565,6 +635,7 @@ function paintList() {
   renderList();
   afterListRender();
   renderSelectBar();
+  prefetchBodies(); // 列表画完就顺手把正文预取回来（空闲、可取消、不碰 UI）
 }
 
 /** 后台 revalidate 的比对基准：内存缓存里该视图的指纹。 */
@@ -2053,9 +2124,12 @@ async function init() {
   }
 
   setInterval(periodicSync, SYNC_MS);
-  // 页面重新可见时补一次同步（隐藏期间跳过的刷新在这里补齐）
+  // 页面重新可见时补一次同步（隐藏期间跳过的刷新在这里补齐），并继续未完成的正文预取
   document.addEventListener('visibilitychange', () => {
-    if (!document.hidden) void periodicSync();
+    if (!document.hidden) {
+      void periodicSync();
+      prefetchBodies();
+    }
   });
 }
 

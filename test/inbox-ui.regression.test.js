@@ -249,6 +249,38 @@ function pagingFixture() {
   };
 }
 
+/**
+ * 预取用例固定装置：收件箱与已发送**各 50 封、id 不重叠**。
+ * 这样「切换视图后有没有抓错视图 / 重复抓」才观察得到 ——
+ * 若新视图为空列表，预取的游标扫描会自然 break，会把「取消没生效」伪装成通过。
+ */
+function prefetchFixture() {
+  const inboxItems = [];
+  const sentItems = [];
+  const messages = {};
+  for (let i = 0; i < 50; i++) {
+    const n = String(i).padStart(2, '0');
+    const a = msg('P' + n, i === 0 ? 0 : 1);
+    const b = msg('S' + n, 1, { direction: 'outbound', status: 'sent' });
+    inboxItems.push(a);
+    sentItems.push(b);
+    messages[a.id] = detail(a, a.read);
+    messages[b.id] = detail(b, 1);
+  }
+  return {
+    honorPaging: true,
+    folders: {
+      inbox: { items: inboxItems, total: 50 },
+      sent: { items: sentItems, total: 50 },
+      starred: { items: [], total: 0 },
+      trash: { items: [], total: 0 },
+    },
+    messages,
+    mailboxes: [{ mailbox: 'alpha@x.com', inbox_unread: 1, inbox_total: 50, sent_total: 50 }],
+    counts: { inbox_unread: 1, inbox_total: 50, sent_total: 50, starred_total: 0, trash_total: 0 },
+  };
+}
+
 /** BUG-5 固定装置：上次会话残留的 localStorage 快照，选中具体账号 beta。 */
 function seededBetaFixture() {
   const items = [];
@@ -363,6 +395,21 @@ const tick = (win) => new Promise((r) => win.setTimeout(r, 0));
 async function ticks(win, n = 1) { for (let i = 0; i < n; i++) await tick(win); }
 const sleep = (ctx, ms) => new Promise((r) => ctx.win.setTimeout(r, ms));
 
+/** 轮询等待页面内某个表达式为真（默认 4s）。等待后台预取这类异步过程用它，别用固定 sleep 猜时长。 */
+async function waitUntil(ctx, expr, timeoutMs = 4000) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < timeoutMs) {
+    let v = false;
+    try { v = !!evalIn(ctx, expr); } catch { /* 脚本尚未就绪 */ }
+    if (v) return true;
+    await sleep(ctx, 40);
+  }
+  return false;
+}
+
+/** 显式启动一次正文预取。boot() 默认会把自动预取作废，只有需要验证预取的用例才用它。 */
+function startPrefetch(ctx) { evalIn(ctx, 'prefetchBodies()'); }
+
 async function boot(cfg = {}) {
   const dom = new JSDOM(INDEX_HTML, { runScripts: 'dangerously', url: 'http://localhost/' });
   const win = dom.window;
@@ -406,6 +453,13 @@ async function boot(cfg = {}) {
   }
   if (!ready) throw new Error('init() 未在预期时间内完成（fetch 打桩或脚本注入失败）');
   await ticks(win, 10);
+
+  // 后台正文预取是**时间相关**的：它会在 paintList() 之后 500ms 开始顺序发详情请求，
+  // 让所有「请求次数」类断言变成 flaky（实测：T9 的缓存条数前置条件被多出来的一封打乱）。
+  // 默认在 boot 结束时作废它，测试就完全确定；要验证预取本身的用例显式调用
+  // startPrefetch()/waitUntil()。gen 与 active 都要清：只递增 gen 的话，
+  // 被取消那轮仍占着 prefetchActive，之后的 startPrefetch() 会被早退挡掉。
+  if (!cfg.keepPrefetch) win.eval('prefetchGen++; prefetchActive = null;');
 
   return { dom, win, doc: win.document, stub, close() { try { dom.window.close(); } catch { /* ignore */ } } };
 }
@@ -1152,6 +1206,116 @@ const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } 
     ok(ctx.stub.counters.detail === detailBefore + 1, '计数器口径一致：恰好 1 次详情请求',
       `${detailBefore} → ${ctx.stub.counters.detail}`);
   });
+
+  /* ---- 后台预下载正文 ---- */
+
+  await test('T11 后台预取：不点击也把列表里未缓存的正文抓回来，且不改动用户视图', async (ctx) => {
+    // boot 会自动打开首项 C → C 已缓存；A、B 尚未缓存
+    ok(evalIn(ctx, "state.cache.messages.has('C')"), '前置：C 已因自动打开进入缓存');
+    ok(!evalIn(ctx, "state.cache.messages.has('A')") && !evalIn(ctx, "state.cache.messages.has('B')"),
+      '前置：A/B 尚未缓存（否则本用例会空转）',
+      evalIn(ctx, 'Array.from(state.cache.messages.keys()).join(",")'));
+
+    const openIdBefore = evalIn(ctx, 'state.openId');
+    const subjectBefore = el(ctx, '#read-message .mail-subject h1').textContent;
+    const before = ctx.stub.calls.length;
+
+    startPrefetch(ctx);
+    const done = await waitUntil(ctx, "state.cache.messages.has('A') && state.cache.messages.has('B')");
+    ok(done, '预取把 A、B 的正文都抓了回来（全程没有任何点击）',
+      evalIn(ctx, 'Array.from(state.cache.messages.keys()).join(",")'));
+
+    const fetched = detailCalls(ctx, before).map((c) => c.url);
+    ok(fetched.includes('/api/messages/A') && fetched.includes('/api/messages/B'),
+      '确实是靠后台详情请求拿到的，而不是凭空出现', fetched.join(' , ') || '（无）');
+
+    // 预取是纯后台行为：不得触碰用户视图
+    ok(evalIn(ctx, 'state.openId') === openIdBefore, '打开中的邮件没有被改变',
+      `${openIdBefore} → ${evalIn(ctx, 'state.openId')}`);
+    ok(evalIn(ctx, 'detailPending') === null, '预取不得留下「下载中」占位状态',
+      String(evalIn(ctx, 'detailPending')));
+    ok(el(ctx, '#read-message .mail-subject h1').textContent === subjectBefore,
+      '右侧面板仍然显示原来那封', el(ctx, '#read-message .mail-subject h1').textContent);
+    ok(!el(ctx, '#read-message .mail-body-pending'), '面板没有出现「下载中」占位');
+  });
+
+  await test('T11b 负控制：页面不可见时不预取，恢复可见后继续', async (ctx) => {
+    Object.defineProperty(ctx.win.document, 'hidden', { value: true, configurable: true });
+    Object.defineProperty(ctx.win.document, 'visibilityState', { value: 'hidden', configurable: true });
+    const before = ctx.stub.calls.length;
+    startPrefetch(ctx);
+    await sleep(ctx, 1200); // 远超 PREFETCH_START_DELAY_MS(500) + 一个间隔
+    ok(detailCalls(ctx, before).length === 0, '页面隐藏时一个详情请求都不发',
+      detailCalls(ctx, before).map((c) => c.url).join(' , ') || '（无）');
+    ok(!evalIn(ctx, "state.cache.messages.has('A')"), '隐藏期间也没有预取到正文');
+
+    // 恢复可见：同一套设置下必须真的开始预取，否则上面的 0 可能是「功能压根没生效」而非「被门控」
+    Object.defineProperty(ctx.win.document, 'hidden', { value: false, configurable: true });
+    Object.defineProperty(ctx.win.document, 'visibilityState', { value: 'visible', configurable: true });
+    startPrefetch(ctx);
+    const done = await waitUntil(ctx, "state.cache.messages.has('A')");
+    ok(done, '恢复可见后预取正常进行（证明上面的 0 不是功能失效）',
+      evalIn(ctx, 'Array.from(state.cache.messages.keys()).join(",")'));
+  });
+
+  await test('T11b2 运行中转为不可见：预取立即暂停（入口门控之外的循环内门控）', async (ctx) => {
+    startPrefetch(ctx);
+    const startedOk = await waitUntil(ctx, "state.cache.messages.has('A')", 4000);
+    ok(startedOk, '前置：预取已经跑起来（否则「暂停」无从观察）',
+      evalIn(ctx, 'Array.from(state.cache.messages.keys()).join(",")'));
+
+    Object.defineProperty(ctx.win.document, 'hidden', { value: true, configurable: true });
+    await ticks(ctx.win, 2);
+    const before = ctx.stub.calls.length;
+    await sleep(ctx, 900); // 远超一个间隔（100ms）
+    ok(detailCalls(ctx, before).length === 0, '转为不可见后不再继续发请求',
+      detailCalls(ctx, before).map((c) => c.url).join(' , ') || '（无）');
+  });
+
+  await test('T11c 视图切换：预取中途作废 —— 不抓旧视图，也不产生重复请求', async (ctx) => {
+    startPrefetch(ctx);
+    await sleep(ctx, 800); // 500ms 启动延迟 + 约 3 封
+    const started = detailCalls(ctx, 0).map((c) => c.url);
+    ok(started.length >= 1, '前置：预取确实已经开始（否则「取消」无从观察）', started.join(' , ') || '（无）');
+
+    const beforeSwitch = ctx.stub.calls.length;
+    evalIn(ctx, "openFolder('sent')"); // folderKey 立刻变化 → 作废本轮预取
+    await ticks(ctx.win, 6);
+    await sleep(ctx, 1400);
+
+    const after = detailCalls(ctx, beforeSwitch).map((c) => c.url);
+    const stale = after.filter((u) => /\/api\/messages\/P\d\d$/.test(u));
+    ok(stale.length === 0, '切换后不再抓旧视图（收件箱 P##）的正文', stale.join(' , ') || '（无）');
+
+    // ⭐ 关键：若取消没生效，旧那轮会**带着游标**继续跑（从第 4 封往后），
+    // 于是切换后第一个请求会是 S04 而不是 S00。只断言「没抓旧视图」抓不到它：
+    // 旧轮重新快照 state.items 后抓的是新视图，看起来也"正常"。
+    const firstNew = after.find((u) => /\/api\/messages\/S\d\d$/.test(u));
+    ok(firstNew === '/api/messages/S00',
+      '切换后从新视图的**第一封**重新开始预取（说明是干净的新一轮，而不是旧轮带着游标继续跑）',
+      firstNew || '（无）');
+
+    const dupes = after.filter((u, i) => after.indexOf(u) !== i);
+    ok(dupes.length === 0, '切换后没有任何一封被重复抓（否则说明新旧两轮预取同时在跑）',
+      dupes.join(' , ') || '（无）');
+
+    ok(after.some((u) => /\/api\/messages\/S\d\d$/.test(u)),
+      '新视图（已发送 S##）的正文有被正常预取',
+      after.filter((u) => /S\d\d$/.test(u)).length + ' 条');
+  }, prefetchFixture());
+
+  await test('T11d 预取是自动的：列表渲染后无需任何调用/点击，正文自己回来', async (ctx) => {
+    // 本用例**不**调用 startPrefetch：验证的是 paintList → prefetchBodies 这条接线本身。
+    // boot({keepPrefetch:true}) 表示不作废自动预取。
+    const before = ctx.stub.calls.length;
+    const done = await waitUntil(ctx, "state.cache.messages.has('A') && state.cache.messages.has('B')", 8000);
+    ok(done, '自动预取生效（全程没有任何点击，也没有手动触发）',
+      evalIn(ctx, 'Array.from(state.cache.messages.keys()).join(",")'));
+
+    const fetched = detailCalls(ctx, before).map((c) => c.url);
+    ok(fetched.includes('/api/messages/A') && fetched.includes('/api/messages/B'),
+      '确实发了后台详情请求', fetched.join(' , ') || '（无）');
+  }, Object.assign(inboxFixture(), { keepPrefetch: true }));
 
   /* ---- 汇总 ---- */
   console.log('\n================ 失败用例清单 ================');
