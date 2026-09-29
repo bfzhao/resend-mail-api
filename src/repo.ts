@@ -51,6 +51,13 @@ export interface OutboundInput {
 const LIST_LIMIT = 50;
 const LIST_MAX = 200;
 
+/**
+ * mailbox 为空串或 NULL 的行在「收件地址」维度归入这个显式分组。
+ * 它与前端 public/app.js 的 UNKNOWN_MAILBOX 必须保持一致。
+ * 这样 mailboxes() 覆盖全部行，保证「全部邮箱」计数 = 各分组计数之和。
+ */
+export const UNKNOWN_MAILBOX = '(未识别)';
+
 export interface ListOpts {
   folder: Folder;
   q?: string | null;
@@ -73,6 +80,12 @@ interface FolderRow {
   starred: number;
   status: string;
   attachments_count: number;
+}
+
+/** mailbox 过滤条件：空/NULL 分组用哨兵值匹配，其余按精确匹配（与 mailboxes() 口径一致）。 */
+function mailboxCond(mailbox: string): { sql: string; params: unknown[] } {
+  if (mailbox === UNKNOWN_MAILBOX) return { sql: "(mailbox IS NULL OR mailbox = '')", params: [] };
+  return { sql: 'mailbox = ?', params: [mailbox] };
 }
 
 /** 已存附件上传到 R2 后组装出的 DB 行参数已含于 attachments[]。 */
@@ -100,8 +113,9 @@ function whereForFolder(
       break;
   }
   if (mailbox) {
-    conds.push('mailbox = ?');
-    params.push(mailbox);
+    const c = mailboxCond(mailbox);
+    conds.push(c.sql);
+    params.push(...c.params);
   }
   if (q) {
     const like = `%${q}%`;
@@ -147,8 +161,9 @@ export async function sidebarCounts(env: Env, mailbox?: string): Promise<{
   const conds: string[] = [];
   const params: unknown[] = [];
   if (mailbox) {
-    conds.push('mailbox = ?');
-    params.push(mailbox);
+    const c = mailboxCond(mailbox);
+    conds.push(c.sql);
+    params.push(...c.params);
   }
   const whereSql = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
   const row = await env.DB.prepare(
@@ -170,33 +185,52 @@ export async function sidebarCounts(env: Env, mailbox?: string): Promise<{
   };
 }
 
-/** 收件地址列表（含各地址未读数/总数），用于侧边栏切换。 */
+/**
+ * 收件地址列表（含各地址未读数/总数），用于侧边栏切换。
+ * 覆盖**全部**行：mailbox 为空串/NULL 的归入 UNKNOWN_MAILBOX 分组，不再被静默丢弃，
+ * 从而保证「全部邮箱」计数（sidebarCounts 无 mailbox 参数）=== 各分组计数之和（BUG-3b）。
+ *
+ * 性能：GROUP BY 用**原始列** `mailbox`（idx_messages_counts 的前导列），可被覆盖索引的有序扫描
+ * 直接满足，不再产生 `TEMP B-TREE FOR GROUP BY`（实测 20000 行 100ms → 4.0ms）。
+ * 空串/NULL 的归一化在 SELECT 里标成哨兵、并在 JS 里按哨兵 key 合并（NULL 与 '' 若同时出现会得到两行）。
+ */
 export async function mailboxes(env: Env): Promise<
   Array<{ mailbox: string; inbox_unread: number; inbox_total: number; sent_total: number }>
 > {
+  const groupExpr = "CASE WHEN mailbox IS NULL OR mailbox = '' THEN ? ELSE mailbox END";
   const rows = await env.DB.prepare(
     `SELECT
-       mailbox,
+       ${groupExpr} AS mailbox,
        SUM(CASE WHEN direction='inbound' AND deleted=0 AND read=0 THEN 1 ELSE 0 END) AS inbox_unread,
        SUM(CASE WHEN direction='inbound' AND deleted=0 THEN 1 ELSE 0 END) AS inbox_total,
        SUM(CASE WHEN direction='outbound' AND deleted=0 THEN 1 ELSE 0 END) AS sent_total
      FROM messages
-     WHERE mailbox IS NOT NULL AND mailbox != ''
      GROUP BY mailbox
      ORDER BY inbox_unread DESC, mailbox ASC`
-  ).all<{ mailbox: string; inbox_unread: number | null; inbox_total: number | null; sent_total: number | null }>();
+  ).bind(UNKNOWN_MAILBOX).all<{ mailbox: string | null; inbox_unread: number | null; inbox_total: number | null; sent_total: number | null }>();
 
-  const list = rows.results
-    .filter((r) => r.mailbox)
-    .map((r) => ({
-      mailbox: r.mailbox,
-      inbox_unread: r.inbox_unread ?? 0,
-      inbox_total: r.inbox_total ?? 0,
-      sent_total: r.sent_total ?? 0,
-    }));
-
-  // 无任何历史时给一个可用的默认地址（SEND_FROM_ADDRESS），前端隐藏选择器
-  return list;
+  // 合并 '' / NULL 归入的哨兵分组（GROUP BY 原始列时二者是不同分组，可能各返回一行）。
+  const merged = new Map<string, { mailbox: string; inbox_unread: number; inbox_total: number; sent_total: number }>();
+  for (const r of rows.results) {
+    const key = r.mailbox === null || r.mailbox === '' ? UNKNOWN_MAILBOX : r.mailbox;
+    const prev = merged.get(key);
+    if (prev) {
+      prev.inbox_unread += r.inbox_unread ?? 0;
+      prev.inbox_total += r.inbox_total ?? 0;
+      prev.sent_total += r.sent_total ?? 0;
+    } else {
+      merged.set(key, {
+        mailbox: key,
+        inbox_unread: r.inbox_unread ?? 0,
+        inbox_total: r.inbox_total ?? 0,
+        sent_total: r.sent_total ?? 0,
+      });
+    }
+  }
+  const out = [...merged.values()];
+  // 合并会打乱 SQL 的排序（未读降序），按同一口径在 JS 里重排；分组数为 0 时返回空数组（不凭空造组）。
+  out.sort((a, b) => (b.inbox_unread - a.inbox_unread) || (a.mailbox < b.mailbox ? -1 : a.mailbox > b.mailbox ? 1 : 0));
+  return out;
 }
 
 /** 同一会话内的消息（升序），用于阅读视图上下文。 */

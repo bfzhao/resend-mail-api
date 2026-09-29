@@ -7,6 +7,7 @@ export interface Env {
   RESEND_API_KEY?: string;
   SEND_FROM_ADDRESS?: string;
   SEND_FROM_NAME?: string;
+  MERGE_SUBREQ_BUDGET?: string;
   API_USERNAME?: string;
   API_PASSWORD?: string;
 }

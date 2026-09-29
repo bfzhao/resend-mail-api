@@ -4,7 +4,7 @@
  * 邮件收件箱前端（无构建，纯原生）
  * 布局：左侧邮件清单 + 右侧详情（类 Yahoo/常见客户端）
  * 能力：多收件地址 · 会话上下文 · 附件发送 · 富文本
- * 性能：列表/详情/计数 TTL 缓存 + 静默刷新 + 定时同步
+ * 性能：本地持久化缓存（localStorage）优先渲染 + 后台 revalidate + 静默刷新 + 定时同步
  * ========================================================= */
 
 const FOLDERS = [
@@ -17,8 +17,23 @@ const FOLDERS = [
 const PAGE_SIZE = 50;
 const MAX_FILE_BYTES = 40 * 1024 * 1024;
 
-const TTL = { folder: 45 * 1000, message: 3 * 60 * 1000, counts: 20 * 1000 };
-const SYNC_MS = 60 * 1000;
+const TTL = { folder: 45 * 1000, message: 3 * 60 * 1000, counts: 20 * 1000, mailboxes: 10 * 1000 };
+// 后台同步间隔：60s → 5min。理由：计数/列表的 TTL 是 20~45s，60s 一轮几乎每轮都在重拉；
+// 而列表/计数只在「有变化」时才需要刷新，5min 已能覆盖「长时间挂着页面」的场景，
+// 页面重新可见时还有 visibilitychange 兜底立即同步一次。
+const SYNC_MS = 5 * 60 * 1000;
+
+/* 本地持久化缓存：刷新页面后首屏 0 请求即可显示列表 / 计数徽标 / 账号下拉。 */
+const CACHE_KEY = 'inbox-cache-v1';
+const CACHE_VERSION = 1;
+const PERSIST_DEBOUNCE_MS = 300;
+
+/* 已打开邮件正文的内存 LRU：最多 40 封或合计 2MB，先到为准。 */
+const MSG_CACHE_MAX = 40;
+const MSG_CACHE_BYTES = 2 * 1024 * 1024;
+
+/** 后端把 mailbox 为空/NULL 的行归入这个显式分组；必须与 src/repo.ts 的 UNKNOWN_MAILBOX 一致。 */
+const UNKNOWN_MAILBOX = '(未识别)';
 
 const STATUS_LABEL = {
   sent: '已发送',
@@ -36,6 +51,7 @@ const state = {
   mailbox: '',
   mailboxList: [],
   items: [],
+  itemsKey: null, // 当前 state.items 对应的视图 key，用于判断「同视图刷新」而非清屏重来
   selected: new Set(),
   q: '',
   total: 0,
@@ -46,9 +62,17 @@ const state = {
   fromAddress: '',
   fromName: '',
   openId: null,
+  pendingOpenId: null, // 从本地缓存恢复、待列表就绪后重新打开的邮件 id
   loading: false,
   firstOpen: true,
-  cache: { folders: new Map(), messages: new Map(), countsAt: 0 },
+  cache: {
+    folders: new Map(),
+    messages: new Map(),
+    countsAt: 0,
+    mailboxesAt: 0,
+    mailboxesLoading: false,
+    mailboxesPending: false,
+  },
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -83,13 +107,20 @@ function folderKey() {
   return `${state.mailbox}|${state.folder}|${state.q}`;
 }
 
-function freshFolderCache() {
-  const c = state.cache.folders.get(folderKey());
-  return c && Date.now() - c.at < TTL.folder ? c : null;
+/** 轻量指纹：首尾 id + 总数 + 每行 read/starred，用于「数据没变就不重渲染」。 */
+function folderFingerprint(items, total) {
+  let s = `${total}|${items.length}`;
+  for (const it of items) s += `|${it.id}${it.read ? 'r' : 'u'}${it.starred ? 's' : ''}`;
+  return s;
 }
 
-function storeFolderCache(items, total) {
-  state.cache.folders.set(folderKey(), { items: [...items], total, at: Date.now() });
+function storeFolderCache(items, total, fp) {
+  state.cache.folders.set(folderKey(), {
+    items: [...items],
+    total,
+    at: Date.now(),
+    fp: fp || folderFingerprint(items, total),
+  });
 }
 
 function findItem(id) {
@@ -103,19 +134,29 @@ function findItem(id) {
   return null;
 }
 
+/**
+ * 单一来源对齐「当前打开」高亮：列表里最多只有 state.openId 对应的一行带 active。
+ * 必须遍历全部行做全量对齐，否则旧行上的 active 会残留，出现多个蓝色选择标记（BUG-1）。
+ * 只切 class、不重渲染整表，避免丢失滚动位置。
+ */
+function syncActiveRow() {
+  for (const row of Array.from(document.querySelectorAll('.list-item[data-id]'))) {
+    row.classList.toggle('active', row.dataset.id === state.openId);
+  }
+}
+
 function syncRowUI(id) {
   const item = findItem(id);
   for (const row of Array.from(document.querySelectorAll('.list-item[data-id]'))) {
     if (row.dataset.id !== id) continue;
-    const active = id === state.openId;
     row.classList.toggle('unread', !!(item && !item.read));
-    row.classList.toggle('active', active);
     const star = row.querySelector('.star-btn');
     if (star) {
       star.classList.toggle('starred', !!(item && item.starred));
       star.textContent = item && item.starred ? '★' : '☆';
     }
   }
+  syncActiveRow();
 }
 
 function applyLocalPatch(id, patch) {
@@ -142,10 +183,124 @@ function applyLocalPatch(id, patch) {
     if (t) for (const k of Object.keys(patch)) t[k] = patch[k];
   }
   syncRowUI(id);
+  persistSoon();
 }
 
 function invalidateFolderCaches() {
   state.cache.folders.clear();
+}
+
+/* ---------------- 已打开邮件正文的内存 LRU ---------------- */
+
+function entryBytes(entry) {
+  const m = entry.message || {};
+  return String(m.body_html || '').length + String(m.body_text || '').length + 512;
+}
+
+/** 写入并置为最近使用；超上限（40 封 / 2MB）时从最久未使用的一端逐出。 */
+function putMessageCache(id, entry) {
+  const e = { ...entry, bytes: entryBytes(entry) };
+  state.cache.messages.delete(id);
+  state.cache.messages.set(id, e);
+  let total = 0;
+  for (const v of state.cache.messages.values()) total += v.bytes || 0;
+  while (state.cache.messages.size > MSG_CACHE_MAX || total > MSG_CACHE_BYTES) {
+    const oldest = state.cache.messages.keys().next().value;
+    if (oldest === undefined || oldest === id) break;
+    total -= state.cache.messages.get(oldest).bytes || 0;
+    state.cache.messages.delete(oldest);
+  }
+}
+
+/** 命中即刷新 LRU 顺序（Map 的插入顺序即使用顺序）。 */
+function touchMessageCache(id) {
+  const v = state.cache.messages.get(id);
+  if (!v) return;
+  state.cache.messages.delete(id);
+  state.cache.messages.set(id, v);
+}
+
+/* ---------------- 本地持久化缓存（localStorage，防抖 + 全链路 try/catch） ---------------- */
+
+let persistTimer = null;
+
+/** 读取本地快照。版本不符 / JSON 损坏 / 隐私模式禁用 localStorage 一律安全降级为 null。 */
+function readPersisted() {
+  try {
+    const raw = localStorage.getItem(CACHE_KEY);
+    if (!raw) return null;
+    const obj = JSON.parse(raw);
+    if (!obj || obj.v !== CACHE_VERSION) return null;
+    return obj;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 把当前视图（列表 + 计数 + 账号列表 + openId）写入本地。空列表不写（避免把 loading 态落盘）。
+ * 不持久化 state.selected：选中态跨刷新保留会让人困惑。
+ */
+function writePersisted() {
+  try {
+    if (!state.items.length) return;
+    localStorage.setItem(
+      CACHE_KEY,
+      JSON.stringify({
+        v: CACHE_VERSION,
+        at: Date.now(),
+        folderKey: folderKey(),
+        mailbox: state.mailbox,
+        folderName: state.folder,
+        q: state.q,
+        folder: { items: state.items, total: state.total },
+        counts: state.counts,
+        mailboxes: state.mailboxList,
+        openId: state.openId,
+      })
+    );
+  } catch {
+    /* 隐私模式 / 超配额（QuotaExceededError）：静默降级为「不持久化」，不影响功能 */
+  }
+}
+
+/** 防抖写入，避免读信 / 翻页 / 批量操作时高频 JSON.stringify 卡主线程。 */
+function persistSoon() {
+  clearTimeout(persistTimer);
+  persistTimer = setTimeout(writePersisted, PERSIST_DEBOUNCE_MS);
+}
+
+/**
+ * 启动时**同步**恢复本地快照并立即渲染（0 请求）。
+ * 只恢复与当前默认视图（inbox / 无搜索）一致的列表；计数与账号列表始终可用。
+ * 任何异常都安全降级为「没有缓存」，绝不白屏。返回是否恢复了列表内容。
+ */
+function restorePersisted() {
+  const p = readPersisted();
+  if (!p) return false;
+  try {
+    if (p.counts && typeof p.counts === 'object') state.counts = { ...state.counts, ...p.counts };
+    if (Array.isArray(p.mailboxes)) state.mailboxList = p.mailboxes;
+    if (typeof p.mailbox === 'string') state.mailbox = p.mailbox;
+    if (typeof p.openId === 'string') state.openId = p.openId;
+    const listOk =
+      p.folder && Array.isArray(p.folder.items) && p.folder.items.length > 0 &&
+      p.folderName === state.folder && p.q === '' && p.folderKey === folderKey();
+    if (!listOk) return false;
+    state.items = p.folder.items;
+    state.itemsKey = folderKey();
+    state.total = Number(p.folder.total) || p.folder.items.length;
+    state.offset = p.folder.items.length;
+    state.cache.folders.set(folderKey(), {
+      items: [...p.folder.items],
+      total: state.total,
+      at: p.at || Date.now(),
+      fp: folderFingerprint(p.folder.items, state.total),
+    });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /* ---------------- 通用 ---------------- */
@@ -213,7 +368,9 @@ function renderMailboxSelect() {
     return;
   }
   wrap.classList.remove('hidden');
-  const prev = sel.value;
+  // 真值来源是 state.mailbox；sel.value 只是它的派生显示，启动恢复路径上 DOM 还可能是空的。
+  // '' = 「全部邮箱」，是合法选择，必须原样保留。
+  const prev = state.mailbox || '';
   sel.innerHTML = '';
   const allOpt = document.createElement('option');
   allOpt.value = '';
@@ -222,13 +379,16 @@ function renderMailboxSelect() {
   for (const m of list) {
     const opt = document.createElement('option');
     opt.value = m.mailbox;
-    opt.textContent = `${m.mailbox}${m.inbox_unread ? ` (${m.inbox_unread})` : ''}`;
+    opt.textContent = `${m.mailbox}${m.inbox_unread ? ` (${m.inbox_unread} 未读)` : ''}`;
     sel.appendChild(opt);
   }
-  const hasPrev = list.some((m) => m.mailbox === prev);
-  const target = hasPrev ? prev : (list.find((m) => m.inbox_unread > 0) || list[0]).mailbox;
+
+  // 只有当前选择确实已不存在（账号被删/改名）时才回退；
+  // 回退时同时更新下拉显示与 state.mailbox，二者永不脱钩（BUG-3a）。
+  const keep = prev === '' || list.some((m) => m.mailbox === prev);
+  const target = keep ? prev : (list.find((m) => m.inbox_unread > 0) || list[0]).mailbox;
   sel.value = target;
-  if (!hasPrev && state.mailbox === '') state.mailbox = target;
+  state.mailbox = target;
 }
 
 function renderNav() {
@@ -268,19 +428,40 @@ async function refreshCounts(force = false) {
     c.countsAt = Date.now();
     state.counts = next;
     renderNav();
+    persistSoon();
   } catch {
     /* 静默 */
   }
 }
 
-async function loadMailboxes() {
+/**
+ * 拉取收件地址列表。会改变计数状态的操作（读信/标星/删除/批量/发送）后用 force=true 调用，
+ * 保证下拉里的「未读」数与实际同步（BUG-3c）；非强制调用走 TTL，且同一时刻只允许一个在途请求，
+ * 期间到达的请求合并为一次补拉，避免高频。
+ */
+async function loadMailboxes(force = false) {
+  const c = state.cache;
+  if (!force && Date.now() - c.mailboxesAt < TTL.mailboxes) return;
+  if (c.mailboxesLoading) {
+    c.mailboxesPending = true;
+    return;
+  }
+  c.mailboxesLoading = true;
   try {
     const data = await api('/api/mailboxes');
     state.mailboxList = data.mailboxes || [];
+    c.mailboxesAt = Date.now();
+    renderMailboxSelect();
+    persistSoon();
   } catch {
-    state.mailboxList = [];
+    /* 保留已有列表：一次网络抖动不该把选择器清空 */
+  } finally {
+    c.mailboxesLoading = false;
+    if (c.mailboxesPending) {
+      c.mailboxesPending = false;
+      void loadMailboxes(true);
+    }
   }
-  renderMailboxSelect();
 }
 
 /* ---------------- 列表 ---------------- */
@@ -291,7 +472,8 @@ function folderLabel() {
 }
 
 function renderListTitle() {
-  const extra = state.total ? ` · ${state.total}` : '';
+  // 明确标注口径：这里是「该文件夹总数」，与侧边栏/下拉的「未读」是不同语义，不强行统一（BUG-3d）。
+  const extra = state.total ? ` · 共 ${state.total} 封` : '';
   const q = state.q ? `：搜索“${state.q}”` : '';
   $('#list-title').textContent = `${folderLabel()}${q}${extra}`;
 }
@@ -330,55 +512,111 @@ function afterListRender() {
   more.textContent = hasMore ? `已显示 ${state.items.length} / ${state.total} 封，点击加载更多` : '';
 }
 
-async function loadFolder(append = false, force = false) {
-  if (append && state.loading) return;
-  const token = `${state.mailbox}|${state.folder}|${state.q}|${append ? 'more' : 'top'}`;
-
-  if (!append && !force) {
-    const cached = freshFolderCache();
-    if (cached && cached.items.length) {
-      state.items = cached.items;
-      state.total = cached.total;
-      state.offset = cached.items.length;
-      state.loading = false;
-      renderList();
-      afterListRender();
-      renderSelectBar();
-      maybeAutoOpen();
-      return;
-    }
-    state.offset = 0;
-    state.items = [];
-  }
-
-  state.loading = true;
+/**
+ * 渲染列表区（列表 + 空态/更多 + 批量条）。
+ * 收敛点：一次加载里每个阶段只调用一次，避免「loading 一次 + 数据一次 + finally 又一次」的重复重建 DOM。
+ */
+function paintList() {
   renderList();
   afterListRender();
+  renderSelectBar();
+}
+
+/** 后台 revalidate 的比对基准：内存缓存里该视图的指纹。 */
+function cachedFolderFingerprint(token) {
+  const c = state.cache.folders.get(token);
+  return c ? c.fp : null;
+}
+
+function fetchFolderPage(offset) {
+  const params = new URLSearchParams({ limit: String(PAGE_SIZE), offset: String(offset) });
+  if (state.q) params.set('q', state.q);
+  if (state.mailbox) params.set('mailbox', state.mailbox);
+  return api(`/api/folders/${state.folder}?${params}`);
+}
+
+/**
+ * 拉取当前视图第 1 页。
+ * - first=true：无可用缓存，走 loading 态（首屏必须等它），数据到达后渲染一次。
+ * - first=false：stale-while-revalidate 的后台刷新；指纹没变就什么都不做。
+ */
+async function revalidateFolder(token, first) {
+  let data;
   try {
-    const params = new URLSearchParams({ limit: String(PAGE_SIZE), offset: String(state.offset) });
-    if (state.q) params.set('q', state.q);
-    if (state.mailbox) params.set('mailbox', state.mailbox);
-    const data = await api(`/api/folders/${state.folder}?${params}`);
-    if (token !== `${state.mailbox}|${state.folder}|${state.q}|${append ? 'more' : 'top'}`) return;
-    const items = append ? state.items.concat(data.items) : data.items;
-    state.items = items;
-    state.total = data.total;
-    state.offset += data.items.length;
-    storeFolderCache(items, state.total);
-    renderList();
-    afterListRender();
-    maybeAutoOpen();
+    data = await fetchFolderPage(0);
   } catch (e) {
-    if (token === `${state.mailbox}|${state.folder}|${state.q}|${append ? 'more' : 'top'}` && !state.items.length) {
-      showToast(e.message, true);
-    }
-  } finally {
-    if (token === `${state.mailbox}|${state.folder}|${state.q}|${append ? 'more' : 'top'}`) {
-      state.loading = false;
-      afterListRender();
-      renderSelectBar();
-    }
+    if (token !== folderKey()) return;
+    state.loading = false;
+    if (first) paintList();
+    if (!state.items.length) showToast(e.message, true);
+    return;
   }
+  if (token !== folderKey()) return; // 视图已切换，丢弃过期响应
+  state.loading = false;
+  const fp = folderFingerprint(data.items, data.total);
+  if (!first && fp === cachedFolderFingerprint(token)) return; // 数据没变：不重渲染
+  state.items = data.items;
+  state.itemsKey = token;
+  state.total = data.total;
+  state.offset = data.items.length;
+  storeFolderCache(state.items, state.total, fp);
+  paintList();
+  maybeAutoOpen();
+  persistSoon();
+}
+
+async function loadFolder(append = false, force = false) {
+  if (append) {
+    if (state.loading) return;
+    const token = folderKey();
+    state.loading = true;
+    try {
+      const data = await fetchFolderPage(state.offset);
+      if (token !== folderKey()) return;
+      state.items = state.items.concat(data.items);
+      state.total = data.total;
+      state.offset += data.items.length;
+      storeFolderCache(state.items, state.total);
+      paintList();
+      persistSoon();
+    } catch (e) {
+      if (!state.items.length) showToast(e.message, true);
+    } finally {
+      if (token === folderKey()) state.loading = false;
+    }
+    return;
+  }
+
+  const token = folderKey();
+  const cached = state.cache.folders.get(token);
+
+  if (!force && cached && cached.items.length) {
+    // 缓存优先（不再要求「新鲜」）：立即渲染，同时在后台 revalidate
+    const painted = state.itemsKey === token && folderFingerprint(state.items, state.total) === cached.fp;
+    if (!painted) {
+      state.items = cached.items;
+      state.itemsKey = token;
+      state.total = cached.total;
+      state.offset = cached.items.length;
+      paintList();
+    }
+    state.loading = false;
+    maybeAutoOpen();
+    persistSoon();
+    void revalidateFolder(token, false);
+    return;
+  }
+
+  const sameView = state.itemsKey === token && state.items.length > 0;
+  if (!sameView) {
+    state.items = [];
+    state.itemsKey = null;
+    state.total = 0;
+    state.offset = 0;
+    state.loading = true;
+    paintList(); // loading 态渲染一次（清屏）
+  }
+  await revalidateFolder(token, true);
 }
 
 /** 首次进入收件箱时自动打开最新一封，方便看到详情区。 */
@@ -415,6 +653,7 @@ async function toggleStar(item, btn) {
     btn.title = next ? '取消星标' : '加星标';
     state.cache.countsAt = 0;
     void refreshCounts();
+    void loadMailboxes(true); // 星标数计入账号计数（BUG-3c）
   } catch (e) {
     showToast(e.message, true);
   }
@@ -491,33 +730,50 @@ function itemRow(item) {
   return row;
 }
 
+/**
+ * 由 state.selected **单向派生** #select-all 的勾选态，消除「全选框 checked 与选中集合脱钩」（BUG-1b）。
+ * #select-all 不再持有独立真值：所有入口只改 state.selected，再经 renderSelectBar() 收敛 UI。
+ * 判定口径：pageIds = 当前页 .list-item[data-id] 的 id 集合；sel = state.selected。
+ */
+function syncSelectAll() {
+  const box = $('#select-all');
+  if (!box) return;
+  const pageIds = Array.from(document.querySelectorAll('.list-item[data-id]')).map((r) => r.dataset.id);
+  const sel = state.selected;
+  const checked = pageIds.length > 0 && pageIds.every((id) => sel.has(id));
+  box.checked = checked;
+  box.indeterminate = !checked && pageIds.some((id) => sel.has(id));
+}
+
 function renderSelectBar() {
   const bar = $('#list-bulk');
   const hasSel = state.selected.size > 0;
   bar.classList.toggle('hidden', !hasSel);
-  if (!hasSel) return;
-  $('#selected-count').textContent = `已选择 ${state.selected.size} 封`;
+  if (hasSel) {
+    $('#selected-count').textContent = `已选择 ${state.selected.size} 封`;
 
-  const actions = $('#bulk-actions');
-  actions.innerHTML = '';
-  const mk = (label, action, cls = '') => {
-    const b = document.createElement('button');
-    b.type = 'button';
-    b.className = 'btn ' + cls;
-    b.textContent = label;
-    b.addEventListener('click', () => void bulk(action));
-    actions.appendChild(b);
-  };
-  if (state.folder === 'trash') {
-    mk('还原', 'restore');
-    mk('彻底删除', 'delete', 'btn-danger');
-  } else {
-    mk('已读', 'read');
-    mk('未读', 'unread');
-    mk('星标', 'star');
-    mk('取消星标', 'unstar');
-    mk('删除', 'trash');
+    const actions = $('#bulk-actions');
+    actions.innerHTML = '';
+    const mk = (label, action, cls = '') => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'btn ' + cls;
+      b.textContent = label;
+      b.addEventListener('click', () => void bulk(action));
+      actions.appendChild(b);
+    };
+    if (state.folder === 'trash') {
+      mk('还原', 'restore');
+      mk('彻底删除', 'delete', 'btn-danger');
+    } else {
+      mk('已读', 'read');
+      mk('未读', 'unread');
+      mk('星标', 'star');
+      mk('取消星标', 'unstar');
+      mk('删除', 'trash');
+    }
   }
+  syncSelectAll(); // 收敛点：所有会改 state.selected 的路径都经此对齐全选框
 }
 
 async function bulk(action) {
@@ -532,6 +788,7 @@ async function bulk(action) {
     invalidateFolderCaches();
     state.cache.countsAt = 0;
     void refreshCounts();
+    void loadMailboxes(true); // 批量已读/星标/删除都会改变账号计数（BUG-3c）
     await loadFolder(false, true);
   } catch (e) {
     showToast(e.message, true);
@@ -551,41 +808,67 @@ function closeMessagePane() {
   currentThread = [];
   $('#read-message').classList.add('hidden');
   $('#read-placeholder').classList.remove('hidden');
+  syncActiveRow(); // 关闭后清掉残留的 active 高亮（BUG-1）
 }
 
 function isReadMode() {
   return state.openId !== null;
 }
 
+/**
+ * 打开详情后同步「已读」状态（BUG-2）。
+ * 服务端 GET 详情时已把 read 置 1 并把新值返回，前端若用 `!currentMessage.read` 判断会永远为假，
+ * 导致本地补丁整段被跳过、列表行继续显示未读。这里改为幂等、不依赖服务端返回值：
+ * 无条件把 read:1 写入 state.items / 所有文件夹缓存 / 消息缓存 / 当前行 DOM；
+ * 是否刷新计数只取决于「打开前本地是否确实观察到未读」（prior 为 null 视为未知，按未读处理）。
+ */
+function syncOpenedReadState(message, prior) {
+  if (!message || message.direction !== 'inbound') return;
+  const observed = prior || findItem(message.id);
+  const wasUnread = !observed || !observed.read;
+  applyLocalPatch(message.id, { read: 1 });
+  if (wasUnread) {
+    state.cache.countsAt = 0;
+    void refreshCounts();
+    void loadMailboxes(true); // 账号未读数随阅读一起更新（BUG-3c）
+  }
+}
+
 async function openMessage(id) {
   const cached = state.cache.messages.get(id);
-  if (cached && Date.now() - cached.at < TTL.message) {
+  const cacheFresh = cached && Date.now() - cached.at < TTL.message;
+  // 入站邮件若在缓存里仍是未读（用户曾手动标为未读），复用缓存会跳过服务端「打开即已读」，
+  // 必须重新请求详情让服务端落库，否则下次刷新列表又会变回未读。
+  const cacheUsable =
+    cacheFresh && !(cached.message && cached.message.direction === 'inbound' && !cached.message.read);
+  if (cacheUsable) {
+    touchMessageCache(id);
     currentMessage = cached.message;
     currentAttachments = cached.attachments || [];
     currentThread = cached.thread || [];
     state.openId = id;
+    syncOpenedReadState(cached.message);
     renderRead();
+    persistSoon();
     return;
   }
 
+  const prior = findItem(id); // 打开前的本地状态，用于判断是否真的发生 0→1 跃迁
   try {
     const data = await api(`/api/messages/${encodeURIComponent(id)}`);
     currentMessage = data.message;
     currentAttachments = data.attachments || [];
     currentThread = data.thread || [];
-    state.cache.messages.set(id, {
+    putMessageCache(id, {
       message: currentMessage,
       attachments: currentAttachments,
       thread: currentThread,
       at: Date.now(),
     });
     state.openId = id;
-    if (currentMessage.direction === 'inbound' && !currentMessage.read) {
-      applyLocalPatch(id, { read: 1 });
-      state.cache.countsAt = 0;
-      void refreshCounts();
-    }
+    syncOpenedReadState(currentMessage, prior);
     renderRead();
+    persistSoon();
   } catch (e) {
     showToast(e.message, true);
   }
@@ -611,6 +894,7 @@ async function setFlag(key, value) {
     renderRead();
     state.cache.countsAt = 0;
     void refreshCounts();
+    void loadMailboxes(true); // 账号未读数随标记一起更新（BUG-3c）
   } catch (e) {
     showToast(e.message, true);
   }
@@ -626,6 +910,7 @@ async function deleteFromRead() {
     invalidateFolderCaches();
     state.cache.countsAt = 0;
     void refreshCounts();
+    void loadMailboxes(true); // 删除会改变账号计数（BUG-3c）
     showToast('已移入已删除');
     closeMessagePane();
     void loadFolder(false, true);
@@ -966,8 +1251,44 @@ function isRich() {
   return state.composing && state.composing.rich === true;
 }
 
+/**
+ * 解析收件人输入：逗号 / 分号（含中文全角）/ 空白均为分隔符，
+ * 每段 trim 后去空，再按小写去重（保留首次出现的写法）。
+ * 与后端 parseRecipient() 的字符串分支同一口径，避免前后端解析结果漂移。
+ */
+function parseRecipients(raw) {
+  const seen = new Set();
+  const out = [];
+  for (const part of String(raw == null ? '' : raw).split(/[,;，；\s]+/)) {
+    const addr = part.trim();
+    const key = addr.toLowerCase();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(addr);
+  }
+  return out;
+}
+
+/** 更新「合并发送」提示：勾选且收件人 > 1 时显示将分别发送的封数，否则清空。 */
+function updateMergeHint() {
+  const n = parseRecipients($('#f-to').value).length;
+  $('#merge-hint').textContent = $('#f-merge').checked && n > 1 ? `将分别单独发送给 ${n} 位收件人` : '';
+}
+
+/** 打开弹窗时重置「合并发送」：取消勾选并清空提示。勾选不算用户输入，不进基线。 */
+function resetMergePick() {
+  $('#f-merge').checked = false;
+  updateMergeHint();
+}
+
+/** 合并发送只在写信模式可用：回复模式的收件人由后端从原邮件推导，显示该控件会误导用户。 */
+function setMergeRowVisible(visible) {
+  $('.merge-row').classList.toggle('hidden', !visible);
+}
+
 function composerMailboxOptions() {
-  const list = state.mailboxList.map((m) => m.mailbox);
+  // 「(未识别)」是聚合用的展示分组，不是可发送地址，不能出现在发件人选择里。
+  const list = state.mailboxList.map((m) => m.mailbox).filter((m) => m && m !== UNKNOWN_MAILBOX);
   if (state.fromAddress && !list.includes(state.fromAddress.toLowerCase())) list.unshift(state.fromAddress.toLowerCase());
   const def = state.composing && state.composing.mailbox ? state.composing.mailbox : '';
   if (def && !list.includes(def)) list.unshift(def);
@@ -1027,6 +1348,8 @@ function openComposer() {
   resetComposerEditor();
   $('#composer-info').textContent = `${state.fromName ? state.fromName + ' ' : ''}<${state.fromAddress}>`;
   hideDiscardConfirm(false);
+  resetMergePick();
+  setMergeRowVisible(true); // 写信模式：显示合并发送
   composerLastFocus = null;
   // 记录基线：此后任何与基线的差异都算「用户输入」
   composerBaseline = {
@@ -1069,6 +1392,8 @@ function openReplyComposer() {
   const mailboxInfo = m.mailbox ? m.mailbox : state.fromAddress;
   $('#composer-info').textContent = `${state.fromName ? state.fromName + ' ' : ''}<${mailboxInfo}>`;
   hideDiscardConfirm(false);
+  resetMergePick();
+  setMergeRowVisible(false); // 回复模式：收件人由后端从原邮件推导，隐藏该控件避免误导
   composerLastFocus = null;
   // 记录基线：预填的收件人/主题不算用户输入
   composerBaseline = {
@@ -1315,9 +1640,9 @@ function bindToolbar() {
 async function sendCompose() {
   const c = state.composing;
   if (!c) return;
-  const to = $('#f-to').value.trim();
+  const recipients = parseRecipients($('#f-to').value);
   const subject = $('#f-subject').value.trim();
-  if (!to) return showToast('请填写收件人', true);
+  if (!recipients.length) return showToast('请填写收件人', true);
 
   let body = $('#f-body').value;
   let html = null;
@@ -1332,38 +1657,49 @@ async function sendCompose() {
   if (!body.trim() && !htmlHasText) return showToast('请填写邮件内容', true);
 
   const mailbox = $('#f-mailbox-label').classList.contains('hidden') ? undefined : $('#f-mailbox').value;
+  // 硬防御：合并发送只对写信接口生效，绝不向 /api/messages/:id/reply 发 merge
+  const merge = c.mode === 'compose' && $('#f-merge').checked;
 
   const payload = {
-    to,
+    to: recipients,
     subject,
     body: body || undefined,
     html: html && htmlHasText ? html : undefined,
     attachments: c.files.map((f) => ({ filename: f.name, content: f.content, content_type: f.type })),
   };
   if (mailbox) payload.mailbox = mailbox;
+  if (merge) payload.merge = true;
 
   const sendBtn = $('#composer-send');
   sendBtn.disabled = true;
   sendInFlight = true; // 发送中禁止放弃，避免失败时内容丢失
   try {
-    if (c.mode === 'reply') {
-      await api(`/api/messages/${encodeURIComponent(c.originalId)}/reply`, {
-        method: 'POST',
-        body: JSON.stringify(payload),
-      });
-      showToast('回复已发送');
+    const url = c.mode === 'reply'
+      ? `/api/messages/${encodeURIComponent(c.originalId)}/reply`
+      : '/api/messages';
+    const res = await api(url, { method: 'POST', body: JSON.stringify(payload) });
+
+    if (merge && res && res.merge) {
+      // 合并发送：可能部分失败。失败者写回收件人框，重试时只发给失败的人，
+      // 不会重复投递给已成功的人；弹窗保持打开，已输入内容不丢。
+      if (res.failed_count > 0) {
+        const failed = res.failed || [];
+        $('#f-to').value = failed.map((f) => f.to).join(', ');
+        updateMergeHint();
+        const first = failed[0] || {};
+        showToast(`已发送 ${res.sent_count} 封，${res.failed_count} 封失败：${first.to}（${first.error}）`, true);
+        return;
+      }
+      showToast(`已分别发送给 ${res.sent_count} 位收件人`);
     } else {
-      await api('/api/messages', {
-        method: 'POST',
-        body: JSON.stringify(payload),
-      });
-      showToast('邮件已发送');
+      showToast(c.mode === 'reply' ? '回复已发送' : '邮件已发送');
     }
+
     closeComposer();
     invalidateFolderCaches();
     state.cache.countsAt = 0;
     void refreshCounts();
-    void loadMailboxes();
+    void loadMailboxes(true);
     if (state.folder !== 'sent') openFolder('sent');
     else void loadFolder(false, true);
   } catch (e) {
@@ -1448,6 +1784,9 @@ function setupEvents() {
   $('#f-attachments').addEventListener('change', (e) => void onPickFiles(e));
   $('#f-mode').addEventListener('click', toggleRich);
   $('#f-quote').addEventListener('click', insertQuote);
+  // 合并发送：勾选状态与收件人数量都会影响提示文案
+  $('#f-merge').addEventListener('change', updateMergeHint);
+  $('#f-to').addEventListener('input', updateMergeHint);
   bindToolbar();
 
   document.addEventListener('keydown', (e) => {
@@ -1478,15 +1817,22 @@ function setupEvents() {
   setupSearch();
 }
 
-/** 定时后台同步：刷新计数 + 当前列表。 */
+/**
+ * 定时后台同步：页面不可见直接跳过；只刷新「超过 TTL」的缓存，不做无条件 force；
+ * 列表刷新在阅读态让路（避免打断阅读），数据没变时由指纹短路、不重建 DOM。
+ */
 async function periodicSync() {
-  await refreshCounts(true);
-  if (!isReadMode() && !state.loading) void loadFolder(false, true);
+  if (document.hidden) return;
+  void refreshCounts(false); // 内部按 TTL.counts 判断
+  void loadMailboxes(false); // 内部按 TTL.mailboxes 判断
+  if (isReadMode() || state.loading) return;
+  const c = state.cache.folders.get(folderKey());
+  if (!c || Date.now() - c.at >= TTL.folder) void loadFolder(false, false);
 }
 
 /* ---------------- 初始化 ---------------- */
 
-async function init() {
+async function loadAccount() {
   try {
     const account = await api('/api/account');
     state.canSend = !!account.can_send;
@@ -1495,16 +1841,53 @@ async function init() {
   } catch (e) {
     showToast(e.message, true);
   }
+}
 
-  await loadMailboxes();
-  renderNav();
+async function init() {
+  // 1) 同步恢复本地缓存 → 首屏 0 请求即可显示列表 / 计数徽标 / 账号下拉
+  const restored = restorePersisted();
+  const mailboxAtStart = state.mailbox;
+
   setupEvents();
+  renderNav();
+  renderMailboxSelect();
   renderListTitle();
-  closeMessagePane();
-  void loadFolder();
-  void refreshCounts(true);
+
+  if (restored) {
+    state.loading = false;
+    paintList();
+    syncActiveRow();
+    if (state.openId && state.items.some((it) => it.id === state.openId)) {
+      state.pendingOpenId = state.openId; // 稍后按需重开（正文不落盘，需一次详情请求）
+    } else {
+      state.openId = null;
+    }
+  } else {
+    closeMessagePane();
+  }
+
+  // 2) 四个请求并发发起，不再串行 await（loadFolder 用缓存里的 mailbox，账号列表回来后若有出入再纠正）
+  await Promise.all([
+    loadAccount(),
+    loadMailboxes(true),
+    refreshCounts(true),
+    loadFolder(),
+  ]);
+
+  if (state.mailbox !== mailboxAtStart) void loadFolder(false, true); // 缓存里的账号已失效，按纠正后的账号重拉
+
+  // 3) 恢复上次打开的邮件（仅当它仍在当前列表里）
+  if (state.pendingOpenId) {
+    const id = state.pendingOpenId;
+    state.pendingOpenId = null;
+    void openMessage(id);
+  }
 
   setInterval(periodicSync, SYNC_MS);
+  // 页面重新可见时补一次同步（隐藏期间跳过的刷新在这里补齐）
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) void periodicSync();
+  });
 }
 
 init();

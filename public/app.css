@@ -517,5 +517,22 @@ html, body {
 #composer .composer-row > label:not(.att-pick) { flex: 0 0 auto; }
 #composer .composer-row > label.grow { flex: 1; }
 #composer label.auto-label select { width: auto; min-width: 200px; }
+
+/* ---------- 合并发送（写信/回复共用一行） ---------- */
+/* 注意：上面的 `#composer label:not(.att-pick)` 把 label 设成了纵向 flex，
+   这里用同权重但更靠后的选择器覆盖回横向排列。 */
+#composer .merge-row { align-items: center; }
+#composer label.merge-pick {
+  display: inline-flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  cursor: pointer;
+  color: var(--text-dim);
+  font-size: 13px;
+}
+#composer label.merge-pick input[type="checkbox"] { margin: 0; cursor: pointer; }
+.merge-hint { color: var(--text-dim); font-size: 12px; }
 .mail-body { font-size: 15px; }
 .env-who .who-name .from-me { font-weight: 600; }

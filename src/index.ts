@@ -134,7 +134,14 @@ async function getMessageDetail(env: Env, id: string): Promise<Response> {
     message.read = 1;
   }
 
-  const attachments = (await repo.listAttachments(env, id)).map((a) => ({
+  // 附件与会话上下文互不依赖，并行取（少一个串行 D1 往返）；markRead 必须在返回前完成，故留在上面串行。
+  const noThread: Awaited<ReturnType<typeof repo.listThread>> = [];
+  const [attachmentsRaw, threadRaw] = await Promise.all([
+    repo.listAttachments(env, id),
+    message.thread_id ? repo.listThread(env, message.thread_id) : Promise.resolve(noThread),
+  ]);
+
+  const attachments = attachmentsRaw.map((a) => ({
     id: a.id,
     message_id: a.message_id,
     filename: a.filename,
@@ -146,23 +153,20 @@ async function getMessageDetail(env: Env, id: string): Promise<Response> {
   }));
 
   // 会话上下文（同一 thread_id 内，按时间升序）
-  let thread: Array<Record<string, unknown>> = [];
-  if (message.thread_id) {
-    thread = (await repo.listThread(env, message.thread_id)).map((t) => ({
-      id: t.id,
-      direction: t.direction,
-      mailbox: t.mailbox,
-      from_name: t.from_name,
-      from_email: t.from_email,
-      to: jsonArr(t.to_emails),
-      subject: t.subject,
-      preview: t.preview,
-      received_at: t.received_at,
-      read: t.read === 1,
-      deleted: t.deleted === 1,
-      current: t.id === id,
-    }));
-  }
+  const thread: Array<Record<string, unknown>> = threadRaw.map((t) => ({
+    id: t.id,
+    direction: t.direction,
+    mailbox: t.mailbox,
+    from_name: t.from_name,
+    from_email: t.from_email,
+    to: jsonArr(t.to_emails),
+    subject: t.subject,
+    preview: t.preview,
+    received_at: t.received_at,
+    read: t.read === 1,
+    deleted: t.deleted === 1,
+    current: t.id === id,
+  }));
 
   const { to_emails, cc, bcc, reply_to, ...rest } = message;
   return json({
@@ -179,6 +183,28 @@ async function getMessageDetail(env: Env, id: string): Promise<Response> {
   });
 }
 
+/** 收件人按小写去重（保留首次出现的原始写法），顺带 trim 与去空。 */
+function dedupeRecipients(list: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const raw of list) {
+    const addr = raw.trim();
+    const key = addr.toLowerCase();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(addr);
+  }
+  return out;
+}
+
+/**
+ * 切分多收件人字符串：逗号 / 分号（含中文全角）/ 空白均为分隔符，
+ * 每段 trim 后去空，再按小写去重。与前端 parseRecipients 同一口径。
+ */
+function splitRecipients(raw: string): string[] {
+  return dedupeRecipients(raw.split(/[,;，；\s]+/));
+}
+
 function parseRecipient(raw: unknown): string[] {
   if (Array.isArray(raw)) {
     const out: string[] = [];
@@ -191,11 +217,37 @@ function parseRecipient(raw: unknown): string[] {
     }
     return out.filter(Boolean);
   }
-  if (typeof raw === 'string') return [raw.trim()].filter(Boolean);
+  if (typeof raw === 'string') return splitRecipients(raw);
   return [];
 }
 
 const MAX_ATTACHMENT_BYTES = 40 * 1024 * 1024; // 对齐 Resend 附件上限
+/**
+ * 每位收件人在合并发送中消耗的子请求数：
+ *   1 次 Resend fetch + 1 次 D1 .run()（saveOutbound）
+ *   + 每个附件 1 次 R2 put + 有附件时 1 次 D1 .batch()（写附件元数据）。
+ *
+ * ⚠️ Cloudflare 的子请求口径**包含对 R2 / D1 的调用**，不只是 fetch。
+ * 此处假设 `DB.batch()` 计 1 次子请求（单次事务往返）。
+ */
+function perRecipientSubrequests(attachmentCount: number): number {
+  return 2 + attachmentCount + (attachmentCount > 0 ? 1 : 0);
+}
+
+/** 绝对上限：串行发送的兜底，防止预算被配得过大导致单请求过久。 */
+const MAX_MERGE_RECIPIENTS = 200;
+
+/**
+ * 合并发送单次最多收件人数（按附件数动态计算）。
+ * 预算默认 45（免费版 50 子请求留 5 余量）。触顶会在循环中途抛错 → 部分邮件已发出、
+ * 用户重试可能重复投递，所以必须留余量，不能贴着 50 用。
+ * 付费版可在 wrangler.toml 把 MERGE_SUBREQ_BUDGET 调大。
+ */
+function mergeRecipientCap(env: Env, attachmentCount: number): number {
+  const budget = clampInt(env.MERGE_SUBREQ_BUDGET ?? null, 45, 10000);
+  const cost = perRecipientSubrequests(attachmentCount);
+  return Math.max(1, Math.min(MAX_MERGE_RECIPIENTS, Math.floor(budget / cost)));
+}
 
 function parseAttachments(raw: unknown): ResendAttachment[] | null {
   if (raw == null) return [];
@@ -259,9 +311,90 @@ function resolveSender(env: Env, mailboxCandidate?: string): { from: string; mai
   return { from, mailbox };
 }
 
+interface MergeInput {
+  recipients: string[];
+  cc: string[];
+  subject: string;
+  content: { text: string; html: string };
+  attachments: ResendAttachment[];
+  sender: { from: string; mailbox: string };
+}
+
+/**
+ * 合并发送：串行地为每位收件人单独发送一封（正文/主题/附件完全相同），
+ * 每人各存一条独立 outbound 记录（独立会话），单个失败不中断后续。
+ *
+ * 一律返回 HTTP 200：部分成功既非全对也非全错，前端据 `failed` 明细做「只重发失败者」。
+ * `ok` 表示「是否**全部**成功」（`failed.length === 0`）；部分成功或全部失败都为 `false`，
+ * 但状态码一律 200，调用方须看 `sent`/`failed` 明细。
+ */
+async function composeMerge(env: Env, input: MergeInput): Promise<Response> {
+  const sent: Array<{ to: string; id: string; resend_id: string }> = [];
+  const failed: Array<{ to: string; error: string }> = [];
+
+  for (const addr of input.recipients) {
+    let resendId: string;
+    try {
+      const result = await resendSend(env, {
+        from: input.sender.from,
+        to: [addr],
+        cc: input.cc,
+        subject: input.subject,
+        text: input.content.text,
+        html: input.content.html,
+        attachments: input.attachments,
+      });
+      if (!result.ok) {
+        failed.push({ to: addr, error: result.error || '发送失败' });
+        continue;
+      }
+      resendId = result.id!;
+    } catch (err) {
+      failed.push({ to: addr, error: `发送失败: ${String(err)}` });
+      continue;
+    }
+
+    // 邮件已经投递出去了：存库失败不能算「未发送」，否则用户重试会重复投递
+    let rowId = '';
+    try {
+      rowId = await repo.saveOutbound(env, {
+        inReplyTo: null,
+        references: null,
+        threadId: uuid(), // 每人独立会话
+        mailbox: input.sender.mailbox,
+        fromName: env.SEND_FROM_NAME || null,
+        fromEmail: input.sender.mailbox,
+        to: [addr],
+        cc: input.cc,
+        subject: input.subject,
+        html: input.content.html,
+        text: input.content.text,
+        resendId,
+        receivedAt: nowSec(),
+      });
+      await storeOutboundAttachments(env, rowId, input.attachments).catch((err) => {
+        console.error('storeOutboundAttachments failed:', err);
+      });
+    } catch (err) {
+      console.error('merge saveOutbound failed:', err);
+    }
+    sent.push({ to: addr, id: rowId, resend_id: resendId });
+  }
+
+  return json({
+    ok: failed.length === 0,
+    merge: true,
+    total: input.recipients.length,
+    sent_count: sent.length,
+    failed_count: failed.length,
+    sent,
+    failed,
+  });
+}
+
 async function compose(env: Env, request: Request): Promise<Response> {
   const body = (await request.json().catch(() => null)) as
-    | { to?: unknown; cc?: unknown; subject?: unknown; body?: unknown; html?: unknown; mailbox?: unknown; attachments?: unknown }
+    | { to?: unknown; cc?: unknown; subject?: unknown; body?: unknown; html?: unknown; mailbox?: unknown; attachments?: unknown; merge?: unknown }
     | null;
   if (!body) return json({ error: '参数错误' }, 400);
 
@@ -274,6 +407,18 @@ async function compose(env: Env, request: Request): Promise<Response> {
   if (attachments === null) return json({ error: '附件格式错误' }, 400);
 
   const sender = resolveSender(env, typeof body.mailbox === 'string' ? body.mailbox : undefined);
+
+  // 合并发送：每位收件人各发一封独立邮件（内容与主题不变）
+  if (body.merge === true) {
+    const recipients = dedupeRecipients(to);
+    if (!recipients.length) return json({ error: '缺少收件人' }, 400);
+    const cap = mergeRecipientCap(env, attachments.length);
+    if (recipients.length > cap) {
+      const why = attachments.length > 0 ? `（当前 ${attachments.length} 个附件）` : '';
+      return json({ error: `单次合并发送最多 ${cap} 位收件人${why}` }, 400);
+    }
+    return composeMerge(env, { recipients, cc, subject, content, attachments, sender });
+  }
 
   const result = await resendSend(env, {
     from: sender.from,
