@@ -32,6 +32,14 @@ const PERSIST_DEBOUNCE_MS = 300;
 const MSG_CACHE_MAX = 40;
 const MSG_CACHE_BYTES = 2 * 1024 * 1024;
 
+/*
+ * 落盘的正文子集。localStorage 通常只有 5MB/源，而内存 LRU 允许 2MB ——
+ * 所以落盘要另设更紧的预算，且超配额时必须能逐级退让（见 writePersisted）。
+ * 12 封覆盖「刷新前后正在来回看的那几封」，已经能消掉绝大多数重复下载。
+ */
+const PERSIST_MSG_MAX = 12;
+const PERSIST_MSG_BYTES = 1.5 * 1024 * 1024;
+
 /** 后端把 mailbox 为空/NULL 的行归入这个显式分组；必须与 src/repo.ts 的 UNKNOWN_MAILBOX 一致。 */
 const UNKNOWN_MAILBOX = '(未识别)';
 
@@ -238,30 +246,65 @@ function readPersisted() {
 }
 
 /**
- * 把当前视图（列表 + 计数 + 账号列表 + openId）写入本地。空列表不写（避免把 loading 态落盘）。
- * 不持久化 state.selected：选中态跨刷新保留会让人困惑。
+ * 从内存 LRU 里挑出要落盘的正文子集：**优先保留最近读过的**，直到条数或字节数触顶。
+ * Map 的迭代顺序即 LRU 顺序（最久未用在前），所以从尾部往前收。
+ * 返回 [[id, entry], ...]，顺序为「最久未用 → 最近使用」，恢复时按序 set 即可还原 LRU 次序。
+ */
+function collectPersistMessages() {
+  const picked = [];
+  let bytes = 0;
+  let oversized = null; // 兜底：若每一封都超预算，至少留下最近那一封，否则正文缓存永远是空的
+  const entries = Array.from(state.cache.messages.entries());
+  for (let i = entries.length - 1; i >= 0 && picked.length < PERSIST_MSG_MAX; i--) {
+    const [id, entry] = entries[i];
+    if (!entry || !entry.message) continue;
+    const size = entry.bytes || entryBytes(entry);
+    if (bytes + size > PERSIST_MSG_BYTES) {
+      if (!oversized) oversized = [id, entry];
+      continue;
+    }
+    bytes += size;
+    picked.push([id, entry]);
+  }
+  if (!picked.length && oversized) picked.push(oversized);
+  picked.reverse();
+  return picked;
+}
+
+/** 写一次快照。成功返回 true；隐私模式 / 超配额（QuotaExceededError）返回 false。 */
+function tryWritePersisted(payload) {
+  try {
+    localStorage.setItem(CACHE_KEY, JSON.stringify(payload));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 把当前视图（列表 + 计数 + 账号列表 + openId + 最近读过的正文）写入本地。
+ * 空列表不写（避免把 loading 态落盘）。不持久化 state.selected：选中态跨刷新保留会让人困惑。
+ *
+ * 超配额时**逐级退让**：先砍掉正文、保住列表与计数；再不行就整份放弃（保留上一次的快照）。
+ * 这样「正文太大」永远不会把列表缓存一起赔进去。
  */
 function writePersisted() {
-  try {
-    if (!state.items.length) return;
-    localStorage.setItem(
-      CACHE_KEY,
-      JSON.stringify({
-        v: CACHE_VERSION,
-        at: Date.now(),
-        folderKey: folderKey(),
-        mailbox: state.mailbox,
-        folderName: state.folder,
-        q: state.q,
-        folder: { items: state.items, total: state.total },
-        counts: state.counts,
-        mailboxes: state.mailboxList,
-        openId: state.openId,
-      })
-    );
-  } catch {
-    /* 隐私模式 / 超配额（QuotaExceededError）：静默降级为「不持久化」，不影响功能 */
-  }
+  if (!state.items.length) return;
+  const base = {
+    v: CACHE_VERSION,
+    at: Date.now(),
+    folderKey: folderKey(),
+    mailbox: state.mailbox,
+    folderName: state.folder,
+    q: state.q,
+    folder: { items: state.items, total: state.total },
+    counts: state.counts,
+    mailboxes: state.mailboxList,
+    openId: state.openId,
+  };
+  const messages = collectPersistMessages();
+  if (messages.length && tryWritePersisted({ ...base, messages })) return;
+  tryWritePersisted(base);
 }
 
 /** 防抖写入，避免读信 / 翻页 / 批量操作时高频 JSON.stringify 卡主线程。 */
@@ -273,6 +316,8 @@ function persistSoon() {
 /**
  * 启动时**同步**恢复本地快照并立即渲染（0 请求）。
  * 只恢复与当前默认视图（inbox / 无搜索）一致的列表；计数与账号列表始终可用。
+ * 正文缓存独立于列表恢复 —— 即使列表不可用（上次在别的文件夹 / 搜索态），
+ * 之前读过的邮件仍能立刻打开、不必重新下载。
  * 任何异常都安全降级为「没有缓存」，绝不白屏。返回是否恢复了列表内容。
  */
 function restorePersisted() {
@@ -283,6 +328,15 @@ function restorePersisted() {
     if (Array.isArray(p.mailboxes)) state.mailboxList = p.mailboxes;
     if (typeof p.mailbox === 'string') state.mailbox = p.mailbox;
     if (typeof p.openId === 'string') state.openId = p.openId;
+    // 落盘顺序是「最久未用 → 最近使用」，按序 set 即可还原 LRU 次序
+    if (Array.isArray(p.messages)) {
+      for (const pair of p.messages) {
+        if (!Array.isArray(pair) || pair.length !== 2) continue;
+        const [id, entry] = pair;
+        if (typeof id !== 'string' || !entry || typeof entry !== 'object' || !entry.message) continue;
+        putMessageCache(id, entry); // 复用同一套条数/字节上限与 LRU 逻辑
+      }
+    }
     const listOk =
       p.folder && Array.isArray(p.folder.items) && p.folder.items.length > 0 &&
       p.folderName === state.folder && p.q === '' && p.folderKey === folderKey();
@@ -854,22 +908,26 @@ function syncOpenedReadState(message, prior) {
 
 async function openMessage(id) {
   const cached = state.cache.messages.get(id);
-  const cacheFresh = cached && Date.now() - cached.at < TTL.message;
-  // 入站邮件若在缓存里仍是未读（用户曾手动标为未读），复用缓存会跳过服务端「打开即已读」，
-  // 必须重新请求详情让服务端落库，否则下次刷新列表又会变回未读。
-  const cacheUsable =
-    cacheFresh && !(cached.message && cached.message.direction === 'inbound' && !cached.message.read);
-  if (cacheUsable) {
-    detailSeq++; // 缓存命中即已完整，作废任何在途的旧请求
+
+  // 缓存命中：正文是不可变的，所以**无论缓存多旧都先渲染**（阅读不被网络阻塞），
+  // 需要时再后台校验。这样刷新页面后重新点开读过的邮件是即时的。
+  if (cached && cached.message) {
+    const cacheFresh = Date.now() - cached.at < TTL.message;
+    // 入站邮件若在缓存里仍是未读（用户曾手动标为未读），必须请求服务端让它落库「已读」，
+    // 否则下次刷新列表又会变回未读。
+    const mustRecordRead = cached.message.direction === 'inbound' && !cached.message.read;
+
+    detailSeq++; // 已用缓存立刻出画面，作废任何在途的旧请求
     detailPending = null;
     touchMessageCache(id);
     currentMessage = cached.message;
     currentAttachments = cached.attachments || [];
     currentThread = cached.thread || [];
     state.openId = id;
-    syncOpenedReadState(cached.message);
+    syncOpenedReadState(cached.message); // 先补本地已读态，再渲染，按钮文案才是对的
     renderRead();
     persistSoon();
+    if (!cacheFresh || mustRecordRead) void revalidateMessage(id);
     return;
   }
 
@@ -893,20 +951,7 @@ async function openMessage(id) {
     const data = await api(`/api/messages/${encodeURIComponent(id)}`);
     // 过期响应（用户已切走 / 已关闭 / 又点了别的邮件）直接丢弃，不覆盖当前视图
     if (seq !== detailSeq) return;
-    currentMessage = data.message;
-    currentAttachments = data.attachments || [];
-    currentThread = data.thread || [];
-    detailPending = null;
-    putMessageCache(id, {
-      message: currentMessage,
-      attachments: currentAttachments,
-      thread: currentThread,
-      at: Date.now(),
-    });
-    state.openId = id;
-    syncOpenedReadState(currentMessage, prior);
-    renderRead();
-    persistSoon();
+    applyDetailToView(id, data, prior);
   } catch (e) {
     if (seq !== detailSeq) return;
     if (prior) {
@@ -916,6 +961,52 @@ async function openMessage(id) {
     }
     showToast(e.message, true);
   }
+}
+
+/** 把详情响应写进缓存并更新当前视图（正文位从「下载中」换成真实内容）。 */
+function applyDetailToView(id, data, prior) {
+  currentMessage = data.message;
+  currentAttachments = data.attachments || [];
+  currentThread = data.thread || [];
+  detailPending = null;
+  state.openId = id;
+  putMessageCache(id, {
+    message: currentMessage,
+    attachments: currentAttachments,
+    thread: currentThread,
+    at: Date.now(),
+  });
+  syncOpenedReadState(currentMessage, prior);
+  renderRead();
+  persistSoon();
+}
+
+/**
+ * 后台校验详情。正文已经用缓存渲染出来了，所以这里**不阻塞、失败静默**。
+ * 用途：① 缓存已过期（read / starred / status 可能已变）② 入站未读必须让服务端落库「已读」。
+ * 用户若已切走，只更新缓存与列表行，不动右侧面板。
+ */
+async function revalidateMessage(id) {
+  let data;
+  try {
+    data = await api(`/api/messages/${encodeURIComponent(id)}`);
+  } catch {
+    return; // 后台校验失败不打扰用户：正文已经可见
+  }
+  putMessageCache(id, {
+    message: data.message,
+    attachments: data.attachments || [],
+    thread: data.thread || [],
+    at: Date.now(),
+  });
+  syncOpenedReadState(data.message, findItem(id));
+  if (state.openId === id && !detailPending) {
+    currentMessage = data.message;
+    currentAttachments = data.attachments || [];
+    currentThread = data.thread || [];
+    renderRead();
+  }
+  persistSoon();
 }
 
 function readBtn(label, fn, cls = '') {
@@ -1945,7 +2036,7 @@ async function init() {
     paintList();
     syncActiveRow();
     if (state.openId && state.items.some((it) => it.id === state.openId)) {
-      state.pendingOpenId = state.openId; // 稍后按需重开（正文不落盘，需一次详情请求）
+      state.pendingOpenId = state.openId; // 稍后按需重开（正文若已在本地快照里就直接渲染，不会发请求）
     } else {
       state.openId = null;
     }

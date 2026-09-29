@@ -486,6 +486,30 @@ function queryParam(url, key) {
   return qs.get(key);
 }
 const folderCalls = (ctx) => ctx.stub.calls.filter((c) => /^\/api\/folders\//.test(c.url));
+
+/**
+ * 详情请求（GET /api/messages/:id），可指定起始下标。
+ *
+ * ⚠️ **必须按 `c.url` 过滤**：`calls` 里存的是 `{ url, method, body }` **对象**。
+ * 若写成 `filter((u) => /^\/api\/messages\//.test(u))`，正则会被隐式转成 `"[object Object]"`
+ * → **永远不匹配** → `length === 0` 恒成立 → 断言**空转假绿**。
+ * 这不是假设：T8「刷新后不再发起详情请求」最初就是这样"通过"的。
+ */
+const detailCalls = (ctx, from = 0) => ctx.stub.calls.slice(from).filter((c) => /^\/api\/messages\//.test(c.url));
+
+/**
+ * 谓词自检：确认上面那个过滤器**真的能识别详情请求**，而不是恒为空。
+ * 没有这一步，「期望 0 条」的断言无法区分「确实没发」与「过滤器坏了」。
+ * 与 T10（同一过滤器，期望恰好 1 条）构成正负控制组。
+ */
+function assertDetailCollectorWorks(ctx) {
+  ok(ctx.stub.calls.every((c) => c && typeof c.url === 'string'),
+    '谓词自检：calls 里是 {url,...} 对象（必须按 c.url 过滤，不能拿正则直接测对象）');
+  const probe = { url: '/api/messages/__probe__', method: 'GET' };
+  ok(/^\/api\/messages\//.test(probe.url), '谓词自检：过滤器能识别详情请求 URL');
+  ok(!/^\/api\/messages\//.test(probe), '谓词自检：拿正则直接测对象不匹配（即空转写法的症状）');
+}
+
 const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } };
 
 /* ===========================================================================
@@ -964,6 +988,124 @@ const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } 
     ok(!!err && /正文加载失败/.test(err.textContent), '错误态给出失败原因', err && err.textContent);
     ok(!!err && /重试/.test(err.textContent), '错误态提供「重试」按钮');
   }, (() => { const c = inboxFixture(); delete c.messages.B; return c; })());
+
+  /* ---- 正文缓存跨刷新存活 ---- */
+
+  await test('T8 正文跨刷新持久化：刷新后点开读过的邮件不再重新下载', async (ctx) => {
+    // 第一次会话：读 A，等防抖写入落盘
+    evalIn(ctx, "openMessage('A')");
+    await ticks(ctx.win, 8);
+    await sleep(ctx, 450); // > PERSIST_DEBOUNCE_MS(300)
+    const raw = ctx.win.localStorage.getItem('inbox-cache-v1');
+    ok(!!raw, '快照已写入 localStorage（否则下面的断言会空转）');
+    const snap = JSON.parse(raw);
+    ok(Array.isArray(snap.messages), '快照含 messages 字段（正文已落盘）');
+    ok(Array.isArray(snap.messages) && snap.messages.some((p) => p[0] === 'A'),
+      'A 的正文在落盘列表里', Array.isArray(snap.messages) ? snap.messages.map((p) => p[0]).join(',') : 'null');
+
+    // 第二次会话：用刚写下的快照冷启动，等价于「刷新页面」
+    const ctx2 = await boot(Object.assign(inboxFixture(), { seedCache: raw }));
+    try {
+      const snapIds = snap.messages.map((p) => p[0]);
+
+      // ⚠️ 前置：init() 会在启动时「重开上次打开的邮件」。若 openId 没被恢复，boot 根本不会重开，
+      // 下面「boot 期间 0 次详情请求」就变成空转（什么都没测）。
+      ok(evalIn(ctx2, 'state.openId') === 'A', '前置：上次打开的邮件已恢复为 A（否则 boot 不会重开）',
+        evalIn(ctx2, 'state.openId'));
+
+      // ⭐ 核心断言：boot 阶段重开 A 时**一次详情请求都没有发**——正文完全来自本地快照。
+      // 用计数器（不依赖 URL 过滤器）度量，且与「是否重开」互相印证。
+      ok(ctx2.stub.counters.detail === 0,
+        '刷新后重开上次打开的邮件**未发起任何详情请求**（正文来自本地快照，不再重新下载）',
+        `boot 期间 detail 计数 = ${ctx2.stub.counters.detail}`);
+
+      // 快照里的每一封都必须回到内存缓存；尤其 C 在本次会话中从未被请求过，只能来自快照。
+      ok(snapIds.length >= 1, '前置：快照里至少有 1 封正文（否则下面的「全部恢复」会空转）',
+        snapIds.join(','));
+      const missing = snapIds.filter((id) => !evalIn(ctx2, `state.cache.messages.has(${JSON.stringify(id)})`));
+      ok(missing.length === 0, '快照里的每一封正文都已恢复到内存缓存',
+        `快照=[${snapIds.join(',')}] 缺失=[${missing.join(',')}]`);
+
+      const before = ctx2.stub.calls.length;
+      const detailBefore = ctx2.stub.counters.detail;
+      assertDetailCollectorWorks(ctx2);
+      evalIn(ctx2, "openMessage('A')");
+      ok(/正文 A/.test(el(ctx2, '#read-message .mail-body').textContent),
+        '点开后正文**同步**可读（来自本地缓存）',
+        el(ctx2, '#read-message .mail-body').textContent.slice(0, 20));
+      ok(!el(ctx2, '#read-message .mail-body-pending'), '不出现「下载中」占位');
+      await ticks(ctx2.win, 8);
+      // 两条独立口径交叉验证：计数器（不依赖过滤器）+ URL 过滤
+      ok(ctx2.stub.counters.detail === detailBefore,
+        '刷新后点开读过的邮件**不再发起详情请求**（计数器口径）',
+        `${detailBefore} → ${ctx2.stub.counters.detail}`);
+      const detailReqs = detailCalls(ctx2, before);
+      ok(detailReqs.length === 0, '刷新后点开读过的邮件**不再发起详情请求**（URL 口径）',
+        detailReqs.map((c) => c.url).join(' , ') || '（无）');
+    } finally {
+      ctx2.close();
+    }
+  });
+
+  await test('T9 超配额时逐级退让：砍掉正文也必须保住列表缓存', async (ctx) => {
+    evalIn(ctx, "openMessage('A')");
+    await ticks(ctx.win, 8);
+    await sleep(ctx, 450);
+    ok(evalIn(ctx, 'state.cache.messages.size') >= 1, '前置条件：已有正文可落盘');
+
+    // 让「带正文」的写入抛配额错误（模拟 localStorage 满）。
+    // ⚠️ jsdom 的 Storage 是 Proxy：`ls.setItem = fn` 与 `Object.defineProperty(ls, 'setItem', …)`
+    // **都会被 get 陷阱忽略**（已实测：包装函数调用次数恒为 0，数据照样写进去）。
+    // 唯一有效的做法是在 **原型** 上覆写。用例结束必须还原。
+    const ls = ctx.win.localStorage;
+    const proto = Object.getPrototypeOf(ls);
+    const origSetItem = proto.setItem;
+    let triedWithMessages = 0;
+    let triedWithout = 0;
+    proto.setItem = function (k, v) {
+      if (k !== 'inbox-cache-v1') return origSetItem.call(this, k, v);
+      if (String(v).includes('"messages"')) { triedWithMessages++; throw new Error('QuotaExceededError'); }
+      triedWithout++;
+      return origSetItem.call(this, k, v);
+    };
+    try {
+      evalIn(ctx, 'writePersisted()');
+    } finally {
+      proto.setItem = origSetItem;
+    }
+
+    ok(triedWithMessages === 1, '确实先尝试了「带正文」的写入（否则断言会空转）', triedWithMessages);
+    ok(triedWithout === 1, '带正文失败后回退到「不带正文」的写入', triedWithout);
+
+    const snap = JSON.parse(ls.getItem('inbox-cache-v1'));
+    ok(!Object.prototype.hasOwnProperty.call(snap, 'messages'), '最终快照不含正文（正文被砍掉）');
+    ok(Array.isArray(snap.folder.items) && snap.folder.items.length > 0,
+      '列表缓存被保住（没有因为正文太大而一起赔进去）', snap.folder.items.length);
+  });
+
+  await test('T10 正文缓存过期后：仍然立刻可读，同时后台校验', async (ctx) => {
+    evalIn(ctx, "openMessage('A')");
+    await ticks(ctx.win, 8);
+    ok(evalIn(ctx, "state.cache.messages.has('A')"), '前置条件：A 已进入正文缓存');
+
+    // 把缓存时间推到 24 小时前（模拟隔天再打开同一封）
+    evalIn(ctx, "state.cache.messages.get('A').at = Date.now() - 24*3600*1000");
+    const before = ctx.stub.calls.length;
+    const detailBefore = ctx.stub.counters.detail;
+    assertDetailCollectorWorks(ctx);
+    evalIn(ctx, "openMessage('A')");
+    ok(/正文 A/.test(el(ctx, '#read-message .mail-body').textContent),
+      '过期缓存也**同步**渲染，不等网络', el(ctx, '#read-message .mail-body').textContent.slice(0, 20));
+    ok(!el(ctx, '#read-message .mail-body-pending'), '不出现「下载中」占位');
+
+    await ticks(ctx.win, 8);
+    // 这条同时是 T8 的正控制组：同一过滤器必须能抓到 1 条，否则 T8 的 0 条无意义
+    const reqs = detailCalls(ctx, before);
+    ok(reqs.length === 1, '同时后台发起了一次校验请求（保证已读态最终一致）',
+      reqs.map((c) => c.url).join(' , ') || '（无）');
+    ok(ctx.stub.counters.detail === detailBefore + 1, '计数器口径一致：恰好 1 次详情请求',
+      `${detailBefore} → ${ctx.stub.counters.detail}`);
+  });
 
   /* ---- 汇总 ---- */
   console.log('\n================ 失败用例清单 ================');
