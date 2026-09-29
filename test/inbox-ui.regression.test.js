@@ -1047,40 +1047,86 @@ const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } 
     }
   });
 
-  await test('T9 超配额时逐级退让：砍掉正文也必须保住列表缓存', async (ctx) => {
-    evalIn(ctx, "openMessage('A')");
-    await ticks(ctx.win, 8);
-    await sleep(ctx, 450);
-    ok(evalIn(ctx, 'state.cache.messages.size') >= 1, '前置条件：已有正文可落盘');
-
-    // 让「带正文」的写入抛配额错误（模拟 localStorage 满）。
-    // ⚠️ jsdom 的 Storage 是 Proxy：`ls.setItem = fn` 与 `Object.defineProperty(ls, 'setItem', …)`
-    // **都会被 get 陷阱忽略**（已实测：包装函数调用次数恒为 0，数据照样写进去）。
-    // 唯一有效的做法是在 **原型** 上覆写。用例结束必须还原。
+  /**
+   * 在 Storage **原型**上装一个「按容量抛配额错误」的 setItem。
+   * ⚠️ jsdom 的 Storage 是 Proxy：`ls.setItem = fn` 与 `Object.defineProperty(ls, 'setItem', …)`
+   * **都会被 get 陷阱忽略**（已实测：包装函数调用次数恒为 0，数据照样写进去）。
+   * 唯一有效的做法是在原型上覆写。调用方必须在 finally 里还原。
+   * @param ctx 上下文
+   * @param limitOf 返回「当前能接受的最大正文条数」；超过就抛 QuotaExceededError
+   * @returns { tries, restore } tries 记录每次尝试时快照里带的正文条数
+   */
+  function installQuotaStub(ctx, limitOf) {
     const ls = ctx.win.localStorage;
     const proto = Object.getPrototypeOf(ls);
     const origSetItem = proto.setItem;
-    let triedWithMessages = 0;
-    let triedWithout = 0;
+    const tries = [];
+    const countMsgs = (v) => {
+      try { const o = JSON.parse(v); return Array.isArray(o.messages) ? o.messages.length : 0; } catch { return 0; }
+    };
     proto.setItem = function (k, v) {
       if (k !== 'inbox-cache-v1') return origSetItem.call(this, k, v);
-      if (String(v).includes('"messages"')) { triedWithMessages++; throw new Error('QuotaExceededError'); }
-      triedWithout++;
+      const n = countMsgs(v);
+      tries.push(n);
+      if (n > limitOf()) throw new Error('QuotaExceededError');
       return origSetItem.call(this, k, v);
     };
+    return { tries, restore: () => { proto.setItem = origSetItem; } };
+  }
+
+  await test('T9 超配额时对半砍重试：保住较新的正文，列表缓存永不赔进去', async (ctx) => {
+    evalIn(ctx, "openMessage('A')");
+    await ticks(ctx.win, 8);
+    await sleep(ctx, 450);
+    ok(evalIn(ctx, 'state.cache.messages.size') === 2,
+      '前置条件：内存里有 2 封正文可落盘（C 由自动打开带入、A 由本次点击带入）',
+      evalIn(ctx, 'Array.from(state.cache.messages.keys()).join(",")'));
+
+    // 模拟 localStorage 满：只装得下 1 封正文
+    const q = installQuotaStub(ctx, () => 1);
     try {
       evalIn(ctx, 'writePersisted()');
     } finally {
-      proto.setItem = origSetItem;
+      q.restore();
     }
 
-    ok(triedWithMessages === 1, '确实先尝试了「带正文」的写入（否则断言会空转）', triedWithMessages);
-    ok(triedWithout === 1, '带正文失败后回退到「不带正文」的写入', triedWithout);
+    // 空转防护：必须真的「先试 2 封、失败、砍到 1 封再试」
+    ok(q.tries.length === 2, '确实重试了一次（而不是一次性放弃）', q.tries.join(' → '));
+    ok(q.tries[0] === 2 && q.tries[1] === 1,
+      '第一次带 2 封被拒后，砍到 1 封再试', q.tries.join(' → '));
 
-    const snap = JSON.parse(ls.getItem('inbox-cache-v1'));
-    ok(!Object.prototype.hasOwnProperty.call(snap, 'messages'), '最终快照不含正文（正文被砍掉）');
+    const snap = JSON.parse(ctx.win.localStorage.getItem('inbox-cache-v1'));
+    ok(Array.isArray(snap.messages) && snap.messages.length === 1,
+      '最终快照保留 1 封正文', Array.isArray(snap.messages) ? snap.messages.length : 'null');
+    ok(Array.isArray(snap.messages) && snap.messages[0][0] === 'A',
+      '保留的是**较新**的那封（A），不是较旧的 C',
+      Array.isArray(snap.messages) ? snap.messages.map((p) => p[0]).join(',') : 'null');
     ok(Array.isArray(snap.folder.items) && snap.folder.items.length > 0,
       '列表缓存被保住（没有因为正文太大而一起赔进去）', snap.folder.items.length);
+  });
+
+  await test('T9b 连一封正文都写不下时：只写列表，仍然不赔进列表缓存', async (ctx) => {
+    evalIn(ctx, "openMessage('A')");
+    await ticks(ctx.win, 8);
+    await sleep(ctx, 450);
+    ok(evalIn(ctx, 'state.cache.messages.size') === 2, '前置条件：内存里有 2 封正文可落盘',
+      evalIn(ctx, 'state.cache.messages.size'));
+
+    // 模拟极端配额：任何带正文的写入都失败
+    const q = installQuotaStub(ctx, () => 0);
+    try {
+      evalIn(ctx, 'writePersisted()');
+    } finally {
+      q.restore();
+    }
+
+    ok(q.tries.join(' → ') === '2 → 1 → 0',
+      '一路砍到空（2 → 1 → 0），没有跳过任何一档', q.tries.join(' → '));
+
+    const snap = JSON.parse(ctx.win.localStorage.getItem('inbox-cache-v1'));
+    ok(!Object.prototype.hasOwnProperty.call(snap, 'messages'), '最终快照不含正文');
+    ok(Array.isArray(snap.folder.items) && snap.folder.items.length > 0,
+      '列表缓存仍然被保住', snap.folder.items.length);
   });
 
   await test('T10 正文缓存过期后：仍然立刻可读，同时后台校验', async (ctx) => {

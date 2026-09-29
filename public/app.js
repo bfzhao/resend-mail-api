@@ -33,12 +33,10 @@ const MSG_CACHE_MAX = 40;
 const MSG_CACHE_BYTES = 2 * 1024 * 1024;
 
 /*
- * 落盘的正文子集。localStorage 通常只有 5MB/源，而内存 LRU 允许 2MB ——
- * 所以落盘要另设更紧的预算，且超配额时必须能逐级退让（见 writePersisted）。
- * 12 封覆盖「刷新前后正在来回看的那几封」，已经能消掉绝大多数重复下载。
+ * 落盘正文**不另设条数/字节上限**：内存 LRU 里有什么就落什么（LRU 自身已封顶 40 封 / 2MB）。
+ * 真正的兜底是 localStorage 的硬配额（通常 5MB/源）—— 见 writePersisted 的对半砍重试。
+ * 这样「读过的邮件刷新后免下载」覆盖到全部最近读过的邮件，而不是只有最近 12 封。
  */
-const PERSIST_MSG_MAX = 12;
-const PERSIST_MSG_BYTES = 1.5 * 1024 * 1024;
 
 /** 后端把 mailbox 为空/NULL 的行归入这个显式分组；必须与 src/repo.ts 的 UNKNOWN_MAILBOX 一致。 */
 const UNKNOWN_MAILBOX = '(未识别)';
@@ -246,29 +244,17 @@ function readPersisted() {
 }
 
 /**
- * 从内存 LRU 里挑出要落盘的正文子集：**优先保留最近读过的**，直到条数或字节数触顶。
- * Map 的迭代顺序即 LRU 顺序（最久未用在前），所以从尾部往前收。
- * 返回 [[id, entry], ...]，顺序为「最久未用 → 最近使用」，恢复时按序 set 即可还原 LRU 次序。
+ * 收集要落盘的正文：**内存 LRU 里有什么就收什么**（LRU 自身已封顶 40 封 / 2MB）。
+ * Map 的迭代顺序即 LRU 顺序（最久未用在前），所以直接遍历即可得到
+ * 「最久未用 → 最近使用」；恢复时按序 set 就能还原 LRU 次序。
+ * 不在这里设预算 —— 超配额的退让统一交给 writePersisted（对半砍重试）。
  */
 function collectPersistMessages() {
-  const picked = [];
-  let bytes = 0;
-  let oversized = null; // 兜底：若每一封都超预算，至少留下最近那一封，否则正文缓存永远是空的
-  const entries = Array.from(state.cache.messages.entries());
-  for (let i = entries.length - 1; i >= 0 && picked.length < PERSIST_MSG_MAX; i--) {
-    const [id, entry] = entries[i];
-    if (!entry || !entry.message) continue;
-    const size = entry.bytes || entryBytes(entry);
-    if (bytes + size > PERSIST_MSG_BYTES) {
-      if (!oversized) oversized = [id, entry];
-      continue;
-    }
-    bytes += size;
-    picked.push([id, entry]);
+  const out = [];
+  for (const [id, entry] of state.cache.messages) {
+    if (entry && entry.message) out.push([id, entry]);
   }
-  if (!picked.length && oversized) picked.push(oversized);
-  picked.reverse();
-  return picked;
+  return out;
 }
 
 /** 写一次快照。成功返回 true；隐私模式 / 超配额（QuotaExceededError）返回 false。 */
@@ -285,8 +271,9 @@ function tryWritePersisted(payload) {
  * 把当前视图（列表 + 计数 + 账号列表 + openId + 最近读过的正文）写入本地。
  * 空列表不写（避免把 loading 态落盘）。不持久化 state.selected：选中态跨刷新保留会让人困惑。
  *
- * 超配额时**逐级退让**：先砍掉正文、保住列表与计数；再不行就整份放弃（保留上一次的快照）。
- * 这样「正文太大」永远不会把列表缓存一起赔进去。
+ * 超配额时**对半砍重试**（保留较新的那一半），而不是一次性全丢：
+ * 否则读了几十封大正文的用户，一超限就一封正文都缓存不上，与「不设上限」的意图相反。
+ * 砍到一封都写不下时，最后只写列表 —— **列表缓存永远不会被正文赔进去**。
  */
 function writePersisted() {
   if (!state.items.length) return;
@@ -302,8 +289,12 @@ function writePersisted() {
     mailboxes: state.mailboxList,
     openId: state.openId,
   };
-  const messages = collectPersistMessages();
-  if (messages.length && tryWritePersisted({ ...base, messages })) return;
+  // 顺序为「最久未用 → 最近使用」，所以保留尾部 = 保留较新的
+  let messages = collectPersistMessages();
+  while (messages.length) {
+    if (tryWritePersisted({ ...base, messages })) return;
+    messages = messages.slice(Math.ceil(messages.length / 2));
+  }
   tryWritePersisted(base);
 }
 
