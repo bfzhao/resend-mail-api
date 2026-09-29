@@ -70,6 +70,11 @@ function makeStub(cfg = {}) {
   const honorPaging = !!cfg.honorPaging;
   // foldersByMailbox：按 mailbox 查询参数返回不同数据集（BUG-5 用；未命中且 mailbox 非空 → 空页）
   const foldersByMailbox = cfg.foldersByMailbox || null;
+  // holdDetail：把详情响应挂起，由测试用 releaseDetail() 显式放行（FIFO）。
+  // 用于观察「头部已渲染、正文仍在下载」这个中间态，以及验证过期响应不被采用。
+  // 可在运行中通过 setHoldDetail() 开关：boot 阶段通常先关掉，点击阶段再打开。
+  let holdDetail = !!cfg.holdDetail;
+  const heldDetails = [];
 
   const jsonRes = (obj, status = 200) => ({
     ok: status >= 200 && status < 300,
@@ -129,12 +134,29 @@ function makeStub(cfg = {}) {
       counters.detail++;
       const d = store.messages[id];
       if (!d) return Promise.resolve(jsonRes({ error: '邮件不存在' }, 404));
+      if (holdDetail) {
+        return new Promise((resolve) => { heldDetails.push({ id, resolve: () => resolve(jsonRes(d)) }); });
+      }
       return Promise.resolve(jsonRes(d));
     }
     return Promise.resolve(jsonRes({}));
   };
 
-  return { fetchImpl, calls, counters, store };
+  return {
+    fetchImpl, calls, counters, store,
+    /** 放行被 holdDetail 挂起的详情响应。传 id 放行指定那封，不传则放行最早的一封。返回是否放行了。 */
+    releaseDetail(id) {
+      const idx = id === undefined ? 0 : heldDetails.findIndex((h) => h.id === id);
+      if (idx < 0 || idx >= heldDetails.length) return false;
+      const [h] = heldDetails.splice(idx, 1);
+      h.resolve();
+      return true;
+    },
+    /** 当前被挂起（尚未放行）的详情请求 id 列表，按到达顺序。 */
+    heldDetailIds: () => heldDetails.map((h) => h.id),
+    /** 运行中开关「挂起详情响应」。 */
+    setHoldDetail(v) { holdDetail = !!v; },
+  };
 }
 
 /* ---------------------------------------------------------------------------
@@ -363,13 +385,23 @@ async function boot(cfg = {}) {
 
   // 就绪判据：renderNav 已渲染 4 个文件夹 + loadFolder 已渲染出列表行 + maybeAutoOpen 已打开首封。
   // 这三件事都发生在 setupEvents() 之后，因此等价于「事件已接线、init 已跑完」。
+  // 另需等详情落定（detailPending 清空），否则会停在「头部已画、正文还在下载」的中间态。
+  // holdDetail 时详情被测试主动挂起，这一条自动豁免。
+  const wantDetailSettled = !cfg.holdDetail;
   let ready = false;
   for (let i = 0; i < 600; i++) {
     const nav = win.document.querySelector('#folder-nav');
     const list = win.document.querySelector('#list');
     let openId = null;
-    try { openId = win.eval('typeof state === "object" ? state.openId : null'); } catch { /* 脚本未就绪 */ }
-    if (nav && nav.children.length === 4 && list && list.children.length > 0 && openId) { ready = true; break; }
+    let detailSettled = false;
+    try {
+      openId = win.eval('typeof state === "object" ? state.openId : null');
+      detailSettled = !win.eval('detailPending');
+    } catch { /* 脚本未就绪 */ }
+    const settledOk = !wantDetailSettled || detailSettled;
+    if (nav && nav.children.length === 4 && list && list.children.length > 0 && openId && settledOk) {
+      ready = true; break;
+    }
     await tick(win);
   }
   if (!ready) throw new Error('init() 未在预期时间内完成（fetch 打桩或脚本注入失败）');
@@ -855,6 +887,83 @@ const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } 
       '负控制：以 sel.value（\'\'）为真值 ⇒ 请求丢掉 mailbox 参数（断言确实能观察到差异）',
       reqs.map((c) => c.url).join(' , '));
   }, emptyMailboxesFixture([]));
+
+  /* ---- 详情：点击不被「正文尚未下载」阻塞 ---- */
+
+  await test('T5 点开未缓存的邮件：头部同步渲染，正文位显示「下载中」，详情回来后原地替换', async (ctx) => {
+    // 前置：boot 正常完成（首封 C 已自动打开并完整渲染）
+    ok(/正文 C/.test(el(ctx, '#read-message .mail-body').textContent), '前置条件：C 已完整渲染');
+
+    // 把详情接口设为「挂起」，以便观察点击后的中间态
+    ctx.stub.setHoldDetail(true);
+    clickRow(ctx, 'A'); // A 未缓存 → 详情被挂起，停在「正文下载中」
+
+    ok(evalIn(ctx, 'state.openId') === 'A',
+      '点击后 state.openId 立刻切到 A（同步，未等待请求）', JSON.stringify(evalIn(ctx, 'state.openId')));
+    ok(el(ctx, '#read-message .mail-subject h1').textContent === '主题 A',
+      'A 的主题立刻可见，且来自列表项（详情尚未返回）', el(ctx, '#read-message .mail-subject h1').textContent);
+    ok(!!el(ctx, '#read-message .mail-envelope'), '信封卡（发件人/时间/操作按钮）已渲染');
+    ok(el(ctx, '#read-message .env-who .who-email').textContent === 'a@x.com',
+      '发件人邮箱立刻可见', el(ctx, '#read-message .env-who .who-email').textContent);
+
+    const ph = el(ctx, '#read-message .mail-body-pending .body-pending');
+    ok(!!ph, '正文位显示占位（而不是一块空白正文）');
+    ok(!!ph && /正在下载/.test(ph.textContent), '占位文案含「正在下载」', ph && ph.textContent);
+    ok(!el(ctx, '#read-message .mail-body pre.text'), '真实正文尚未渲染（否则上面「下载中」的断言会空转）');
+
+    // 放行详情 → 正文原地替换
+    ok(ctx.stub.releaseDetail('A'), '确实放行了被挂起的详情响应（否则下面的断言会空转）');
+    await ticks(ctx.win, 10);
+    ok(!el(ctx, '#read-message .mail-body-pending'), '详情到达后占位被移除');
+    ok(/正文 A/.test(el(ctx, '#read-message .mail-body').textContent), '正文已原地替换为真实内容',
+      el(ctx, '#read-message .mail-body').textContent.slice(0, 30));
+    ok(el(ctx, '#read-message .mail-subject h1').textContent === '主题 A', '主题保持不变');
+
+    // 负控制：缓存命中时必须同步渲染、不出现占位（证明占位由「缓存未命中」触发，而非无条件渲染）
+    // 这里刻意保持 holdDetail=true —— 即使详情接口是挂起的，缓存命中也不该有占位。
+    clickRow(ctx, 'C');
+    ok(evalIn(ctx, 'state.openId') === 'C', '切回 C');
+    ok(!el(ctx, '#read-message .mail-body-pending'), '负控制：缓存命中 ⇒ 同步渲染，不出现「下载中」占位');
+    ok(/正文 C/.test(el(ctx, '#read-message .mail-body').textContent), '负控制：缓存命中的正文立即可见');
+  });
+
+  await test('T6 快速连点：先发的详情响应后到时，不得覆盖后选的邮件', async (ctx) => {
+    ctx.stub.setHoldDetail(true);
+
+    clickRow(ctx, 'A');
+    clickRow(ctx, 'B');
+    info(`被挂起的详情请求（按到达顺序）: ${JSON.stringify(ctx.stub.heldDetailIds())}`);
+    ok(ctx.stub.heldDetailIds().join(',') === 'A,B', 'A、B 的详情都被挂起且顺序正确',
+      JSON.stringify(ctx.stub.heldDetailIds()));
+    ok(el(ctx, '#read-message .mail-subject h1').textContent === '主题 B', '当前显示的是 B 的头部');
+
+    // 放行「先发」的 A：它已是过期响应，必须被丢弃
+    ok(ctx.stub.releaseDetail('A'), '放行了 A 的（过期）详情响应');
+    await ticks(ctx.win, 10);
+    ok(el(ctx, '#read-message .mail-subject h1').textContent === '主题 B',
+      '过期响应到达后面板仍是 B（没有被 A 覆盖）', el(ctx, '#read-message .mail-subject h1').textContent);
+    ok(evalIn(ctx, 'state.openId') === 'B', 'state.openId 仍为 B', JSON.stringify(evalIn(ctx, 'state.openId')));
+    ok(!!el(ctx, '#read-message .mail-body-pending'), 'B 的正文仍显示「下载中」（A 的响应没有被误用）');
+
+    // 再放行 B：这次是当前请求，应当被采用
+    ok(ctx.stub.releaseDetail('B'), '放行了 B 的详情响应');
+    await ticks(ctx.win, 10);
+    ok(!el(ctx, '#read-message .mail-body-pending'), 'B 的占位被移除');
+    ok(/正文 B/.test(el(ctx, '#read-message .mail-body').textContent), '面板显示 B 的正文',
+      el(ctx, '#read-message .mail-body').textContent.slice(0, 30));
+  });
+
+  await test('T7 详情加载失败：保留头部，正文位给出错误态与重试', async (ctx) => {
+    // B 的详情缺失 → stub 返回 404，模拟详情接口失败
+    clickRow(ctx, 'B');
+    await ticks(ctx.win, 10);
+    ok(el(ctx, '#read-message .mail-subject h1').textContent === '主题 B',
+      '详情失败时头部仍可见（来自列表项）', el(ctx, '#read-message .mail-subject h1').textContent);
+    const err = el(ctx, '#read-message .body-pending.is-error');
+    ok(!!err, '正文位显示错误态占位（而不是一块空白正文）');
+    ok(!!err && /正文加载失败/.test(err.textContent), '错误态给出失败原因', err && err.textContent);
+    ok(!!err && /重试/.test(err.textContent), '错误态提供「重试」按钮');
+  }, (() => { const c = inboxFixture(); delete c.messages.B; return c; })());
 
   /* ---- 汇总 ---- */
   console.log('\n================ 失败用例清单 ================');

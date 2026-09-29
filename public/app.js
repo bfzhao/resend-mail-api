@@ -801,7 +801,25 @@ let currentMessage = null;
 let currentAttachments = [];
 let currentThread = [];
 
+/**
+ * 详情「正文下载中 / 下载失败」的占位状态。
+ * 列表项本身已带主题、发件人、时间、星标、方向、附件数，足够立刻画出信封卡；
+ * 只有正文 / 附件明细 / 会话上下文必须等详情接口。因此点击后**同步**先渲染头部，
+ * 正文位交给这个占位态，详情回来后原地替换——不阻塞点击。
+ * 形如 { id, phase: 'loading' | 'error', message? }
+ */
+let detailPending = null;
+
+/**
+ * 详情请求序号。用户快速连点多封时，先发的响应可能后到；
+ * 过期响应必须丢弃，否则会把后选的邮件覆盖成先选的那封。
+ * closeMessagePane() 也会自增它，使「关闭后又被加载完成重新打开」不可能发生。
+ */
+let detailSeq = 0;
+
 function closeMessagePane() {
+  detailSeq++; // 作废在途详情响应
+  detailPending = null;
   state.openId = null;
   currentMessage = null;
   currentAttachments = [];
@@ -842,6 +860,8 @@ async function openMessage(id) {
   const cacheUsable =
     cacheFresh && !(cached.message && cached.message.direction === 'inbound' && !cached.message.read);
   if (cacheUsable) {
+    detailSeq++; // 缓存命中即已完整，作废任何在途的旧请求
+    detailPending = null;
     touchMessageCache(id);
     currentMessage = cached.message;
     currentAttachments = cached.attachments || [];
@@ -854,11 +874,29 @@ async function openMessage(id) {
   }
 
   const prior = findItem(id); // 打开前的本地状态，用于判断是否真的发生 0→1 跃迁
+
+  // 乐观渲染：先用列表项把头部画出来，正文位显示「正在下载」。
+  // 这样点击的反馈是同步的，不会被详情请求的往返卡住主流程。
+  if (prior) {
+    state.openId = id;
+    currentMessage = prior;
+    currentAttachments = [];
+    currentThread = [];
+    detailPending = { id, phase: 'loading' };
+    renderRead();
+    syncActiveRow();
+    persistSoon();
+  }
+
+  const seq = ++detailSeq;
   try {
     const data = await api(`/api/messages/${encodeURIComponent(id)}`);
+    // 过期响应（用户已切走 / 已关闭 / 又点了别的邮件）直接丢弃，不覆盖当前视图
+    if (seq !== detailSeq) return;
     currentMessage = data.message;
     currentAttachments = data.attachments || [];
     currentThread = data.thread || [];
+    detailPending = null;
     putMessageCache(id, {
       message: currentMessage,
       attachments: currentAttachments,
@@ -870,6 +908,12 @@ async function openMessage(id) {
     renderRead();
     persistSoon();
   } catch (e) {
+    if (seq !== detailSeq) return;
+    if (prior) {
+      // 保留已经画好的头部，只把正文位换成错误态 + 重试，不留一块空白正文
+      detailPending = { id, phase: 'error', message: e.message };
+      renderRead();
+    }
     showToast(e.message, true);
   }
 }
@@ -958,6 +1002,8 @@ function renderRead() {
   const m = currentMessage;
   if (!m) return;
   const isInbound = m.direction === 'inbound';
+  // 正文是否仍在下载（或下载失败）。头部字段来自列表项，只有正文/附件明细依赖详情接口。
+  const pending = detailPending && detailPending.id === m.id ? detailPending : null;
 
   $('#read-placeholder').classList.add('hidden');
   $('#read-message').classList.remove('hidden');
@@ -1013,7 +1059,9 @@ function renderRead() {
   who.appendChild(nameRow);
   const emailLine = document.createElement('div');
   emailLine.className = 'who-email';
-  emailLine.textContent = isInbound ? (m.from_email || '') : `致 ${recipientsLabel(m.to_emails)}`;
+  emailLine.textContent = isInbound
+    ? (m.from_email || '')
+    : `致 ${recipientsLabel(m.to_emails) || (pending ? '…' : '')}`;
   who.appendChild(emailLine);
   top.appendChild(who);
 
@@ -1041,7 +1089,7 @@ function renderRead() {
   toggle.className = 'toggle-detail';
   toggle.textContent = '查看详情';
   const lines = metaLines();
-  toLine.innerHTML = `<b>${toLabel}：</b>${esc(isInbound ? recipientsLabel(m.to_emails) : recipientsLabel(m.to_emails))} `;
+  toLine.innerHTML = `<b>${toLabel}：</b>${esc(recipientsLabel(m.to_emails) || (pending ? '…' : ''))} `;
   toggle.addEventListener('click', () => envelopeDetailToggle(toggle, lines));
   toLine.appendChild(toggle);
   env.appendChild(toLine);
@@ -1076,20 +1124,59 @@ function renderRead() {
     }
     box.appendChild(list);
     env.appendChild(box);
+  } else if (pending && m.attachments_count > 0) {
+    // 附件明细要等详情接口，但列表项已带附件数量：先把数量显示出来，
+    // 否则用户在下载期间会以为这封邮件没有附件。
+    const box = document.createElement('div');
+    box.className = 'attachments';
+    const title = document.createElement('div');
+    title.className = 'att-title';
+    title.textContent = `${m.attachments_count} 个附件（随正文下载中…）`;
+    box.appendChild(title);
+    env.appendChild(box);
   }
   readEl.appendChild(env);
 
-  // 正文
+  // 正文：下载中 / 下载失败时用占位态，不渲染一块空正文
   const bodyCard = document.createElement('div');
   bodyCard.className = 'mail-body';
-  bodyCard.innerHTML = buildBodyHtml(m);
-  bodyCard.querySelectorAll('a').forEach((a) => {
-    a.target = '_blank';
-    a.rel = 'noopener noreferrer';
-  });
+  if (pending) {
+    bodyCard.classList.add('mail-body-pending');
+    bodyCard.appendChild(detailPlaceholder(pending));
+  } else {
+    bodyCard.innerHTML = buildBodyHtml(m);
+    bodyCard.querySelectorAll('a').forEach((a) => {
+      a.target = '_blank';
+      a.rel = 'noopener noreferrer';
+    });
+  }
   readEl.appendChild(bodyCard);
 
   syncRowUI(m.id);
+}
+
+/**
+ * 正文位的占位：下载中显示转圈 + 文案；失败显示原因 + 重试。
+ * 两种情况都**保留信封卡**，用户始终能看到主题 / 发件人 / 时间。
+ */
+function detailPlaceholder(pend) {
+  const wrap = document.createElement('div');
+  wrap.className = 'body-pending' + (pend.phase === 'error' ? ' is-error' : '');
+  if (pend.phase === 'loading') {
+    const spin = document.createElement('span');
+    spin.className = 'spinner';
+    spin.setAttribute('aria-hidden', 'true');
+    wrap.appendChild(spin);
+  }
+  const txt = document.createElement('div');
+  txt.className = 'body-pending-text';
+  txt.setAttribute('role', 'status');
+  txt.textContent = pend.phase === 'error' ? `正文加载失败：${pend.message}` : '正在下载邮件正文…';
+  wrap.appendChild(txt);
+  if (pend.phase === 'error') {
+    wrap.appendChild(readBtn('重试', () => { void openMessage(pend.id); }));
+  }
+  return wrap;
 }
 
 function threadPanel() {

@@ -535,4 +535,30 @@ html, body {
 #composer label.merge-pick input[type="checkbox"] { margin: 0; cursor: pointer; }
 .merge-hint { color: var(--text-dim); font-size: 12px; }
 .mail-body { font-size: 15px; }
+
+/* ---------- 详情正文：下载中 / 下载失败占位 ---------- */
+/* 头部（主题/发件人/时间）来自列表项，点击后同步渲染；只有正文需要等详情接口。 */
+.mail-body-pending { display: flex; align-items: center; justify-content: center; min-height: 180px; }
+.body-pending {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  color: var(--text-dim);
+  font-size: 13px;
+  text-align: center;
+}
+.body-pending.is-error { color: var(--danger); }
+.body-pending .spinner {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  animation: body-spin 0.7s linear infinite;
+}
+@keyframes body-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .body-pending .spinner { animation: none; border-top-color: var(--border); }
+}
 .env-who .who-name .from-me { font-weight: 600; }
