@@ -70,6 +70,8 @@ export interface ListOpts {
 interface FolderRow {
   id: string;
   direction: string;
+  /** 该行所属的收件信箱；乐观渲染信封卡时前端靠它显示「收至 …」，故必须随列表一起返回。 */
+  mailbox: string | null;
   from_name: string | null;
   from_email: string | null;
   subject: string | null;
@@ -126,7 +128,7 @@ function whereForFolder(
 }
 
 const LIST_SELECT = `SELECT
-    m.id, m.direction, m.from_name, m.from_email, m.subject, m.to_emails,
+    m.id, m.direction, m.mailbox, m.from_name, m.from_email, m.subject, m.to_emails,
     substr(coalesce(NULLIF(m.body_text, ''), ''), 1, 200) AS preview,
     m.received_at, m.read, m.starred, m.status,
     (SELECT COUNT(*) FROM attachments a WHERE a.message_id = m.id) AS attachments_count

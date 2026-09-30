@@ -181,8 +181,11 @@ function msg(id, read, extra = {}) {
   }, extra);
 }
 
-/** 详情响应：服务端在响应前已把 read 置 1（src/index.ts getMessageDetail 的真实行为）。 */
-function detail(m, read) {
+/**
+ * 详情响应：服务端在响应前已把 read 置 1（src/index.ts getMessageDetail 的真实行为）。
+ * thread 可选：会话面板用例需要真实会话项，默认空数组（与原行为一致）。
+ */
+function detail(m, read, thread = []) {
   return {
     message: Object.assign({}, m, {
       read,
@@ -195,7 +198,7 @@ function detail(m, read) {
       mailbox: m.mailbox || 'alpha@x.com',
     }),
     attachments: [],
-    thread: [],
+    thread,
   };
 }
 
@@ -226,6 +229,72 @@ function inboxFixture() {
       S1: detail(S1, 1),
     },
     counts: { inbox_unread: 1, inbox_total: 2, sent_total: 1, starred_total: 0, trash_total: 0 },
+  };
+}
+
+/**
+ * 会话面板固定装置：「会话行必须显示收发双方的实际信箱」的回归。
+ *
+ * ⚠️ 会话项的字段名必须与**真实接口**一致：收件人是 `to`（见 src/index.ts 的 thread.map），
+ * 不是 `to_emails`。历史上前端只读 `t.to_emails` → 恒为 undefined → 会话行永远显示「我 → ?」。
+ * 这里刻意只提供 `to`，字段名一旦写错用例必然失败（而不是"恰好蒙对"）。
+ *
+ * 列表首项 T3 是**已读**的：init() 的 maybeAutoOpen 会打开它，会话面板（length > 1）随之渲染。
+ */
+function threadFixture() {
+  const threadItems = [
+    { // 来信（有名字）
+      id: 'T1', direction: 'inbound', mailbox: 'alpha@x.com',
+      from_name: 'Alice', from_email: 'alice@partner.com',
+      to: ['alpha@x.com'], subject: '报价确认',
+      preview: '见附件', received_at: 1700000100, read: true, deleted: false, current: false,
+    },
+    { // 我的回信（出站，两个收件人）
+      id: 'T2', direction: 'outbound', mailbox: 'support@x.com',
+      from_name: 'support', from_email: 'support@x.com',
+      to: ['alice@partner.com', 'bob@partner.com'], subject: 'Re: 报价确认',
+      preview: '好的', received_at: 1700000200, read: true, deleted: false, current: false,
+    },
+    { // 对方再来信（无名字 → 回退邮箱地址），也是当前打开的一封
+      id: 'T3', direction: 'inbound', mailbox: 'alpha@x.com',
+      from_name: null, from_email: 'bob@partner.com',
+      to: ['alpha@x.com'], subject: 'Re: 报价确认',
+      preview: '补充', received_at: 1700000300, read: true, deleted: false, current: true,
+    },
+  ];
+
+  // 列表项走 LIST_SELECT 口径（收件人是 to_emails），与真实列表接口一致。
+  const T3 = msg('T3', 1, {
+    from_name: null, from_email: 'bob@partner.com', subject: 'Re: 报价确认', mailbox: 'alpha@x.com',
+  });
+  const T2 = msg('T2', 1, {
+    direction: 'outbound', from_name: 'support', from_email: 'support@x.com',
+    to_emails: ['alice@partner.com', 'bob@partner.com'], subject: 'Re: 报价确认',
+    mailbox: 'support@x.com', status: 'sent',
+  });
+  // T4 排在 T3 之后 → 不会被 maybeAutoOpen 打开，用来验证「详情未返回时的乐观渲染」。
+  const T4 = msg('T4', 1, {
+    from_name: 'Carol', from_email: 'carol@partner.com', subject: '另一封信', mailbox: 'beta@x.com',
+  });
+
+  return {
+    mailboxes: [
+      { mailbox: 'alpha@x.com', inbox_unread: 0, inbox_total: 1, sent_total: 0 },
+      { mailbox: 'beta@x.com', inbox_unread: 0, inbox_total: 1, sent_total: 0 },
+      { mailbox: 'support@x.com', inbox_unread: 0, inbox_total: 0, sent_total: 1 },
+    ],
+    folders: {
+      inbox: { items: [T3, T4], total: 2 },
+      sent: { items: [T2], total: 1 },
+      starred: { items: [], total: 0 },
+      trash: { items: [], total: 0 },
+    },
+    messages: {
+      T3: detail(T3, 1, threadItems),
+      T2: detail(T2, 1, threadItems),
+      T4: detail(T4, 1, []),
+    },
+    counts: { inbox_unread: 0, inbox_total: 2, sent_total: 1, starred_total: 0, trash_total: 0 },
   };
 }
 
@@ -981,8 +1050,9 @@ const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } 
     ok(el(ctx, '#read-message .mail-subject h1').textContent === '主题 A',
       'A 的主题立刻可见，且来自列表项（详情尚未返回）', el(ctx, '#read-message .mail-subject h1').textContent);
     ok(!!el(ctx, '#read-message .mail-envelope'), '信封卡（发件人/时间/操作按钮）已渲染');
-    ok(el(ctx, '#read-message .env-who .who-email').textContent === 'a@x.com',
-      '发件人邮箱立刻可见', el(ctx, '#read-message .env-who .who-email').textContent);
+    ok(el(ctx, '#read-message .env-who .who-email').textContent === 'a@x.com · 收至 alpha@x.com',
+      '发件人邮箱 + 我方收件信箱立刻可见（乐观渲染，详情尚未返回）',
+      el(ctx, '#read-message .env-who .who-email').textContent);
 
     const ph = el(ctx, '#read-message .mail-body-pending .body-pending');
     ok(!!ph, '正文位显示占位（而不是一块空白正文）');
@@ -1316,6 +1386,68 @@ const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } 
     ok(fetched.includes('/api/messages/A') && fetched.includes('/api/messages/B'),
       '确实发了后台详情请求', fetched.join(' , ') || '（无）');
   }, Object.assign(inboxFixture(), { keepPrefetch: true }));
+
+  /* ---- T12 会话行 / 信封卡必须显示「实际收发信箱」---- */
+  await test('T12 会话行显示收发双方的实际信箱（来信含我方收件信箱）', async (ctx) => {
+    // 负控制：会话面板必须真的渲染出来了，否则下面全部空转
+    ok(!!el(ctx, '.rm-thread'), '会话面板已渲染（currentThread.length > 1）');
+    const rows = Array.from(ctx.doc.querySelectorAll('.rm-thread .t-item'));
+    ok(rows.length === 3, '会话面板渲染出 3 行', rows.length);
+    ok(rows.length === 3 && evalIn(ctx, 'currentThread.length') === 3,
+      '面板行数与 currentThread 一致（不是上一轮的渲染残留）', evalIn(ctx, 'currentThread.length'));
+
+    const texts = rows.map((r) => r.querySelector('.t-sender').textContent);
+    ok(texts[0] === 'Alice → alpha@x.com',
+      '来信：对方名字 → 我方收到的信箱', texts[0]);
+    ok(texts[1] === 'support@x.com → alice@partner.com, bob@partner.com',
+      '我的回信：实际发件信箱 → 完整收件人清单（不再截成首个 local part）', texts[1]);
+    ok(texts[2] === 'bob@partner.com → alpha@x.com',
+      '无名字的来信回退到邮箱地址，仍带我方收件信箱', texts[2]);
+
+    // 旧实现的症状：字段名读错（t.to_emails）→ 恒为「我 → ?」。下面两条直接锁死该症状。
+    ok(!texts.some((t) => t.includes('?')), '任何会话行都不得出现「?」占位', texts.join(' | '));
+    ok(!texts.some((t) => /^我\s*→/.test(t)), '出站行不得用字面量「我」顶替实际发件信箱', texts.join(' | '));
+
+    const titles = rows.map((r) => r.querySelector('.t-sender').title);
+    ok(titles[1] === 'support@x.com → alice@partner.com, bob@partner.com',
+      '会话行 title 给出完整收发双方（列宽不足被省略号截断时靠它读全）', titles[1]);
+  }, threadFixture());
+
+  await test('T12b 信封卡：来信显示「收至 我的信箱」，回信显示实际发件信箱', async (ctx) => {
+    ok(evalIn(ctx, 'state.openId') === 'T3', '前置：首项 T3 已被自动打开', evalIn(ctx, 'state.openId'));
+    ok(el(ctx, '#read-message .env-who .who-name').textContent === 'bob@partner.com',
+      '来信标题：无名字时回退到对方邮箱', el(ctx, '#read-message .env-who .who-name').textContent);
+    ok(el(ctx, '#read-message .env-who .who-email').textContent === 'bob@partner.com · 收至 alpha@x.com',
+      '来信副行必须能一眼看到「我方收到的信箱」',
+      el(ctx, '#read-message .env-who .who-email').textContent);
+
+    // 切到「已发送」，打开我的回信
+    evalIn(ctx, "openFolder('sent')");
+    await ticks(ctx.win, 10);
+    ok(!!rowFor(ctx, 'T2'), '已切到「已发送」且 T2 在列表里（否则下面的点击会空转）');
+    clickRow(ctx, 'T2');
+    await ticks(ctx.win, 20);
+    ok(evalIn(ctx, 'state.openId') === 'T2', '已打开 T2', evalIn(ctx, 'state.openId'));
+    ok(el(ctx, '#read-message .env-who .who-name').textContent === 'support@x.com',
+      '回信标题是**实际发件信箱**，不再是字面量「我」',
+      el(ctx, '#read-message .env-who .who-name').textContent);
+    ok(el(ctx, '#read-message .env-who .who-email').textContent === '致 alice@partner.com, bob@partner.com',
+      '回信副行是完整收件人清单', el(ctx, '#read-message .env-who .who-email').textContent);
+  }, threadFixture());
+
+  await test('T12c 乐观渲染：详情未返回时信封卡已显示「收至 我的信箱」', async (ctx) => {
+    ok(evalIn(ctx, 'state.openId') === 'T3', '前置：自动打开的是 T3');
+    ctx.stub.setHoldDetail(true);
+    clickRow(ctx, 'T4');
+    ok(evalIn(ctx, 'state.openId') === 'T4', '点击后同步切到 T4', evalIn(ctx, 'state.openId'));
+    ok(!!el(ctx, '#read-message .mail-body-pending'),
+      '负控制：详情确实还没回来（否则下面的断言可能是被详情蒙对的）');
+    ok(el(ctx, '#read-message .env-who .who-email').textContent === 'carol@partner.com · 收至 beta@x.com',
+      '详情未返回时信封卡已经显示我方收件信箱（靠列表项随带的 mailbox，不依赖详情接口）',
+      el(ctx, '#read-message .env-who .who-email').textContent);
+    ok(ctx.stub.releaseDetail('T4'), '放行被挂起的详情响应');
+    await ticks(ctx.win, 10);
+  }, threadFixture());
 
   /* ---- 汇总 ---- */
   console.log('\n================ 失败用例清单 ================');

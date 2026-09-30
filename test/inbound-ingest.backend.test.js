@@ -299,6 +299,28 @@ function section(t) { console.log(`\n=== ${t} ===`); }
     ok(row && Number(row.read) === 0, '入站仍为 0（默认值只对出站生效）', row && row.read);
   }
 
+  section('T9 ⭐ 列表查询必须带回 mailbox（信封卡乐观渲染靠它显示「收至 …」）');
+  {
+    const res = await repo.listFolder(inboundEnv, { folder: 'inbox', limit: 50, offset: 0 });
+    ok(res.items.length > 0, '列表有数据（否则下面的断言空转）', res.items.length);
+    ok(res.items.every((it) => Object.prototype.hasOwnProperty.call(it, 'mailbox')),
+      'LIST_SELECT 每一行都带 mailbox 字段', JSON.stringify(Object.keys(res.items[0] || {})));
+    const mine = res.items.find((it) => it.mailbox === MAILBOX);
+    ok(!!mine, 'mailbox 的值正确（不是恒 null / 恒空串）', mine && mine.mailbox);
+
+    // 负控制：不同信箱的行各自带回自己的值，排除「恰好所有行都一样」也能通过
+    await repo.saveInbound(inboundEnv, {
+      rowId: 'row-other-mb', resendId: 're_in_other', messageId: null, inReplyTo: null, references: null,
+      threadId: 't-in-3', mailbox: 'other@notionmanager.com', fromName: null, fromEmail: 'a@b.com',
+      to: ['other@notionmanager.com'], cc: [], bcc: [], replyTo: [], subject: 's', html: null, text: 't',
+      receivedAt: 1788800002, attachments: [],
+    }, 'evt-other');
+    const res2 = await repo.listFolder(inboundEnv, { folder: 'inbox', limit: 50, offset: 0 });
+    const other = res2.items.find((it) => it.id === 'row-other-mb');
+    ok(other && other.mailbox === 'other@notionmanager.com',
+      '负控制：不同信箱的行各自带回自己的 mailbox（区分度成立）', other && other.mailbox);
+  }
+
   /* ---- 汇总 ---- */
   globalThis.fetch = realFetch;
   fs.rmSync(BUILD_DIR, { recursive: true, force: true });

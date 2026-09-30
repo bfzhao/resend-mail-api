@@ -357,7 +357,9 @@ html, body {
 }
 .rm-thread .t-item:hover { background: var(--hover); }
 .rm-thread .t-item.current { background: var(--accent-strong); font-weight: 600; }
-.rm-thread .t-sender { flex: 0 0 170px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-dim); }
+/* 会话行收发双方（`A → B`）比单纯的发件人名长得多，给足宽度；overflow:hidden 让 min-width 归零，
+   长地址按省略号截断，完整内容在 title 里（见 threadPanel）。 */
+.rm-thread .t-sender { flex: 0 1 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-dim); }
 .rm-thread .t-item.current .t-sender { color: var(--text); }
 .rm-thread .t-subject { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .rm-thread .t-time { flex: 0 0 120px; text-align: right; color: var(--text-dim); font-size: 11px; font-variant-numeric: tabular-nums; }

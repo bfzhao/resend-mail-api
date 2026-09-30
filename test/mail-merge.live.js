@@ -95,6 +95,9 @@ async function main() {
   ok(js.status === 200, '/app.js 返回 200', `status=${js.status}`);
   ok(js.text.includes('parseRecipients'), '/app.js 含 parseRecipients（前端多收件人解析已上线）');
   ok(js.text.includes('f-merge'), '/app.js 含 f-merge 接线');
+  // 会话行/信封卡显示「实际收发信箱」——抓「代码改了但没生效」
+  ok(js.text.includes('endpointsOf'), '/app.js 含 endpointsOf（会话行收发双方口径已上线）');
+  ok(js.text.includes('收至'), '/app.js 含「收至」（来信显示我方收件信箱）');
 
   // ---- B. 参数校验与动态上限（不需要真实 key）----
   section('[B] 参数校验与「按附件数动态计算」的上限');

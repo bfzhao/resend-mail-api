@@ -465,6 +465,40 @@ function recipientsLabel(toList) {
   return jsonArr(toList).join(', ');
 }
 
+/**
+ * 会话行 / 信封卡共用的「收发双方」唯一真值 → `[发件方, 收件方]`。
+ *
+ * ⚠️ 改这里之前先读这两条（都曾踩过）：
+ *  1) 详情接口返回的**会话项**收件人字段名是 `to`（见 src/index.ts 里 thread.map），
+ *     而**消息本身**用的是 `to_emails`。历史上只读 `t.to_emails` → 恒为 undefined
+ *     → 会话行永远显示「我 → ?」。两个字段名都必须兼容。
+ *  2) 出站不能用字面量「我」：用户要看到**实际发件信箱**，否则多身份时无法分辨是哪个信箱发的。
+ */
+function endpointsOf(item) {
+  const mine = String(item.mailbox || '').trim();
+  const tos = jsonArr(item.to_emails !== undefined ? item.to_emails : item.to);
+  if (item.direction === 'inbound') {
+    // 对方（有名字优先用名字） → 我方收到的信箱（mailbox 权威，回退收件人首个地址）
+    return [senderLabel(item), mine || tos[0] || '?'];
+  }
+  // 我方实际发件信箱 → 收件人清单（全量，不截成首个地址的 local part）
+  return [String(item.from_email || '').trim() || mine || '我', tos.join(', ') || '?'];
+}
+
+/** 信封卡第二行：入站「对方邮箱 · 收至 <我的信箱>」，出站「致 <收件人清单>」。 */
+function envelopeSubLine(m, pending) {
+  if (m.direction === 'inbound') {
+    const from = String(m.from_email || '').trim();
+    const mine = String(m.mailbox || '').trim();
+    const parts = [];
+    if (from) parts.push(from);
+    // 自己发给自己的邮件两者相同，避免重复显示
+    if (mine && mine.toLowerCase() !== from.toLowerCase()) parts.push(`收至 ${mine}`);
+    return parts.join(' · ');
+  }
+  return `致 ${recipientsLabel(m.to_emails) || (pending ? '…' : '')}`;
+}
+
 function avatarChar(item) {
   if (item.direction === 'outbound') return '我';
   const name = item.from_name || '';
@@ -1144,6 +1178,7 @@ function metaLines() {
     if (m.mailbox) add('收件地址', m.mailbox);
     add('时间', timeLong(m.received_at));
   } else {
+    add('发件人', m.from_email || m.mailbox || '');
     add('收件人', jsonArr(m.to_emails).join(', '));
     add('状态', STATUS_LABEL[m.status] || m.status || '—');
     add('时间', timeLong(m.received_at));
@@ -1201,7 +1236,8 @@ function renderRead() {
   const nameRow = document.createElement('div');
   const name = document.createElement('span');
   name.className = 'who-name';
-  name.textContent = isInbound ? (m.from_name || m.from_email || '(未知发件人)') : '我';
+  // 出站显示**实际发件信箱**（不是字面量「我」），入站显示对方；口径统一走 endpointsOf。
+  name.textContent = endpointsOf(m)[0];
   nameRow.appendChild(name);
   if (!isInbound && m.status) {
     const chip = document.createElement('span');
@@ -1212,9 +1248,7 @@ function renderRead() {
   who.appendChild(nameRow);
   const emailLine = document.createElement('div');
   emailLine.className = 'who-email';
-  emailLine.textContent = isInbound
-    ? (m.from_email || '')
-    : `致 ${recipientsLabel(m.to_emails) || (pending ? '…' : '')}`;
+  emailLine.textContent = envelopeSubLine(m, pending);
   who.appendChild(emailLine);
   top.appendChild(who);
 
@@ -1355,7 +1389,10 @@ function threadPanel() {
     }
     const sender = document.createElement('span');
     sender.className = 't-sender';
-    sender.textContent = displayThreadSender(t);
+    const senderText = displayThreadSender(t);
+    sender.textContent = senderText;
+    // 会话行宽度有限，长地址会被省略号截断；悬停给出完整收发双方。
+    sender.title = senderText;
     btn.appendChild(sender);
 
     const tag = document.createElement('span');
@@ -1381,9 +1418,10 @@ function threadPanel() {
   return panel;
 }
 
+/** 会话行的收发方文案：`发件方 → 收件方`（口径见 endpointsOf）。 */
 function displayThreadSender(t) {
-  if (t.direction === 'inbound') return senderLabel(t);
-  return `我 → ${(jsonArr(t.to_emails)[0] || '').split('@')[0] || '?'}`;
+  const [from, to] = endpointsOf(t);
+  return `${from} → ${to}`;
 }
 
 function buildBodyHtml(m) {
