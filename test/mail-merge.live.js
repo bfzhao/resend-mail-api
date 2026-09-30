@@ -91,6 +91,12 @@ async function main() {
   const idx = await get('/');
   ok(idx.status === 200, '/ 返回 200', `status=${idx.status}`);
   ok(idx.text.includes('f-merge'), '/ 的 HTML 含 #f-merge（勾选框已上线）');
+  ok(/<link[^>]+rel="icon"[^>]+favicon\.svg/.test(idx.text),
+    '/ 的 HTML 引用 /favicon.svg（不再是空 data: -> 浏览器显示默认地球）');
+  const ico = await get('/favicon.svg');
+  ok(ico.status === 200, '/favicon.svg 返回 200（浏览器能真正取到图标）', `status=${ico.status}`);
+  ok(/<svg[\s>]/.test(ico.text) && /<\/svg>/.test(ico.text),
+    '/favicon.svg 是一份合法 SVG', ico.text.slice(0, 40).replace(/\n/g, ' '));
   const js = await get('/app.js');
   ok(js.status === 200, '/app.js 返回 200', `status=${js.status}`);
   ok(js.text.includes('parseRecipients'), '/app.js 含 parseRecipients（前端多收件人解析已上线）');

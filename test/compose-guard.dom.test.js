@@ -17,7 +17,9 @@ const crypto = require('crypto');
 const { JSDOM } = require('jsdom');
 
 const ROOT = path.join(__dirname, '..');
-const APP_JS_PATH = path.join(ROOT, 'public', 'app.js');
+// QA_APP_JS 仅用于「变异验证」：指向一份人工构造的缺陷版 app.js，确认本测试确实能抓到缺陷。
+// 没有这个钩子时，变异脚本会「跑的是仓库原文件却以为跑的是变体」→ 变体恒不被抓（假阴性）。
+const APP_JS_PATH = process.env.QA_APP_JS || path.join(ROOT, 'public', 'app.js');
 const INDEX_PATH = path.join(ROOT, 'public', 'index.html');
 const APP_CSS_PATH = path.join(ROOT, 'public', 'app.css');
 const APP_JS = fs.readFileSync(APP_JS_PATH, 'utf8');
@@ -28,6 +30,7 @@ const FINGERPRINT = {
   md5: crypto.createHash('md5').update(APP_JS).digest('hex'),
   mtime: fs.statSync(APP_JS_PATH).mtime.toISOString(),
   bytes: Buffer.byteLength(APP_JS),
+  path: APP_JS_PATH,
 };
 
 /* ---------------------------------------------------------------------------
@@ -235,6 +238,7 @@ async function test(name, fn, bootOpts) {
 (async function main() {
   console.log('写信弹窗「放弃确认」守卫 —— 独立 jsdom 验证');
   console.log(`被测版本: md5=${FINGERPRINT.md5}  mtime=${FINGERPRINT.mtime}  bytes=${FINGERPRINT.bytes}`);
+  console.log(`被测文件: ${FINGERPRINT.path}${process.env.QA_APP_JS ? '  ← QA_APP_JS 变异体' : ''}`);
 
   /* ---- T0 环境自检 ---- */
   await test('T0 测试环境自检（harness 可信度）', async (ctx) => {
@@ -782,6 +786,38 @@ async function test(name, fn, bootOpts) {
     ok(evalIn(ctx, 'isComposerDirty()') === false, '改回原值 -> 不脏');
     clickMaskBlank(ctx);
     ok(!confirmShown(ctx) && !composerOpen(ctx), '改回原值点外部 -> 直接关闭');
+  }, { mailboxes: [{ mailbox: 'me@example.com' }, { mailbox: 'alias@example.com' }] });
+
+  /* ---- T11c 回信：改选发件人必须进入请求体（后端曾完全忽略它） ---- */
+  await test('T11c 回信时改选发件人 -> 请求体必须带上所选 mailbox', async (ctx) => {
+    const orig = 'me@example.com';
+    const other = 'alias@example.com';
+    openReply(ctx, { mailbox: orig });
+    await ticks(ctx.win, 2);
+    ok(composerOpen(ctx), '回复弹窗已打开');
+
+    const sel = el(ctx, '#f-mailbox');
+    const opts = Array.from(sel.options).map((o) => o.value);
+    ok(opts.join(',') === `${orig},${other}`, '发件人下拉含两个地址（否则下面的改选无从谈起）', opts.join(','));
+    ok(sel.value === orig, '默认沿用「收到原邮件的那个信箱」', sel.value);
+
+    sel.value = other;
+    sel.dispatchEvent(new ctx.win.Event('change', { bubbles: true }));
+    setValue(ctx, '#f-body', '回复内容');
+    clickEl(ctx, '#composer-send');
+    ok(ctx.stub.hasPendingSend(), '发送请求已发出且挂起');
+
+    const sent = ctx.stub.calls.filter((c) => c.method === 'POST' && /\/api\/messages\/m1\/reply$/.test(c.url));
+    ok(sent.length === 1, '恰好 1 个回信请求（按 c.url 过滤，不是拿正则直接测对象）',
+      sent.map((c) => c.url).join(',') || '（无）');
+    const body = sent.length ? JSON.parse(sent[0].body) : null;
+    ok(body && body.mailbox === other,
+      '请求体 mailbox 是用户改选的地址（否则后端只能退回原邮件的收件信箱）',
+      body && JSON.stringify(body.mailbox));
+    ok(body && body.merge === undefined, '回信请求不得携带 merge（合并发送只对写信生效）');
+
+    ctx.stub.settleSend(200, { ok: true });
+    await ticks(ctx.win, 15);
   }, { mailboxes: [{ mailbox: 'me@example.com' }, { mailbox: 'alias@example.com' }] });
 
   /* ---- T13 norm() 归一化边界 ---- */

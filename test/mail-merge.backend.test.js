@@ -61,15 +61,18 @@ function build() {
 /* ---------------------------------------------------------------------------
  * 2) D1 / R2 / fetch 桩
  * -------------------------------------------------------------------------*/
-function makeDB() {
+function makeDB(opts = {}) {
   const executed = [];
+  // firstHandler(sql, args) -> row | null：默认恒 null（合并发送路径不需要读回数据）。
+  // 回信路径需要 getMessage() 拿到原邮件，故允许用例注入。
+  const firstHandler = typeof opts.first === 'function' ? opts.first : () => null;
   const mk = (sql) => {
     const st = {
       sql,
       args: [],
       bind(...a) { st.args = a; return st; },
       async run() { executed.push({ sql, args: st.args }); return { success: true, results: [], meta: {} }; },
-      async first() { executed.push({ sql, args: st.args }); return null; },
+      async first() { executed.push({ sql, args: st.args }); return firstHandler(sql, st.args) ?? null; },
       async all() { executed.push({ sql, args: st.args }); return { results: [], success: true, meta: {} }; },
     };
     return st;
@@ -148,6 +151,18 @@ async function postMessages(worker, env, body) {
   return { res, status: res.status, data };
 }
 
+async function postReply(worker, env, id, body) {
+  const req = new Request(`https://example.com/api/messages/${encodeURIComponent(id)}/reply`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: typeof body === 'string' ? body : JSON.stringify(body),
+  });
+  const res = await worker.fetch(req, env);
+  let data = null;
+  try { data = await res.json(); } catch { data = null; }
+  return { res, status: res.status, data };
+}
+
 /* ---------------------------------------------------------------------------
  * 用例运行器
  * -------------------------------------------------------------------------*/
@@ -178,12 +193,16 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
   if (!worker || typeof worker.fetch !== 'function') throw new Error('编译产物未导出 default.fetch');
   console.log(`被测版本: src/index.ts md5=${FINGERPRINT['src/index.ts']}`);
 
-  const mkCtx = (handler, extra) => {
-    const db = makeDB();
+  const mkCtx = (handler, extra, dbOpts) => {
+    const db = makeDB(dbOpts);
     const bucket = makeBucket();
     const resend = makeResendStub(handler);
     const env = makeEnv(db, bucket, extra);
-    return { db, bucket, resend, env, post: (b) => postMessages(worker, env, b) };
+    return {
+      db, bucket, resend, env,
+      post: (b) => postMessages(worker, env, b),
+      reply: (id, b) => postReply(worker, env, id, b),
+    };
   };
 
   /* ---- B1 merge 全成功：N 次调用、每次 to 长度 1、一一对应 ---- */
@@ -600,6 +619,66 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
     const c7 = mkCtx(undefined, { MERGE_SUBREQ_BUDGET: '90.7' });
     const r7 = await c7.post({ to: Array.from({ length: 45 }, (_, i) => `u${i}@x.com`).join(', '), subject: 'S', body: 'B', merge: true });
     ok(r7.status === 200 && c7.resend.calls.length === 45, 'budget="90.7" / 45 人 -> 200 且 45 次 fetch', `${r7.status}/${c7.resend.calls.length}`);
+  }
+
+  /* ---- B20 ⭐ 回信的发件人：body.mailbox 必须生效 ---- */
+  {
+    section('B20 ⭐ 回信发件人：body.mailbox 必须生效（曾忽略它 -> 改选发件人无效）');
+    const ORIG = {
+      id: 'orig-1', direction: 'inbound', mailbox: 'inbox@notionmanager.com',
+      from_email: 'alice@partner.com', from_name: 'Alice',
+      to_emails: '["inbox@notionmanager.com"]', cc: null, bcc: null, reply_to: null,
+      subject: '报价', body_text: 'hi', body_html: null,
+      message_id: '<orig-1@partner.com>', references: null, thread_id: 't-1',
+      received_at: 1788000000, read: 1, deleted: 0, starred: 0, status: 'received',
+      resend_id: 're_in_1',
+    };
+    // 只让「按 id 取原邮件」这一次 first() 命中，其余查询保持 null（与默认桩一致）
+    const ctxOf = (extra) => mkCtx(undefined, extra, {
+      first: (sql, args) =>
+        /SELECT \* FROM messages WHERE id = \?/i.test(sql) && args[0] === 'orig-1' ? ORIG : null,
+    });
+    const fromOf = (c) => (c.resend.calls[0] ? c.resend.calls[0].body.from : undefined);
+
+    // ① 缺省：沿用「收到原邮件的那个信箱」
+    const c1 = ctxOf();
+    const r1 = await c1.reply('orig-1', { body: '回复内容' });
+    ok(r1.status === 200 && r1.data && r1.data.original_id === 'orig-1',
+      '负控制：回信路由确实被驱动（否则下面的发件人断言可能是空转）',
+      `${r1.status}/${JSON.stringify(r1.data)}`);
+    ok(c1.resend.calls.length === 1, '恰好 1 次 Resend 调用', c1.resend.calls.length);
+    ok(fromOf(c1) === 'support <inbox@notionmanager.com>',
+      '未指定 mailbox -> 沿用原邮件的收件信箱', fromOf(c1));
+
+    // ② ⭐ 指定 mailbox：必须用它（这就是用户报的 bug）
+    const c2 = ctxOf();
+    const r2 = await c2.reply('orig-1', { body: '回复内容', mailbox: 'billing@notionmanager.com' });
+    ok(r2.status === 200, '指定 mailbox 时回信成功', `${r2.status}/${JSON.stringify(r2.data)}`);
+    ok(c2.resend.calls.length === 1, '恰好 1 次 Resend 调用', c2.resend.calls.length);
+    ok(fromOf(c2) === 'support <billing@notionmanager.com>',
+      '⭐ body.mailbox 生效：发件人 = 用户改选的信箱（不再是原邮件的收件信箱）', fromOf(c2));
+
+    // ③ 落库的 from_email / mailbox 与真正发出的发件人一致（否则发件箱会显示错的发件人）
+    const ins = c2.db._executed.filter((e) => /INSERT INTO messages/i.test(e.sql));
+    ok(ins.length === 1, '出站记录已落库', ins.length);
+    const flat = ins.length ? ins[0].args.map((a) => String(a)).join('|') : '';
+    ok(flat.includes('billing@notionmanager.com'),
+      '落库的 mailbox / from_email 用的是改选后的地址', flat.slice(0, 160));
+    ok(!flat.includes('inbox@notionmanager.com'),
+      '落库记录里不得再残留原邮件的收件信箱', flat.slice(0, 160));
+
+    // ④ 域名兜底仍然生效：非默认域不会冒充外部域名发信
+    const c3 = ctxOf();
+    const r3 = await c3.reply('orig-1', { body: '回复内容', mailbox: 'evil@other-domain.com' });
+    ok(r3.status === 200, '异域地址不报错（走回退而非 4xx）', `${r3.status}/${JSON.stringify(r3.data)}`);
+    ok(fromOf(c3) === 'support <support@notionmanager.com>',
+      '非默认域回退到默认发件人（senderFromMailbox 的既有保护，未被本次改动绕过）', fromOf(c3));
+
+    // ⑤ 空白 mailbox 视同未指定，不得把发件人变成空
+    const c4 = ctxOf();
+    await c4.reply('orig-1', { body: '回复内容', mailbox: '   ' });
+    ok(fromOf(c4) === 'support <inbox@notionmanager.com>',
+      'mailbox 只有空白 -> 视同未指定，回退原邮件收件信箱', fromOf(c4));
   }
 
   /* ---- 汇总 ---- */

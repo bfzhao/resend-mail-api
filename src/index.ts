@@ -461,7 +461,9 @@ async function reply(env: Env, request: Request, id: string): Promise<Response> 
     return json({ error: '只能回复收到的邮件' }, 400);
   }
 
-  const raw = (await request.json().catch(() => null)) as { body?: unknown; html?: unknown; attachments?: unknown } | null;
+  const raw = (await request.json().catch(() => null)) as
+    | { body?: unknown; html?: unknown; attachments?: unknown; mailbox?: unknown }
+    | null;
   const content = bodyFrom(raw || {});
   if (!content.text.trim() && !content.html.trim()) return json({ error: '回复内容为空' }, 400);
 
@@ -479,7 +481,12 @@ async function reply(env: Env, request: Request, id: string): Promise<Response> 
     .replace(/\s+/g, ' ');
 
   const subject = replySubject(original.subject);
-  const sender = resolveSender(env, original.mailbox || undefined);
+  // 发件人：优先用户在「发件人」下拉里的选择（与 compose 完全同一口径），
+  // 未指定时才沿用「收到原邮件的那个信箱」。
+  // ⚠️ 曾经无条件用 original.mailbox → 回复时改选发件人完全不生效，发出的仍是原邮件的收件信箱。
+  // 域名校验由 senderFromMailbox 兜底（非默认域会回退默认发件人），此处不做额外白名单。
+  const requestedMailbox = typeof raw?.mailbox === 'string' ? raw.mailbox.trim() : '';
+  const sender = resolveSender(env, requestedMailbox || original.mailbox || undefined);
 
   const result = await resendSend(env, {
     from: sender.from,

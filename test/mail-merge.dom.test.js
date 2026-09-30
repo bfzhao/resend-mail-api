@@ -22,7 +22,9 @@ const crypto = require('crypto');
 const { JSDOM } = require('jsdom');
 
 const ROOT = path.join(__dirname, '..');
-const APP_JS_PATH = path.join(ROOT, 'public', 'app.js');
+// QA_APP_JS 仅用于「变异验证」：指向一份人工构造的缺陷版 app.js。
+// 缺了这个钩子，变异脚本会「跑仓库原文件却以为跑的是变体」→ 变体恒不被抓（假阴性）。
+const APP_JS_PATH = process.env.QA_APP_JS || path.join(ROOT, 'public', 'app.js');
 const INDEX_PATH = path.join(ROOT, 'public', 'index.html');
 const APP_JS = fs.readFileSync(APP_JS_PATH, 'utf8');
 const INDEX_HTML = fs.readFileSync(INDEX_PATH, 'utf8');
@@ -205,6 +207,7 @@ async function test(name, fn) {
  * ===========================================================================*/
 (async () => {
   console.log(`被测版本: app.js md5=${FINGERPRINT['public/app.js']}  index.html md5=${FINGERPRINT['public/index.html']}`);
+  console.log(`被测文件: ${APP_JS_PATH}${process.env.QA_APP_JS ? '  ← QA_APP_JS 变异体' : ''}`);
 
   /* ---- T1 控件可见性：写信显示 / 回复隐藏 ---- */
   await test('T1 .merge-row 可见性：写信显示、回复整行隐藏', async (ctx) => {
@@ -541,6 +544,7 @@ async function test(name, fn) {
   else for (const f of failed) console.log(`- [${f.test}] ${f.msg}${f.detail ? `  [${f.detail}]` : ''}`);
 
   console.log(`\n被测版本: app.js md5=${FINGERPRINT['public/app.js']}  index.html md5=${FINGERPRINT['public/index.html']}`);
+  console.log(`被测文件: ${APP_JS_PATH}${process.env.QA_APP_JS ? '  ← QA_APP_JS 变异体' : ''}`);
   console.log(`===== 结果: ${pass} passed, ${fail} failed =====`);
   process.exit(fail ? 1 : 0);
 })();

@@ -18,7 +18,10 @@ const fs = require('fs');
 const path = require('path');
 const vm = require('vm');
 
-const SRC = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');
+// QA_APP_JS 仅用于「变异验证」：指向一份人工构造的缺陷版 app.js。
+// 缺了这个钩子，变异脚本会「跑仓库原文件却以为跑的是变体」→ 变体恒不被抓（假阴性）。
+const APP_JS_PATH = process.env.QA_APP_JS || path.join(__dirname, '..', 'public', 'app.js');
+const SRC = fs.readFileSync(APP_JS_PATH, 'utf8');
 
 function slice(startMarker, endMarker, label) {
   const s = SRC.indexOf(startMarker);
