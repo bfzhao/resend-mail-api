@@ -1996,7 +1996,7 @@ function resetComposerEditor() {
 function openComposerShell(opts) {
   const {
     mode, title, to = '', cc = '', bcc = '', subject = '', body = '',
-    original = null, originalId = null, mailbox, info, showMerge, showQuote, focus,
+    original = null, originalId = null, mailbox, showMerge, showQuote, focus,
   } = opts;
 
   state.composing = { mode, originalId, files: [], rich: false, original, mailbox };
@@ -2016,7 +2016,6 @@ function openComposerShell(opts) {
   renderAttachChips();
   renderMailboxPicker();
   resetComposerEditor();
-  $('#composer-info').textContent = `${state.fromName ? state.fromName + ' ' : ''}<${info || state.fromAddress}>`;
   hideDiscardConfirm(false);
   resetMergePick();
   setMergeRowVisible(!!showMerge);
@@ -2046,7 +2045,6 @@ function openComposer() {
     mode: 'compose',
     title: '写信',
     mailbox: state.mailbox || undefined,
-    info: state.fromAddress,
     showMerge: true, // 写信模式：显示合并发送
     showQuote: false,
     focus: '#f-to',
@@ -2069,7 +2067,6 @@ function openReplyComposer() {
     to: to || '',
     subject: /^\s*re:/i.test(m.subject || '') ? m.subject : `Re: ${m.subject || ''}`,
     mailbox: m.mailbox || undefined,
-    info: m.mailbox || state.fromAddress,
     showMerge: false, // 回复模式：合并发送无意义，隐藏该控件避免误导
     showQuote: true,
     focus: '#f-body',
@@ -2096,7 +2093,6 @@ function openForwardComposer() {
     subject: /^\s*fwd?\s*:/i.test(m.subject || '') ? m.subject : `Fwd: ${m.subject || ''}`,
     body: forwardQuoteText(m),
     mailbox: m.mailbox || undefined,
-    info: m.mailbox || state.fromAddress,
     showMerge: false,
     showQuote: false, // 正文里已经带了原文引用，不再需要「引用原文」按钮
     focus: '#f-to',

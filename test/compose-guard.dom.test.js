@@ -20,7 +20,9 @@ const ROOT = path.join(__dirname, '..');
 // QA_APP_JS 仅用于「变异验证」：指向一份人工构造的缺陷版 app.js，确认本测试确实能抓到缺陷。
 // 没有这个钩子时，变异脚本会「跑的是仓库原文件却以为跑的是变体」→ 变体恒不被抓（假阴性）。
 const APP_JS_PATH = process.env.QA_APP_JS || path.join(ROOT, 'public', 'app.js');
-const INDEX_PATH = path.join(ROOT, 'public', 'index.html');
+// QA_INDEX_HTML 仅用于「变异验证」：指向一份人工构造的缺陷版 index.html（变体放仓库外）。
+// 缺了这个钩子，HTML 变体会「跑仓库原文件却以为跑的是变体」→ 变体恒不被抓（假阴性）。
+const INDEX_PATH = process.env.QA_INDEX_HTML || path.join(ROOT, 'public', 'index.html');
 const APP_CSS_PATH = path.join(ROOT, 'public', 'app.css');
 const APP_JS = fs.readFileSync(APP_JS_PATH, 'utf8');
 const INDEX_HTML = fs.readFileSync(INDEX_PATH, 'utf8');
@@ -871,6 +873,23 @@ async function test(name, fn, bootOpts) {
     ok(hid('#f-mailbox-row'), '⭐ 点了也不展开（只有一个选项，展开是空转）');
     ok(el(ctx, '#f-sender-current').textContent === 'me@example.com',
       '摘要就是那唯一的地址', el(ctx, '#f-sender-current').textContent);
+  }, { mailboxes: [{ mailbox: 'me@example.com' }] });
+
+  /* ---- T11f 发信身份只在顶部显示一次（底部那个重复且会拼错名字的提示已删除） ---- */
+  await test('T11f 写信弹窗的操作行里不得再挂「发信身份」文字', async (ctx) => {
+    await openCompose(ctx);
+    ok(composerOpen(ctx), '前置：写信弹窗已打开（否则下面的断言空转）');
+
+    ok(el(ctx, '#composer-info') === null,
+      '⭐ #composer-info 已删除：它把 SEND_FROM_NAME 和实际发件地址拼在一起，回复/转发时会显示成「support <别人的地址>」');
+
+    const acts = el(ctx, '.composer-actions');
+    ok(!!acts, '.composer-actions 存在');
+    ok(acts.querySelectorAll('span').length === 0,
+      '⭐ 操作行里只剩按钮，没有多余的文字节点（发件人只在顶部那一行显示）',
+      acts.querySelectorAll('span').length);
+    const labels = Array.from(acts.querySelectorAll('button')).map((b) => b.textContent);
+    ok(labels.join(',') === '取消,发送', '操作行就是「取消 / 发送」两个按钮', labels.join(','));
   }, { mailboxes: [{ mailbox: 'me@example.com' }] });
 
   /* ---- T13 norm() 归一化边界 ---- */

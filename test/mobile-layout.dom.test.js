@@ -36,7 +36,9 @@ const ROOT = path.join(__dirname, '..');
 // QA_APP_JS / QA_APP_CSS 仅用于「变异验证」：指向人工构造的缺陷版本（放在仓库外）。
 const APP_JS_PATH = process.env.QA_APP_JS || path.join(ROOT, 'public', 'app.js');
 const APP_CSS_PATH = process.env.QA_APP_CSS || path.join(ROOT, 'public', 'app.css');
-const INDEX_PATH = path.join(ROOT, 'public', 'index.html');
+// QA_INDEX_HTML 仅用于「变异验证」：指向一份人工构造的缺陷版 index.html（变体放仓库外）。
+// 缺了这个钩子，HTML 变体会「跑仓库原文件却以为跑的是变体」→ 变体恒不被抓（假阴性）。
+const INDEX_PATH = process.env.QA_INDEX_HTML || path.join(ROOT, 'public', 'index.html');
 
 const APP_JS = fs.readFileSync(APP_JS_PATH, 'utf8');
 const APP_CSS = fs.readFileSync(APP_CSS_PATH, 'utf8');
@@ -595,6 +597,14 @@ async function test(name, fn) {
     // 10d) 发件人摘要行：折叠后它是唯一可见的发件人信息，字号不能比正文小
     ok(ruleHas(cssMobile, '.sender-toggle', 'font-size:\\s*15px'),
       '⭐ 移动端发件人摘要行 15px（原来继承 .link-btn 的 13px，折叠后看不清用哪个地址发）');
+
+    // 10e) 原生下拉的弹出列表：闭合态 16px 时列表跟着 16px 会明显偏大（用户报障）
+    ok(ruleHas(cssMobile, ['#mailbox-select option', '#composer select option'], 'font-size:\\s*14px'),
+      '⭐ 移动端原生下拉的列表项单独收回 14px（闭合态仍 16px，不受影响）');
+    ok(ruleHas(cssMobile, '#mailbox-select', 'font-size:\\s*16px'),
+      '负控制：闭合态的 #mailbox-select 仍保持 16px（别顺手把它也改小了）');
+    ok(!ruleHas(APP_CSS.slice(0, mobileSectionAt), '#mailbox-select option', 'font-size:\\s*14px'),
+      '负控制：桌面端不给列表项设字号（那边闭合态 13px，列表跟着走即可）');
 
     // 11) toast 抬离底部安全区
     ok(ruleHas(cssMobile, '#toast', 'bottom:\\s*calc\\(20px\\s*\\+\\s*env\\(safe-area-inset-bottom\\)\\)'), 'toast 抬离底部安全区');
