@@ -141,6 +141,19 @@ export function base64ToBytes(b64: string): Uint8Array {
   return bytes;
 }
 
+/**
+ * bytes -> base64（Worker 运行时无 Buffer）。
+ * 分块 String.fromCharCode 避免 `apply` 在超大数组上爆栈（附件可达数十 MB）。
+ */
+export function bytesToBase64(bytes: Uint8Array): string {
+  const CHUNK = 0x8000;
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    bin += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(bin);
+}
+
 export function escapeHtml(s: string): string {
   return s
     .replace(/&/g, '&amp;')

@@ -2,9 +2,9 @@ import type { Env, Folder } from './types';
 import { authenticate, unauthorized } from './auth';
 import { handleInbound, handleEvents } from './webhook';
 import * as repo from './repo';
-import { resendSend, replySubject, textToHtml, senderFromMailbox } from './send';
+import { resendSend, replySubject, forwardSubject, textToHtml, senderFromMailbox } from './send';
 import type { ResendAttachment } from './send';
-import { json, jsonArr, nowSec, parseAddress, parseAddressList, rootThreadId, uuid, base64ToBytes, stripHtml } from './util';
+import { json, jsonArr, nowSec, parseAddress, parseAddressList, rootThreadId, uuid, base64ToBytes, bytesToBase64, stripHtml } from './util';
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -62,6 +62,11 @@ async function routeApi(request: Request, env: Env, path: string, url: URL): Pro
     return json({ mailboxes: await repo.mailboxes(env) });
   }
 
+  // 本地联系人（写信/回复/转发的收件人输入联想）
+  if (path === '/api/contacts' && method === 'GET') {
+    return json({ contacts: await repo.contacts(env) });
+  }
+
   // 账户/发送能力信息（供写信界面显示发件人）
   if (path === '/api/account' && method === 'GET') {
     return json({
@@ -91,6 +96,12 @@ async function routeApi(request: Request, env: Env, path: string, url: URL): Pro
   const replyMatch = /^\/api\/messages\/([^/]+)\/reply$/.exec(path);
   if (replyMatch && method === 'POST') {
     return reply(env, request, decodeURIComponent(replyMatch[1]));
+  }
+
+  // 转发：/api/messages/:id/forward（任意方向的邮件都可转发）
+  const forwardMatch = /^\/api\/messages\/([^/]+)\/forward$/.exec(path);
+  if (forwardMatch && method === 'POST') {
+    return forward(env, request, decodeURIComponent(forwardMatch[1]));
   }
 
   // 单封邮件详情 / 更新
@@ -219,6 +230,33 @@ function parseRecipient(raw: unknown): string[] {
   }
   if (typeof raw === 'string') return splitRecipients(raw);
   return [];
+}
+
+/**
+ * 归一化 to / cc / bcc 三组收件人：
+ * - **to 原样保留**（顺序与重复项都不动）—— 这是 B13 锁定的既有行为，改动会让老断言变红；
+ * - cc / bcc 去重，并剔除已出现在更高优先级分组里的地址（to > cc > bcc）。
+ *
+ * 剔除重复是必须的：同一地址同时出现在 to 和 cc 时，Resend 会把同一封信投两次，
+ * 收件人会收到两封一模一样的邮件。
+ */
+function normalizeRecipients(
+  to: string[],
+  cc: string[],
+  bcc: string[]
+): { to: string[]; cc: string[]; bcc: string[] } {
+  const toClean = to.filter((x) => x.trim());
+  const taken = new Set(toClean.map((x) => x.trim().toLowerCase()));
+  const ccClean = dedupeRecipients(cc).filter((x) => !taken.has(x.toLowerCase()));
+  for (const x of ccClean) taken.add(x.toLowerCase());
+  const bccClean = dedupeRecipients(bcc).filter((x) => !taken.has(x.toLowerCase()));
+  return { to: toClean, cc: ccClean, bcc: bccClean };
+}
+
+/** base64 长度 -> 原始字节数（仅用于「总大小是否超限」的粗略预检，不解码）。 */
+function approxBase64Bytes(b64: string): number {
+  const n = b64.replace(/\s+/g, '').length;
+  return Math.floor((n * 3) / 4);
 }
 
 const MAX_ATTACHMENT_BYTES = 40 * 1024 * 1024; // 对齐 Resend 附件上限
@@ -394,13 +432,17 @@ async function composeMerge(env: Env, input: MergeInput): Promise<Response> {
 
 async function compose(env: Env, request: Request): Promise<Response> {
   const body = (await request.json().catch(() => null)) as
-    | { to?: unknown; cc?: unknown; subject?: unknown; body?: unknown; html?: unknown; mailbox?: unknown; attachments?: unknown; merge?: unknown }
+    | { to?: unknown; cc?: unknown; bcc?: unknown; subject?: unknown; body?: unknown; html?: unknown; mailbox?: unknown; attachments?: unknown; merge?: unknown }
     | null;
   if (!body) return json({ error: '参数错误' }, 400);
 
-  const to = parseRecipient(body.to);
-  if (!to.length) return json({ error: '缺少收件人' }, 400);
-  const cc = parseRecipient(body.cc);
+  const { to, cc, bcc } = normalizeRecipients(
+    parseRecipient(body.to),
+    parseRecipient(body.cc),
+    parseRecipient(body.bcc)
+  );
+  // to / cc / bcc 任一非空即可（只密送的邮件是合法的）
+  if (!to.length && !cc.length && !bcc.length) return json({ error: '缺少收件人' }, 400);
   const subject = typeof body.subject === 'string' ? body.subject.trim() : '';
   const content = bodyFrom(body);
   const attachments = parseAttachments(body.attachments);
@@ -410,6 +452,9 @@ async function compose(env: Env, request: Request): Promise<Response> {
 
   // 合并发送：每位收件人各发一封独立邮件（内容与主题不变）
   if (body.merge === true) {
+    // 合并发送的语义是「给每个人单独发一封」，而密送会让被密送者收到 N 封重复邮件。
+    // 两者语义冲突 → 明确拒绝，而不是静默忽略 bcc（用户会以为密送生效了）。
+    if (bcc.length) return json({ error: '合并发送不支持密送（BCC），请取消其中一个' }, 400);
     const recipients = dedupeRecipients(to);
     if (!recipients.length) return json({ error: '缺少收件人' }, 400);
     const cap = mergeRecipientCap(env, attachments.length);
@@ -424,6 +469,7 @@ async function compose(env: Env, request: Request): Promise<Response> {
     from: sender.from,
     to,
     cc,
+    bcc,
     subject,
     text: content.text,
     html: content.html,
@@ -440,6 +486,7 @@ async function compose(env: Env, request: Request): Promise<Response> {
     fromEmail: sender.mailbox,
     to,
     cc,
+    bcc,
     subject,
     html: content.html,
     text: content.text,
@@ -462,13 +509,25 @@ async function reply(env: Env, request: Request, id: string): Promise<Response> 
   }
 
   const raw = (await request.json().catch(() => null)) as
-    | { body?: unknown; html?: unknown; attachments?: unknown; mailbox?: unknown }
+    | { to?: unknown; cc?: unknown; bcc?: unknown; body?: unknown; html?: unknown; attachments?: unknown; mailbox?: unknown }
     | null;
   const content = bodyFrom(raw || {});
   if (!content.text.trim() && !content.html.trim()) return json({ error: '回复内容为空' }, 400);
 
   const replyTo = parseAddressList(original.reply_to)[0] ?? parseAddress(original.from_email);
   if (!replyTo) return json({ error: '原邮件缺少发件地址' }, 400);
+
+  // ⚠️ 曾经无条件 to: [replyTo.email] → 用户在回复框里补的收件人（逗号分隔）被**整段丢弃**：
+  // 新人收不到信，发件箱记录也只留原发件人一人。
+  // 现在以请求体的 to 为准（前端回复框预填原发件人，用户可再追加/编辑）；
+  // 仅在请求体完全没给 to（老客户端 / 直接调 API）时才回退到从原邮件推导的那一个地址。
+  const requestedTo = dedupeRecipients(parseRecipient(raw?.to));
+  // cc / bcc 由用户自己填（不自动「回复全部」）；归一化会剔除与 to 重复的地址，避免重复投递。
+  const { to, cc, bcc } = normalizeRecipients(
+    requestedTo.length ? requestedTo : [replyTo.email],
+    parseRecipient(raw?.cc),
+    parseRecipient(raw?.bcc)
+  );
 
   const attachments = parseAttachments(raw?.attachments);
   if (attachments === null) return json({ error: '附件格式错误' }, 400);
@@ -490,7 +549,9 @@ async function reply(env: Env, request: Request, id: string): Promise<Response> 
 
   const result = await resendSend(env, {
     from: sender.from,
-    to: [replyTo.email],
+    to,
+    cc,
+    bcc,
     subject,
     text: content.text,
     html: content.html,
@@ -516,8 +577,9 @@ async function reply(env: Env, request: Request, id: string): Promise<Response> 
     mailbox: sender.mailbox,
     fromName: env.SEND_FROM_NAME || null,
     fromEmail: sender.mailbox,
-    to: [replyTo.email],
-    cc: [],
+    to,
+    cc,
+    bcc,
     subject,
     html: content.html,
     text: content.text,
@@ -530,4 +592,143 @@ async function reply(env: Env, request: Request, id: string): Promise<Response> 
   });
 
   return json({ ok: true, id: rowId, resend_id: result.id, original_id: original.id });
+}
+
+/** 转发时原邮件附件的总大小上限（对齐 Resend 单封 40 MB）。 */
+const MAX_FORWARD_TOTAL_BYTES = 40 * 1024 * 1024;
+
+/** 把源邮件的附件复制到目标消息名下（新 R2 key），供转发使用。 */
+async function copyAttachmentsToMessage(
+  env: Env,
+  messageId: string,
+  source: Array<{ r2_key: string; filename: string; content_type: string }>
+): Promise<void> {
+  const rows: Array<{ filename: string; contentType: string; size: number; r2Key: string }> = [];
+  for (const a of source) {
+    const obj = await env.BUCKET.get(a.r2_key);
+    if (!obj) continue;
+    const bytes = new Uint8Array(await obj.arrayBuffer());
+    const r2Key = `attachments/${messageId}/${uuid()}-${safeFilename(a.filename)}`;
+    await env.BUCKET.put(r2Key, bytes, { httpMetadata: { contentType: a.content_type } });
+    rows.push({ filename: a.filename, contentType: a.content_type, size: bytes.length, r2Key });
+  }
+  if (rows.length) await repo.insertOutboundAttachments(env, messageId, rows);
+}
+
+/**
+ * 转发：**任意方向**的邮件都可以转发给任意收件人（不像回复只能回收到的邮件）。
+ *
+ * 关键语义：
+ * - 主题补 `Fwd:` 前缀（已有则不重复叠加）；
+ * - **不设** `In-Reply-To` / `References` —— 转发是**新会话**，带上就会串进原会话；
+ * - 原邮件附件由**服务端**从 R2 读出随信发出，并复制到新 R2 key 落库
+ *   （不能共用 key：`permanentDelete` 会删 R2 对象，共用会让「删除原邮件」连带删掉转发件的附件）；
+ * - 内联图片（cid）不转发：正文引用走纯文本，带过去只会变成一堆无引用的图片附件；
+ * - 附件读不到 / 合计超限时**不静默**：前者跳过并在响应里列出 `skipped_attachments`，
+ *   后者直接 400 说明原因（宁可让用户自己删附件，也不要发出去一封少了一半附件的信）。
+ */
+async function forward(env: Env, request: Request, id: string): Promise<Response> {
+  const original = await repo.getMessage(env, id);
+  if (!original) return json({ error: '原邮件不存在' }, 404);
+
+  const raw = (await request.json().catch(() => null)) as
+    | {
+        to?: unknown;
+        cc?: unknown;
+        bcc?: unknown;
+        body?: unknown;
+        html?: unknown;
+        attachments?: unknown;
+        mailbox?: unknown;
+        include_original_attachments?: unknown;
+      }
+    | null;
+
+  const { to, cc, bcc } = normalizeRecipients(
+    parseRecipient(raw?.to),
+    parseRecipient(raw?.cc),
+    parseRecipient(raw?.bcc)
+  );
+  if (!to.length && !cc.length && !bcc.length) return json({ error: '缺少收件人' }, 400);
+
+  const content = bodyFrom(raw || {});
+  if (!content.text.trim() && !content.html.trim()) return json({ error: '转发内容为空' }, 400);
+
+  const extra = parseAttachments(raw?.attachments);
+  if (extra === null) return json({ error: '附件格式错误' }, 400);
+
+  const includeOriginal = raw?.include_original_attachments !== false;
+  const requestedMailbox = typeof raw?.mailbox === 'string' ? raw.mailbox.trim() : '';
+  const sender = resolveSender(env, requestedMailbox || original.mailbox || undefined);
+
+  // 读原附件：内联图片（cid）跳过；单个读不到也跳过，但**记录下来告知用户**
+  const sourceRows = includeOriginal
+    ? (await repo.listAttachments(env, id)).filter((a) => a.inline !== 1)
+    : [];
+  let totalBytes = extra.reduce((n, f) => n + approxBase64Bytes(f.content), 0);
+  const originalFiles: ResendAttachment[] = [];
+  const skipped: string[] = [];
+  for (const a of sourceRows) {
+    const obj = await env.BUCKET.get(a.r2_key);
+    if (!obj) {
+      skipped.push(a.filename);
+      continue;
+    }
+    const bytes = new Uint8Array(await obj.arrayBuffer());
+    totalBytes += bytes.length;
+    if (totalBytes > MAX_FORWARD_TOTAL_BYTES) {
+      return json(
+        { error: `附件合计超过 ${Math.floor(MAX_FORWARD_TOTAL_BYTES / 1024 / 1024)} MB，无法转发（可先删除部分附件）` },
+        400
+      );
+    }
+    originalFiles.push({ filename: a.filename, content: bytesToBase64(bytes), content_type: a.content_type });
+  }
+
+  const subject = forwardSubject(original.subject);
+  const result = await resendSend(env, {
+    from: sender.from,
+    to,
+    cc,
+    bcc,
+    subject,
+    text: content.text,
+    html: content.html,
+    attachments: [...originalFiles, ...extra],
+  });
+  if (!result.ok) return json({ error: result.error }, 400);
+
+  const rowId = await repo.saveOutbound(env, {
+    inReplyTo: null,
+    references: null,
+    threadId: uuid(), // 转发开启新会话
+    mailbox: sender.mailbox,
+    fromName: env.SEND_FROM_NAME || null,
+    fromEmail: sender.mailbox,
+    to,
+    cc,
+    bcc,
+    subject,
+    html: content.html,
+    text: content.text,
+    resendId: result.id!,
+    receivedAt: nowSec(),
+  });
+
+  // 邮件已经投递出去了：附件落库失败不能当成「没发出去」（否则用户重试会重复投递）
+  await storeOutboundAttachments(env, rowId, extra).catch((err) => {
+    console.error('forward: storeOutboundAttachments failed:', err);
+  });
+  await copyAttachmentsToMessage(env, rowId, sourceRows).catch((err) => {
+    console.error('forward: copyAttachmentsToMessage failed:', err);
+  });
+
+  return json({
+    ok: true,
+    id: rowId,
+    resend_id: result.id,
+    original_id: original.id,
+    forwarded_attachments: originalFiles.length,
+    skipped_attachments: skipped,
+  });
 }

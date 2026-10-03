@@ -2,7 +2,8 @@
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- viewport-fit=cover：让页面铺满刘海屏/圆角屏，配合 env(safe-area-inset-*) 留出安全区 -->
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <meta name="referrer" content="no-referrer" />
   <title>收件箱</title>
   <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
@@ -19,11 +20,18 @@
       <div id="sidebar-status" hidden>未连接 API</div>
     </aside>
 
+    <!-- 移动端抽屉遮罩：仅在 #app.drawer-open 时由 CSS 显示；点击关闭抽屉 -->
+    <div id="drawer-mask"></div>
+
     <div id="workspace">
       <header id="topbar">
+        <!-- 移动端：打开文件夹抽屉（桌面端由 CSS 隐藏） -->
+        <button id="drawer-btn" class="icon-btn" type="button" aria-label="打开文件夹" aria-controls="sidebar">☰</button>
         <div id="search-box">
           <input id="search-input" type="search" placeholder="搜索邮件…" autocomplete="off" />
         </div>
+        <!-- 移动端：侧边栏收进抽屉后，顶栏需要一个直接可点的写信入口（桌面端由 CSS 隐藏） -->
+        <button id="topbar-compose" class="btn btn-primary" type="button">写信</button>
         <div id="topbar-actions" class="hidden"></div>
       </header>
 
@@ -48,6 +56,10 @@
 
         <!-- 右：邮件详情 -->
         <section id="read-pane">
+          <!-- 移动端：单栏布局下从详情返回列表（桌面端由 CSS 隐藏） -->
+          <div id="read-back">
+            <button id="read-back-btn" class="btn" type="button">← 返回列表</button>
+          </div>
           <div id="read-placeholder" class="read-placeholder">
             <div class="ph-title">选择一封邮件以阅读</div>
             <div class="ph-hint">从左侧列表中选择，或用 ↑ ↓ 键浏览</div>
@@ -62,10 +74,28 @@
     <div id="composer" role="dialog" aria-label="写信">
       <div id="composer-title">写信</div>
       <div class="composer-row">
-        <label class="grow">收件人 <input id="f-to" type="text" placeholder="name@example.com，多个用逗号分隔" /></label>
-        <label id="f-mailbox-label" class="auto-label hidden">发件人
+        <label class="grow">收件人 <input id="f-to" type="text" placeholder="name@example.com，多个用逗号分隔" autocomplete="off" /></label>
+      </div>
+      <!-- 发件人独占一行：和收件人挤一行时，两个字段在窄屏上都只剩半宽（收件人输入框越窄，
+           联想下拉越难看清）。折叠时只留一行摘要显示「当前用哪个地址发」，点开才展开下拉。 -->
+      <div class="composer-row sender-row hidden" id="f-sender-row">
+        <button id="f-sender-toggle" class="link-btn sender-toggle" type="button" aria-expanded="false" aria-controls="f-mailbox-label">
+          <span class="sender-label">发件人</span><span id="f-sender-current" class="sender-current"></span><span id="f-sender-caret" class="sender-caret" aria-hidden="true">▾</span>
+        </button>
+      </div>
+      <div class="composer-row sender-row hidden" id="f-mailbox-row">
+        <label id="f-mailbox-label" class="grow auto-label">发件人
           <select id="f-mailbox"></select>
         </label>
+      </div>
+      <div class="composer-row cc-toggle-row">
+        <button id="f-cc-toggle" class="link-btn" type="button">＋ 抄送 / 密送</button>
+      </div>
+      <div class="composer-row cc-field hidden" id="f-cc-row">
+        <label class="grow">抄送 <input id="f-cc" type="text" placeholder="抄送，多个用逗号分隔" autocomplete="off" /></label>
+      </div>
+      <div class="composer-row cc-field hidden" id="f-bcc-row">
+        <label class="grow">密送 <input id="f-bcc" type="text" placeholder="密送（其他收件人看不到），多个用逗号分隔" autocomplete="off" /></label>
       </div>
       <div class="composer-row merge-row">
         <label class="merge-pick" title="勾选后，将对每个收件人分别单独发送一封邮件（内容与主题相同）">
@@ -96,6 +126,7 @@
         <button id="f-mode" class="btn" type="button">切换 HTML 富文本</button>
         <button id="f-quote" class="btn hidden" type="button">引用原文</button>
         <span class="grow"></span>
+        <span id="f-forward-note" class="merge-hint"></span>
         <label class="att-pick btn" title="添加附件">＋ 附件
           <input id="f-attachments" type="file" multiple hidden />
         </label>
@@ -107,6 +138,8 @@
         <button id="composer-cancel" class="btn" type="button">取消</button>
         <button id="composer-send" class="btn btn-primary" type="button">发送</button>
       </div>
+      <!-- 收件人联想下拉：由 app.js 定位到当前正在输入的收件人字段下方 -->
+      <div id="addr-suggest" class="addr-suggest hidden" role="listbox"></div>
     </div>
   </div>
 

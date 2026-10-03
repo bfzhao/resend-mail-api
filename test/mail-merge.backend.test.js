@@ -66,6 +66,8 @@ function makeDB(opts = {}) {
   // firstHandler(sql, args) -> row | null：默认恒 null（合并发送路径不需要读回数据）。
   // 回信路径需要 getMessage() 拿到原邮件，故允许用例注入。
   const firstHandler = typeof opts.first === 'function' ? opts.first : () => null;
+  // allHandler(sql, args) -> rows：默认空数组。转发路径需要 listAttachments() 拿到原附件行。
+  const allHandler = typeof opts.all === 'function' ? opts.all : () => [];
   const mk = (sql) => {
     const st = {
       sql,
@@ -73,7 +75,7 @@ function makeDB(opts = {}) {
       bind(...a) { st.args = a; return st; },
       async run() { executed.push({ sql, args: st.args }); return { success: true, results: [], meta: {} }; },
       async first() { executed.push({ sql, args: st.args }); return firstHandler(sql, st.args) ?? null; },
-      async all() { executed.push({ sql, args: st.args }); return { results: [], success: true, meta: {} }; },
+      async all() { executed.push({ sql, args: st.args }); return { results: allHandler(sql, st.args) ?? [], success: true, meta: {} }; },
     };
     return st;
   };
@@ -95,11 +97,27 @@ function makeDB(opts = {}) {
 
 function makeBucket() {
   const puts = [];
+  const store = new Map();
+  const toBytes = (v) => (v instanceof Uint8Array ? v : new TextEncoder().encode(String(v ?? '')));
   return {
     puts,
-    async put(key, value, opts) { puts.push({ key, size: value && value.length, opts }); return {}; },
-    async get() { return null; },
-    async delete() { return {}; },
+    /** 用例预置对象（模拟「原邮件附件已经在 R2 里」） */
+    seed(key, value) { store.set(key, toBytes(value)); },
+    async put(key, value, opts) {
+      const bytes = toBytes(value);
+      store.set(key, bytes);
+      puts.push({ key, size: bytes.length, opts });
+      return {};
+    },
+    // get 必须能读回 put 过的对象：转发要从 R2 读原附件
+    async get(key) {
+      if (!store.has(key)) return null;
+      const bytes = store.get(key);
+      return {
+        arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
+      };
+    },
+    async delete(key) { store.delete(key); return {}; },
     async list() { return { objects: [] }; },
   };
 }
@@ -163,6 +181,18 @@ async function postReply(worker, env, id, body) {
   return { res, status: res.status, data };
 }
 
+async function postForward(worker, env, id, body) {
+  const req = new Request(`https://example.com/api/messages/${encodeURIComponent(id)}/forward`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: typeof body === 'string' ? body : JSON.stringify(body),
+  });
+  const res = await worker.fetch(req, env);
+  let data = null;
+  try { data = await res.json(); } catch { data = null; }
+  return { res, status: res.status, data };
+}
+
 /* ---------------------------------------------------------------------------
  * 用例运行器
  * -------------------------------------------------------------------------*/
@@ -202,6 +232,7 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
       db, bucket, resend, env,
       post: (b) => postMessages(worker, env, b),
       reply: (id, b) => postReply(worker, env, id, b),
+      forward: (id, b) => postForward(worker, env, id, b),
     };
   };
 
@@ -623,7 +654,7 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
 
   /* ---- B20 ⭐ 回信的发件人：body.mailbox 必须生效 ---- */
   {
-    section('B20 ⭐ 回信发件人：body.mailbox 必须生效（曾忽略它 -> 改选发件人无效）');
+    section('B24 ⭐ 回信发件人：body.mailbox 必须生效（曾忽略它 -> 改选发件人无效）');
     const ORIG = {
       id: 'orig-1', direction: 'inbound', mailbox: 'inbox@notionmanager.com',
       from_email: 'alice@partner.com', from_name: 'Alice',
@@ -679,6 +710,243 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
     await c4.reply('orig-1', { body: '回复内容', mailbox: '   ' });
     ok(fromOf(c4) === 'support <inbox@notionmanager.com>',
       'mailbox 只有空白 -> 视同未指定，回退原邮件收件信箱', fromOf(c4));
+  }
+
+  /* ---- B21 ⭐ 回信收件人：请求体的 to 必须生效（曾整段被忽略 -> 补的人收不到信、发件箱只记一人） ---- */
+  {
+    section('B25 ⭐ 回信收件人：请求体 to 必须生效（曾忽略它 -> 补的收件人被丢弃）');
+    const ORIG2 = {
+      id: 'orig-1', direction: 'inbound', mailbox: 'inbox@notionmanager.com',
+      from_email: 'alice@partner.com', from_name: 'Alice',
+      to_emails: '["inbox@notionmanager.com"]', cc: null, bcc: null, reply_to: null,
+      subject: '报价', body_text: 'hi', body_html: null,
+      message_id: '<orig-1@partner.com>', references: null, thread_id: 't-1',
+      received_at: 1788000000, read: 1, deleted: 0, starred: 0, status: 'received',
+      resend_id: 're_in_1',
+    };
+    const ctxOf = (extra) => mkCtx(undefined, extra, {
+      first: (sql, args) =>
+        /SELECT \* FROM messages WHERE id = \?/i.test(sql) && args[0] === 'orig-1' ? ORIG2 : null,
+    });
+    const toOf = (c) => (c.resend.calls[0] ? c.resend.calls[0].body.to : undefined);
+    const storedTo = (c) => {
+      const ins = c.db.messageInserts();
+      return ins.length ? JSON.parse(ins[0].args[9]) : null;
+    };
+
+    // ① 前端实际发的是数组：原发件人 + 用户补的人
+    const c1 = ctxOf();
+    const r1 = await c1.reply('orig-1', { to: ['alice@partner.com', 'bob@other.com'], body: '回复内容' });
+    ok(r1.status === 200 && r1.data && r1.data.original_id === 'orig-1',
+      '负控制：回信路由确实被驱动（否则下面的收件人断言可能是空转）',
+      `${r1.status}/${JSON.stringify(r1.data)}`);
+    ok(c1.resend.calls.length === 1, '恰好 1 次 Resend 调用（多人共用一封，不是每人一封）', c1.resend.calls.length);
+    ok(JSON.stringify(toOf(c1)) === JSON.stringify(['alice@partner.com', 'bob@other.com']),
+      '⭐ 请求体 to 原样生效：两位收件人都发出去了', JSON.stringify(toOf(c1)));
+    ok(c1.db.messageInserts().length === 1, '恰好 1 条出站记录', c1.db.messageInserts().length);
+    ok(JSON.stringify(storedTo(c1)) === JSON.stringify(['alice@partner.com', 'bob@other.com']),
+      '⭐ 发件箱记录 to_emails 含两人（用户报的「只有一个人」）', JSON.stringify(storedTo(c1)));
+
+    // ② 字符串形态（直接调 API）：逗号 / 分号都算分隔符
+    const c2 = ctxOf();
+    await c2.reply('orig-1', { to: 'alice@partner.com; bob@other.com', body: '回复内容' });
+    ok(JSON.stringify(toOf(c2)) === JSON.stringify(['alice@partner.com', 'bob@other.com']),
+      '字符串形态同样解析出两人（与前端 parseRecipients 同口径）', JSON.stringify(toOf(c2)));
+
+    // ③ 去重且保序
+    const c3 = ctxOf();
+    await c3.reply('orig-1', { to: ['bob@other.com', 'BOB@other.com', 'alice@partner.com'], body: '回复内容' });
+    ok(JSON.stringify(toOf(c3)) === JSON.stringify(['bob@other.com', 'alice@partner.com']),
+      '按小写去重并保留首次出现的写法/顺序', JSON.stringify(toOf(c3)));
+
+    // ④ 负控制：完全没给 to -> 回退到从原邮件推导的那一个地址（老客户端 / 直接调 API 不回归）
+    const c4 = ctxOf();
+    await c4.reply('orig-1', { body: '回复内容' });
+    ok(JSON.stringify(toOf(c4)) === JSON.stringify(['alice@partner.com']),
+      '未给 to -> 回退原发件人单个（既有行为不变）', JSON.stringify(toOf(c4)));
+
+    // ⑤ 只给空白 to -> 视同未给，回退原发件人，不得发出空收件人
+    const c5 = ctxOf();
+    await c5.reply('orig-1', { to: '   ', body: '回复内容' });
+    ok(JSON.stringify(toOf(c5)) === JSON.stringify(['alice@partner.com']),
+      'to 只有空白 -> 回退原发件人', JSON.stringify(toOf(c5)));
+  }
+
+  /* ---- B22 ⭐ cc / bcc：归一化（去重 + 与更高优先级分组重复的剔除） ---- */
+  {
+    section('B26 ⭐ cc/bcc 归一化：同一地址不能既在 to 又在 cc（否则同一人收到两封）');
+    // ① cc 与 to 重复 -> 从 cc 剔除
+    const c1 = mkCtx();
+    const r1 = await c1.post({ to: 'a@x.com', cc: 'a@x.com, b@y.com', subject: 'S', body: 'B' });
+    ok(r1.status === 200, 'HTTP 200', `${r1.status}/${JSON.stringify(r1.data)}`);
+    ok(JSON.stringify(c1.resend.calls[0].body.to) === JSON.stringify(['a@x.com']), 'to 原样保留', JSON.stringify(c1.resend.calls[0].body.to));
+    ok(JSON.stringify(c1.resend.calls[0].body.cc) === JSON.stringify(['b@y.com']),
+      '⭐ cc 中与 to 重复的地址被剔除（否则 a@x.com 会收到两封）', JSON.stringify(c1.resend.calls[0].body.cc));
+    ok(JSON.parse(c1.db.messageInserts()[0].args[10]) && JSON.stringify(JSON.parse(c1.db.messageInserts()[0].args[10])) === JSON.stringify(['b@y.com']),
+      '落库的 cc 与真正发出的 cc 一致', c1.db.messageInserts()[0].args[10]);
+
+    // ② 只填 bcc 也能发信（to 为空）
+    const c2 = mkCtx();
+    const r2 = await c2.post({ to: '', bcc: 'secret@x.com', subject: 'S', body: 'B' });
+    ok(r2.status === 200, '⭐ 只填密送也能发信（to/cc/bcc 任一非空即可）', `${r2.status}/${JSON.stringify(r2.data)}`);
+    ok(JSON.stringify(c2.resend.calls[0].body.to) === '[]', 'to 为空数组', JSON.stringify(c2.resend.calls[0].body.to));
+    ok(JSON.stringify(c2.resend.calls[0].body.bcc) === JSON.stringify(['secret@x.com']), '⭐ bcc 透传到 Resend', JSON.stringify(c2.resend.calls[0].body.bcc));
+    ok(JSON.stringify(JSON.parse(c2.db.messageInserts()[0].args[11])) === JSON.stringify(['secret@x.com']),
+      'bcc 落库（发件人自己回看时能看到密送给了谁）', c2.db.messageInserts()[0].args[11]);
+    ok(c2.resend.calls[0].body.cc === undefined, '没有 cc 时不传 cc 字段（不传空数组）');
+
+    // ③ bcc 与 to / cc 重复 -> 剔除；bcc 内部去重
+    const c3 = mkCtx();
+    await c3.post({ to: 'a@x.com', cc: 'b@y.com', bcc: 'A@X.com, b@y.com, s@z.com, S@Z.com', subject: 'S', body: 'B' });
+    ok(JSON.stringify(c3.resend.calls[0].body.bcc) === JSON.stringify(['s@z.com']),
+      '⭐ bcc 剔除与 to/cc 重复的（大小写不敏感）并在自身内部去重', JSON.stringify(c3.resend.calls[0].body.bcc));
+
+    // ④ 三组全空 -> 400（既有文案不变）
+    const c4 = mkCtx();
+    const r4 = await c4.post({ to: '', cc: ' , ; ', bcc: [], subject: 'S', body: 'B' });
+    ok(r4.status === 400 && r4.data.error === '缺少收件人', '三组全空 -> 400 缺少收件人', `${r4.status}/${r4.data.error}`);
+    ok(c4.resend.calls.length === 0, '不发信');
+  }
+
+  /* ---- B23 ⭐ merge 与 bcc 互斥：明确拒绝，不静默忽略 ---- */
+  {
+    section('B27 ⭐ merge + bcc -> 400（不静默忽略密送）');
+    const c = mkCtx();
+    const r = await c.post({ to: 'a@x.com, b@y.com', bcc: 's@x.com', subject: 'S', body: 'B', merge: true });
+    ok(r.status === 400, 'HTTP 400', `${r.status}/${JSON.stringify(r.data)}`);
+    ok(/密送/.test(String(r.data.error)) && /合并发送/.test(String(r.data.error)), '错误文案说明是「合并发送不支持密送」', r.data.error);
+    ok(c.resend.calls.length === 0, '⭐ 一封都不发（若静默忽略 bcc，用户会以为密送生效了）', c.resend.calls.length);
+    // 负控制：同样的收件人但不勾 merge -> 正常发出，且带 bcc
+    const c2 = mkCtx();
+    const r2 = await c2.post({ to: 'a@x.com, b@y.com', bcc: 's@x.com', subject: 'S', body: 'B' });
+    ok(r2.status === 200 && c2.resend.calls.length === 1, '负控制：不勾 merge 时同样入参可以发（区分度成立）', `${r2.status}/${c2.resend.calls.length}`);
+    ok(JSON.stringify(c2.resend.calls[0].body.bcc) === JSON.stringify(['s@x.com']), '负控制：bcc 正常透传');
+  }
+
+  /* ---- B24 ⭐ 回复也支持 cc / bcc ---- */
+  {
+    section('B28 ⭐ 回复：cc/bcc 透传并落库；与 to 重复的被剔除');
+    const ORIG_R = {
+      id: 'orig-1', direction: 'inbound', mailbox: 'inbox@notionmanager.com',
+      from_email: 'alice@partner.com', from_name: 'Alice',
+      to_emails: '["inbox@notionmanager.com"]', cc: null, bcc: null, reply_to: null,
+      subject: '报价', body_text: 'hi', body_html: null,
+      message_id: '<orig-1@partner.com>', references: null, thread_id: 't-1',
+      received_at: 1788000000, read: 1, deleted: 0, starred: 0, status: 'received',
+      resend_id: 're_in_1',
+    };
+    const ctxOf = () => mkCtx(undefined, {}, {
+      first: (sql, args) =>
+        /SELECT \* FROM messages WHERE id = \?/i.test(sql) && args[0] === 'orig-1' ? ORIG_R : null,
+    });
+
+    const c1 = ctxOf();
+    const r1 = await c1.reply('orig-1', {
+      to: ['alice@partner.com'], cc: ['cc@x.com'], bcc: ['bcc@x.com'], body: '回复内容',
+    });
+    ok(r1.status === 200, 'HTTP 200', `${r1.status}/${JSON.stringify(r1.data)}`);
+    ok(JSON.stringify(c1.resend.calls[0].body.cc) === JSON.stringify(['cc@x.com']), '⭐ 回复的 cc 透传', JSON.stringify(c1.resend.calls[0].body.cc));
+    ok(JSON.stringify(c1.resend.calls[0].body.bcc) === JSON.stringify(['bcc@x.com']), '⭐ 回复的 bcc 透传', JSON.stringify(c1.resend.calls[0].body.bcc));
+    const ins = c1.db.messageInserts()[0];
+    ok(JSON.stringify(JSON.parse(ins.args[10])) === JSON.stringify(['cc@x.com']), '回复的 cc 落库', ins.args[10]);
+    ok(JSON.stringify(JSON.parse(ins.args[11])) === JSON.stringify(['bcc@x.com']), '回复的 bcc 落库', ins.args[11]);
+
+    // cc 与 to 重复（大小写不同）-> 剔除
+    const c2 = ctxOf();
+    await c2.reply('orig-1', { to: ['alice@partner.com'], cc: ['ALICE@partner.com'], body: '回复内容' });
+    ok(c2.resend.calls[0].body.cc === undefined,
+      '⭐ cc 与 to 是同一个地址（仅大小写不同）-> 剔除，不重复投递', JSON.stringify(c2.resend.calls[0].body.cc));
+  }
+
+  /* ---- B25 ⭐ 转发：任意方向、新会话、原附件服务端复制 ---- */
+  {
+    section('B29 ⭐ 转发：任意方向 / 新会话 / 原附件服务端复制到新 R2 key');
+    const ORIG_F = {
+      id: 'orig-1', direction: 'inbound', mailbox: 'inbox@notionmanager.com',
+      from_email: 'alice@partner.com', from_name: 'Alice',
+      to_emails: '["inbox@notionmanager.com"]', cc: null, bcc: null, reply_to: null,
+      subject: '报价', body_text: 'hi', body_html: null,
+      message_id: '<orig-1@partner.com>', references: null, thread_id: 't-1',
+      received_at: 1788000000, read: 1, deleted: 0, starred: 0, status: 'received',
+      resend_id: 're_in_1',
+    };
+    const ATTS = [
+      { id: 'a1', message_id: 'orig-1', r2_key: 'attachments/orig/a1-note.txt', filename: 'note.txt', content_type: 'text/plain', size: 5, inline: 0, content_id: null, created_at: 1 },
+      { id: 'a2', message_id: 'orig-1', r2_key: 'attachments/orig/a2-logo.png', filename: 'logo.png', content_type: 'image/png', size: 3, inline: 1, content_id: 'logo', created_at: 1 },
+    ];
+    const ctxOf = (orig) => mkCtx(undefined, {}, {
+      first: (sql, args) =>
+        /SELECT \* FROM messages WHERE id = \?/i.test(sql) && args[0] === 'orig-1' ? (orig || ORIG_F) : null,
+      all: (sql, args) =>
+        /FROM attachments WHERE message_id = \?/i.test(sql) && args[0] === 'orig-1' ? ATTS : [],
+    });
+
+    // ① 基本转发（带原附件）
+    const c1 = ctxOf();
+    c1.bucket.seed('attachments/orig/a1-note.txt', 'hello');
+    c1.bucket.seed('attachments/orig/a2-logo.png', 'png');
+    const r1 = await c1.forward('orig-1', { to: 'bob@x.com', subject: '客户端传的主题应被忽略', body: '转发内容' });
+    ok(r1.status === 200, 'HTTP 200', `${r1.status}/${JSON.stringify(r1.data)}`);
+    ok(c1.resend.calls.length === 1, '恰好 1 次 Resend 调用', c1.resend.calls.length);
+    const b1 = c1.resend.calls[0].body;
+    ok(b1.subject === 'Fwd: 报价', '⭐ 主题由服务端补 Fwd:（不信客户端传的主题）', b1.subject);
+    ok(JSON.stringify(b1.to) === JSON.stringify(['bob@x.com']), '收件人正确', JSON.stringify(b1.to));
+    ok(b1.headers === undefined, '⭐ 转发不设 In-Reply-To / References（否则会串进原会话）', JSON.stringify(b1.headers));
+    ok(Array.isArray(b1.attachments) && b1.attachments.length === 1,
+      '⭐ 只带非内联附件（内联图片跳过）', JSON.stringify((b1.attachments || []).map((x) => x.filename)));
+    ok(b1.attachments[0].filename === 'note.txt' && b1.attachments[0].content === 'aGVsbG8=',
+      '原附件内容以 base64 随信发出', JSON.stringify(b1.attachments[0]));
+    ok(r1.data.forwarded_attachments === 1 && JSON.stringify(r1.data.skipped_attachments) === '[]',
+      '响应报告带走了几个附件', JSON.stringify(r1.data));
+
+    const ins1 = c1.db.messageInserts();
+    ok(ins1.length === 1, '1 条出站记录', ins1.length);
+    // `|| null` + `x && ...`：前置条件不成立时给出 FAIL，而不是在下一行解引用抛 TypeError
+    // 把整个套件打崩（那样汇总行都打不出来，下游断言全部失去信号）。
+    const row1 = ins1[0] || null;
+    ok(row1 && row1.args[5] !== 't-1', '⭐ threadId 是新会话（不是原邮件的 thread_id）', row1 && row1.args[5]);
+    ok(row1 && row1.args[3] === null && row1.args[4] === null, '落库的 in_reply_to / references 为空', row1 && `${row1.args[3]}/${row1.args[4]}`);
+    const attIns = c1.db.attachmentInserts();
+    ok(attIns.length === 1, '附件表插入 1 行（只复制非内联附件）', attIns.length);
+    const newKey = attIns[0] ? attIns[0].args[2] : null;
+    ok(newKey && newKey !== 'attachments/orig/a1-note.txt',
+      '⭐ 原附件复制到**新** R2 key（共用 key 会在删除原邮件时被连带删掉）', newKey);
+    ok(newKey && row1 && String(newKey).startsWith(`attachments/${row1.args[0]}/`), '新 key 挂在新 messageId 下', newKey);
+    ok(c1.bucket.puts.some((p) => p.key === newKey), 'R2 里确实写入了新 key', JSON.stringify(c1.bucket.puts.map((p) => p.key)));
+
+    // ② 主题已有 Fwd: 前缀 -> 不重复叠加
+    const c2 = ctxOf(Object.assign({}, ORIG_F, { subject: 'Fwd: 报价' }));
+    const r2 = await c2.forward('orig-1', { to: 'bob@x.com', body: 'x' });
+    ok(r2.status === 200 && c2.resend.calls[0].body.subject === 'Fwd: 报价', '已有 Fwd: 前缀不重复叠加', c2.resend.calls[0].body.subject);
+
+    // ③ 转发出站邮件也允许（reply 只允许 inbound，forward 不限方向）
+    const c3 = ctxOf(Object.assign({}, ORIG_F, { direction: 'outbound', from_email: 'me@notionmanager.com', from_name: null }));
+    const r3 = await c3.forward('orig-1', { to: 'bob@x.com', body: 'x' });
+    ok(r3.status === 200, '⭐ 出站（已发送）的邮件也能转发（「转发任何邮件」）', `${r3.status}/${JSON.stringify(r3.data)}`);
+
+    // ④ 原附件在 R2 读不到 -> 跳过但**明确列出**，不静默少发
+    const c4 = ctxOf();
+    const r4 = await c4.forward('orig-1', { to: 'bob@x.com', body: 'x' });
+    ok(r4.status === 200, '附件读不到仍转发（不整封拦下）', `${r4.status}/${JSON.stringify(r4.data)}`);
+    ok(JSON.stringify(r4.data.skipped_attachments) === JSON.stringify(['note.txt']),
+      '⭐ 明确列出跳过的附件（否则用户以为附件跟着走了）', JSON.stringify(r4.data.skipped_attachments));
+    ok(c4.resend.calls[0].body.attachments === undefined, '没有附件随信发出');
+
+    // ⑤ 附件合计超 40MB -> 400 且不发信
+    const c5 = ctxOf();
+    c5.bucket.seed('attachments/orig/a1-note.txt', new Uint8Array(41 * 1024 * 1024));
+    const r5 = await c5.forward('orig-1', { to: 'bob@x.com', body: 'x' });
+    ok(r5.status === 400, '⭐ 附件合计超 40MB -> HTTP 400', `${r5.status}/${JSON.stringify(r5.data)}`);
+    ok(/40 MB/.test(String(r5.data.error)), '错误文案说明是大小超限', r5.data.error);
+    ok(c5.resend.calls.length === 0, '不发信');
+
+    // ⑥ 收件人为空 / 原邮件不存在
+    const c6 = ctxOf();
+    const r6 = await c6.forward('orig-1', { to: '', body: 'x' });
+    ok(r6.status === 400 && r6.data.error === '缺少收件人', '收件人为空 -> 400 缺少收件人', `${r6.status}/${r6.data.error}`);
+    const c7 = mkCtx();
+    const r7 = await c7.forward('nope', { to: 'b@x.com', body: 'x' });
+    ok(r7.status === 404, '原邮件不存在 -> 404', `${r7.status}/${JSON.stringify(r7.data)}`);
   }
 
   /* ---- 汇总 ---- */

@@ -820,6 +820,59 @@ async function test(name, fn, bootOpts) {
     await ticks(ctx.win, 15);
   }, { mailboxes: [{ mailbox: 'me@example.com' }, { mailbox: 'alias@example.com' }] });
 
+  /* ---- T11d 发件人：独立一行 + 默认折叠，摘要始终同步 ---- */
+  await test('T11d 发件人独立一行：默认折叠、点开可选、摘要跟着选择走', async (ctx) => {
+    await openCompose(ctx);
+    const hid = (sel) => el(ctx, sel).classList.contains('hidden');
+    const sel = el(ctx, '#f-mailbox');
+
+    ok(!hid('#f-sender-row'), '发件人摘要行可见（独占一行，不再和收件人抢宽度）');
+    ok(hid('#f-mailbox-row'), '⭐ 默认折叠：下拉行收起');
+    ok(!hid('#f-to'), '收件人字段照常在（没有被发件人顶掉）');
+    ok(el(ctx, '#f-sender-current').textContent === sel.value,
+      '⭐ 折叠态摘要写着当前发件人（收起 ≠ 看不见用哪个地址发）',
+      el(ctx, '#f-sender-current').textContent);
+    ok(el(ctx, '#f-sender-toggle').getAttribute('aria-expanded') === 'false', 'aria-expanded=false');
+
+    clickEl(ctx, '#f-sender-toggle');
+    ok(!hid('#f-mailbox-row'), '⭐ 点开 -> 下拉行展开');
+    ok(el(ctx, '#f-sender-toggle').getAttribute('aria-expanded') === 'true', '展开后 aria-expanded=true');
+
+    const other = Array.from(sel.options).map((o) => o.value).find((v) => v !== sel.value);
+    sel.value = other;
+    sel.dispatchEvent(new ctx.win.Event('change', { bubbles: true }));
+    ok(el(ctx, '#f-sender-current').textContent === other,
+      '⭐ 改选后摘要同步（不同步的话收起来会显示旧地址）', el(ctx, '#f-sender-current').textContent);
+    ok(evalIn(ctx, 'isComposerDirty()') === true, '改过发件人 -> 判脏');
+
+    clickEl(ctx, '#f-sender-toggle');
+    ok(hid('#f-mailbox-row'), '再点一次 -> 收起');
+    ok(evalIn(ctx, 'isComposerDirty()') === true, '⭐ 收起只是收 UI，判脏不受影响');
+
+    setValue(ctx, '#f-to', 'someone@x.com');
+    setValue(ctx, '#f-body', '正文');
+    clickEl(ctx, '#composer-send');
+    ok(ctx.stub.hasPendingSend(), '发送请求已发出且挂起');
+    const sent = ctx.stub.calls.filter((c) => c.method === 'POST' && /\/api\/messages$/.test(c.url));
+    const body = sent.length ? JSON.parse(sent[0].body) : null;
+    ok(body && body.mailbox === other,
+      '⭐ 折叠状态下发信，请求体照样带上改选后的发件人', body && JSON.stringify(body.mailbox));
+    ctx.stub.settleSend(200, { ok: true });
+    await ticks(ctx.win, 15);
+  }, { mailboxes: [{ mailbox: 'me@example.com' }, { mailbox: 'alias@example.com' }] });
+
+  /* ---- T11e 只有一个发件地址：不给「可展开」的假象 ---- */
+  await test('T11e 只有一个发件地址：摘要行不显示箭头，点了也不展开', async (ctx) => {
+    await openCompose(ctx);
+    const hid = (sel) => el(ctx, sel).classList.contains('hidden');
+    ok(!hid('#f-sender-row'), '摘要行仍可见（至少让人知道用哪个地址发）');
+    ok(el(ctx, '#f-sender-row').classList.contains('sender-solo'), '⭐ 单地址时带 sender-solo（CSS 靠它藏箭头）');
+    clickEl(ctx, '#f-sender-toggle');
+    ok(hid('#f-mailbox-row'), '⭐ 点了也不展开（只有一个选项，展开是空转）');
+    ok(el(ctx, '#f-sender-current').textContent === 'me@example.com',
+      '摘要就是那唯一的地址', el(ctx, '#f-sender-current').textContent);
+  }, { mailboxes: [{ mailbox: 'me@example.com' }] });
+
   /* ---- T13 norm() 归一化边界 ---- */
   await test('T13 norm() 边界：null/undefined/各类空白', async (ctx) => {
     const probe = (expr) => evalIn(ctx, `(() => { const r = norm(${expr}); return JSON.stringify(r); })()`);

@@ -76,6 +76,9 @@ const state = {
   canSend: false,
   fromAddress: '',
   fromName: '',
+  /** 本地联系人（GET /api/contacts），供收件人输入联想。 */
+  contacts: [],
+  contactsLoaded: false,
   openId: null,
   pendingOpenId: null, // 从本地缓存恢复、待列表就绪后重新打开的邮件 id
   loading: false,
@@ -93,6 +96,76 @@ const state = {
 const $ = (sel) => document.querySelector(sel);
 const listEl = $('#list');
 const readEl = $('#read-message');
+
+/* ---------------- 移动端布局（单栏 + 抽屉） ----------------
+ * 断点必须与 app.css 里的 `@media (max-width: 768px)` 保持一致。
+ */
+const MOBILE_MAX_W = 768;
+
+/**
+ * 视口宽度。
+ *
+ * 用 `globalThis` 而不是 `window`：两个 vm 套件（compose-guard / mail-merge）的 sandbox 里
+ * **没有 window**，裸访问会 `ReferenceError` 把整个套件打挂；`globalThis` 在浏览器里就是
+ * window、在 sandbox 里是 sandbox 自身，两边都安全。
+ */
+function viewportWidth() {
+  const w = globalThis.innerWidth;
+  return typeof w === 'number' && w > 0 ? w : 1024;
+}
+
+/**
+ * 是否走移动端（单栏 + 抽屉）布局。
+ *
+ * matchMedia 优先：真机上它还能感知旋转 / 分屏，且不依赖读时机的 innerWidth。
+ * 缺失时回退到 innerWidth —— jsdom 不实现 matchMedia（实测 `typeof window.matchMedia`
+ * 是 `undefined`），不做这层特性检测，4 个 jsdom 套件会在 init() 里直接抛错全挂。
+ *
+ * ⚠️ 不要用「触摸能力」判断移动端：jsdom 里 `'ontouchstart' in window` 是 **true**，
+ * 会把所有测试误判成移动端；`navigator.maxTouchPoints` 在 jsdom 里是 undefined，同样不可靠。
+ * 只认宽度。
+ */
+function isMobile() {
+  const mm = globalThis.matchMedia;
+  if (typeof mm === 'function') {
+    try {
+      return mm(`(max-width: ${MOBILE_MAX_W}px)`).matches;
+    } catch {
+      /* matchMedia 存在但不可用（被桩成不完整对象等）→ 回退到宽度判断 */
+    }
+  }
+  return viewportWidth() <= MOBILE_MAX_W;
+}
+
+/** 抽屉是否展开。仅移动端有意义。 */
+let drawerOpen = false;
+
+/**
+ * 移动端布局的**唯一收敛点**：把 (isMobile, state.openId, drawerOpen) 全量对齐到
+ * `#app` 上的状态类。任何地方都不许直接 toggle 这几个类，只调这里。
+ *
+ * 桌面端下这些类不生效（对应规则全在 @media 内），所以从移动端缩放到桌面时不必额外清理；
+ * 但仍在这里把 drawerOpen 归零，避免缩回移动端时抽屉莫名是开着的。
+ */
+function syncLayout() {
+  const app = $('#app');
+  if (!app) return;
+  const mobile = isMobile();
+  if (!mobile) drawerOpen = false;
+  app.classList.toggle('is-mobile', mobile);
+  app.classList.toggle('mobile-detail', mobile && state.openId !== null);
+  app.classList.toggle('drawer-open', mobile && drawerOpen);
+}
+
+function setDrawer(open) {
+  drawerOpen = !!open;
+  syncLayout();
+}
+
+/** 收起抽屉。桌面端调用无副作用（drawerOpen 本来就是 false）。 */
+function closeDrawer() {
+  if (drawerOpen) setDrawer(false);
+}
 
 /* ---------------- API ---------------- */
 
@@ -635,6 +708,7 @@ function openFolder(folder) {
   if (input) input.value = '';
   state.offset = 0;
   closeMessagePane();
+  closeDrawer(); // 移动端：选完文件夹收起抽屉，否则它一直挡着刚切出来的列表
   renderNav();
   renderListTitle();
   renderSelectBar();
@@ -977,6 +1051,7 @@ function closeMessagePane() {
   $('#read-message').classList.add('hidden');
   $('#read-placeholder').classList.remove('hidden');
   syncActiveRow(); // 关闭后清掉残留的 active 高亮（BUG-1）
+  syncLayout(); // 移动端：退出单栏详情视图，让列表重新占满
 }
 
 function isReadMode() {
@@ -1180,6 +1255,9 @@ function metaLines() {
   } else {
     add('发件人', m.from_email || m.mailbox || '');
     add('收件人', jsonArr(m.to_emails).join(', '));
+    // 抄送/密送只在有内容时列出，避免每封都多两行「—」
+    if (jsonArr(m.cc).length) add('抄送', jsonArr(m.cc).join(', '));
+    if (jsonArr(m.bcc).length) add('密送', jsonArr(m.bcc).join(', '));
     add('状态', STATUS_LABEL[m.status] || m.status || '—');
     add('时间', timeLong(m.received_at));
   }
@@ -1264,6 +1342,8 @@ function renderRead() {
   if (isInbound) {
     actions.appendChild(readBtn('回复', () => { if (isOpen()) openReplyComposer(); }, 'btn-primary'));
   }
+  // 转发对入站 / 出站邮件都开放（自己的已发送邮件同样可以转给别人）
+  actions.appendChild(readBtn('转发', () => { if (isOpen()) openForwardComposer(); }));
   actions.appendChild(readBtn(m.read ? '标为未读' : '标为已读', () => { if (isOpen()) void setFlag('read', !m.read); }));
   actions.appendChild(readBtn('删除', () => { if (isOpen()) void deleteFromRead(); }));
   env.appendChild(actions);
@@ -1340,6 +1420,10 @@ function renderRead() {
   readEl.appendChild(bodyCard);
 
   syncRowUI(m.id);
+  // 详情渲染完再对齐布局。放在这里而不是 openMessage 的每个分支里各加一次：
+  // renderRead() 是详情内容出现的**唯一出口**（缓存命中 / 乐观渲染 / 详情返回都走它），
+  // 放这里天然不会漏。
+  syncLayout();
 }
 
 /**
@@ -1553,6 +1637,261 @@ function updateMergeHint() {
   $('#merge-hint').textContent = $('#f-merge').checked && n > 1 ? `将分别单独发送给 ${n} 位收件人` : '';
 }
 
+/* ---------------- 收件人联想（本地联系人） ---------------- */
+
+const RECIPIENT_FIELDS = ['#f-to', '#f-cc', '#f-bcc'];
+const SUGGEST_MAX = 8;
+
+/** 当前联想状态；field 为 null 表示下拉未打开。 */
+let addrSuggest = { field: null, items: [], index: -1, query: '', start: 0, end: 0 };
+
+/** 懒加载本地联系人；失败只是联想不可用，不能影响发信，所以静默降级。 */
+async function loadContacts(force = false) {
+  if (state.contactsLoaded && !force) return;
+  try {
+    const data = await api('/api/contacts');
+    state.contacts = data && Array.isArray(data.contacts) ? data.contacts : [];
+    state.contactsLoaded = true;
+  } catch {
+    state.contacts = [];
+  }
+}
+
+/**
+ * 取光标所在的那一段地址（逗号 / 分号 / 空白为分隔）。
+ * 返回 start/end 供替换用 —— 选中后只替换这一段，字段里其余收件人保持不动。
+ */
+function recipientToken(input) {
+  const v = String(input.value || '');
+  const caret = typeof input.selectionStart === 'number' ? input.selectionStart : v.length;
+  const before = v.slice(0, caret);
+  let start = 0;
+  for (const d of [',', ';', '，', '；', ' ', '\t', '\n']) {
+    const i = before.lastIndexOf(d);
+    if (i + 1 > start) start = i + 1;
+  }
+  return { start, end: caret, text: before.slice(start) };
+}
+
+/**
+ * 联想排序：姓名前缀 > 姓名包含 > 邮箱前缀 > 邮箱包含，同级按往来次数降序。
+ * 输入 lili 时，名字里带 lili 的人排在「只是邮箱碰巧含 lili」的前面。
+ */
+function contactScore(c, q) {
+  const name = String(c.name || '').toLowerCase();
+  const email = String(c.email || '').toLowerCase();
+  if (name.startsWith(q)) return 0;
+  if (name.includes(q)) return 1;
+  if (email.startsWith(q)) return 2;
+  if (email.includes(q)) return 3;
+  return -1;
+}
+
+function matchContacts(query) {
+  const q = query.trim().toLowerCase();
+  if (!q) return [];
+  const hits = [];
+  // `|| []`：联想跑在每次按键上，任何情况下都不能让输入框抛错（联系人未加载完也是合法状态）
+  for (const c of state.contacts || []) {
+    const score = contactScore(c, q);
+    if (score < 0) continue;
+    hits.push({ c, score });
+  }
+  hits.sort((a, b) => a.score - b.score || (b.c.count || 0) - (a.c.count || 0) || (a.c.email < b.c.email ? -1 : 1));
+  return hits.slice(0, SUGGEST_MAX).map((h) => h.c);
+}
+
+/** 转义后再把命中的那段包 <mark>（先插标签再转义会把标签一起转掉）。 */
+function highlightMatch(text, query) {
+  const t = String(text == null ? '' : text);
+  const q = String(query || '');
+  const i = q ? t.toLowerCase().indexOf(q.toLowerCase()) : -1;
+  if (i < 0) return esc(t);
+  return `${esc(t.slice(0, i))}<mark>${esc(t.slice(i, i + q.length))}</mark>${esc(t.slice(i + q.length))}`;
+}
+
+/**
+ * 联想下拉的几何：**宽度不跟随输入框**。
+ *
+ * 输入框在手机上只有一百多像素（收件人那行还要和别的控件分宽度），跟着它走会把
+ * `zhanglili@notionmanager.com` 这类邮箱截断成看不见。改为铺满写信弹窗的**内容宽度**
+ * （左边界对齐内容左边缘，右边界对齐内容右边缘），一行就够放下完整邮箱。
+ *
+ * 抽成纯函数（只吃数字、不读 DOM）：jsdom 没有真实布局，clientWidth 恒为 0，
+ * 直接断言 positionSuggest 只能测出「设了 0px」，测不出真正的宽度策略。
+ */
+function suggestBoxGeom({ hostWidth, padLeft, padRight, anchorTop, anchorHeight }) {
+  const width = Math.max(0, hostWidth - padLeft - padRight);
+  return { left: padLeft, top: anchorTop + anchorHeight + 4, width };
+}
+
+function positionSuggest(anchor) {
+  const box = $('#addr-suggest');
+  const host = $('#composer');
+  const cs = typeof getComputedStyle === 'function' ? getComputedStyle(host) : null;
+  const padLeft = cs ? parseFloat(cs.paddingLeft) || 0 : 0;
+  const padRight = cs ? parseFloat(cs.paddingRight) || 0 : 0;
+  const g = suggestBoxGeom({
+    hostWidth: host.clientWidth || 0,
+    padLeft,
+    padRight,
+    anchorTop: anchor.offsetTop || 0,
+    anchorHeight: anchor.offsetHeight || 0,
+  });
+  box.style.left = `${g.left}px`;
+  box.style.top = `${g.top}px`;
+  box.style.width = `${g.width}px`;
+}
+
+function hideSuggest() {
+  addrSuggest = { field: null, items: [], index: -1, query: '', start: 0, end: 0 };
+  const box = $('#addr-suggest');
+  box.classList.add('hidden');
+  box.innerHTML = '';
+}
+
+function paintSuggest() {
+  const box = $('#addr-suggest');
+  if (!addrSuggest.field || !addrSuggest.items.length) {
+    hideSuggest();
+    return;
+  }
+  box.innerHTML = '';
+  addrSuggest.items.forEach((c, i) => {
+    const row = document.createElement('div');
+    row.className = 'addr-suggest-item' + (i === addrSuggest.index ? ' active' : '');
+    row.setAttribute('role', 'option');
+    const nm = document.createElement('span');
+    nm.className = 'nm';
+    // 没有姓名时用邮箱当主标签，保证每行都有可读的主字段
+    nm.innerHTML = highlightMatch(c.name || c.email, addrSuggest.query);
+    row.appendChild(nm);
+    if (c.name) {
+      const em = document.createElement('span');
+      em.className = 'em';
+      em.innerHTML = highlightMatch(c.email, addrSuggest.query);
+      row.appendChild(em);
+    }
+    // mousedown + preventDefault：点下拉项时不夺走输入框焦点（否则 blur 会先把下拉关掉）
+    row.addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      applySuggest(i);
+    });
+    box.appendChild(row);
+  });
+  box.classList.remove('hidden');
+  positionSuggest(addrSuggest.field);
+}
+
+/** 把光标所在的这一段替换为联系人的纯邮箱（其余收件人原样保留）。 */
+function applySuggest(i) {
+  const input = addrSuggest.field;
+  const item = addrSuggest.items[i];
+  if (!input || !item) return;
+  const v = String(input.value || '');
+  const { start, end } = addrSuggest;
+  // 在末尾选中时补一个分隔符，方便接着输下一个收件人
+  const insert = end >= v.length ? `${item.email}, ` : item.email;
+  input.value = v.slice(0, start) + insert + v.slice(end);
+  const caret = start + insert.length;
+  hideSuggest();
+  input.focus();
+  try {
+    input.setSelectionRange(caret, caret);
+  } catch {
+    /* 老浏览器忽略 */
+  }
+  // 不派发合成 input 事件（否则会立刻拿刚插入的邮箱再触发一次联想），只手工跑联动
+  updateMergeHint();
+}
+
+function moveSuggest(step) {
+  const n = addrSuggest.items.length;
+  if (!n) return;
+  addrSuggest.index = (addrSuggest.index + step + n) % n;
+  paintSuggest();
+}
+
+/** 输入变化：重算光标所在段，按需显示/更新/收起下拉。 */
+function refreshSuggest(input) {
+  const { start, end, text } = recipientToken(input);
+  const items = matchContacts(text);
+  if (!items.length) {
+    hideSuggest();
+    return;
+  }
+  addrSuggest = { field: input, items, index: 0, query: text.trim(), start, end };
+  paintSuggest();
+}
+
+/** 收件人字段键盘导航；下拉未打开时一律放行（不干扰正常输入，也不吃掉 Esc 关弹窗）。 */
+function onRecipientKeydown(e) {
+  if (!addrSuggest.field || addrSuggest.field !== e.target || !addrSuggest.items.length) return;
+  if (e.key === 'ArrowDown') {
+    e.preventDefault();
+    moveSuggest(1);
+  } else if (e.key === 'ArrowUp') {
+    e.preventDefault();
+    moveSuggest(-1);
+  } else if (e.key === 'Enter' || e.key === 'Tab') {
+    e.preventDefault();
+    applySuggest(addrSuggest.index);
+  } else if (e.key === 'Escape') {
+    // 只收起下拉，不能顺带把整个写信弹窗关掉
+    e.preventDefault();
+    e.stopPropagation();
+    hideSuggest();
+  }
+}
+
+/** 给三个收件人字段挂上联想：输入 / 键盘导航 / 失焦收起 / 聚焦时按需拉联系人。 */
+function bindRecipientSuggest() {
+  for (const sel of RECIPIENT_FIELDS) {
+    const input = $(sel);
+    input.addEventListener('input', () => refreshSuggest(input));
+    input.addEventListener('keydown', onRecipientKeydown);
+    input.addEventListener('focus', () => void loadContacts());
+    input.addEventListener('blur', () => {
+      // 延迟收起：给下拉项的 mousedown 一个先手（正常点击路径下其实不会 blur）
+      setTimeout(() => {
+        if (addrSuggest.field === input) hideSuggest();
+      }, 120);
+    });
+  }
+}
+
+/* ---------------- 抄送 / 密送展开 ---------------- */
+
+// 用显式 id 而不是 querySelectorAll('.cc-field')：零依赖的 DOM 桩（test/compose-guard.test.js）
+// 只实现了 querySelector，没有 querySelectorAll，用类选择器会让那套件直接抛错。
+const CC_ROWS = ['#f-cc-row', '#f-bcc-row'];
+
+function recipientsExpanded() {
+  return !$('#f-cc-row').classList.contains('hidden');
+}
+
+function setRecipientsExpanded(show) {
+  for (const sel of CC_ROWS) $(sel).classList.toggle('hidden', !show);
+  $('#f-cc-toggle').textContent = show ? '－ 收起抄送 / 密送' : '＋ 抄送 / 密送';
+}
+
+/**
+ * 切换抄送/密送行。**已有内容时不允许收起** —— 收起后字段仍会参与发送，
+ * 用户看不见却发出去，是最容易造成误抄送的一类事故。
+ */
+function toggleRecipientsExpanded() {
+  if (!recipientsExpanded()) {
+    setRecipientsExpanded(true);
+    return;
+  }
+  const filled = parseRecipients($('#f-cc').value).length + parseRecipients($('#f-bcc').value).length;
+  if (filled) {
+    showToast('抄送 / 密送里已有内容，清空后才能收起', true);
+    return;
+  }
+  setRecipientsExpanded(false);
+}
+
 /** 打开弹窗时重置「合并发送」：取消勾选并清空提示。勾选不算用户输入，不进基线。 */
 function resetMergePick() {
   $('#f-merge').checked = false;
@@ -1562,6 +1901,45 @@ function resetMergePick() {
 /** 合并发送只在写信模式可用：回复模式的收件人由后端从原邮件推导，显示该控件会误导用户。 */
 function setMergeRowVisible(visible) {
   $('.merge-row').classList.toggle('hidden', !visible);
+}
+
+/* ---------------- 发件人（独立一行，默认折叠） ---------------- */
+
+/**
+ * 发件人折叠态只显示一行摘要（「发件人 xxx@yyy ▾」），点开才展开下拉选择。
+ *
+ * 和抄送 / 密送的关键差别：收起来**不会丢内容** —— 当前发件人始终写在摘要行里，
+ * 选择值也一直留在 select 上（发送时照常读取）。所以这里没有「有内容不许收起」
+ * 那条限制，收起纯属省版面。
+ */
+function senderExpanded() {
+  return !$('#f-mailbox-row').classList.contains('hidden');
+}
+
+function setSenderExpanded(show) {
+  $('#f-mailbox-row').classList.toggle('hidden', !show);
+  const caret = $('#f-sender-caret');
+  if (caret) caret.textContent = show ? '▴' : '▾';
+  $('#f-sender-toggle').setAttribute('aria-expanded', show ? 'true' : 'false');
+}
+
+/** 摘要行始终反映 select 的当前值；只有一个可选项时藏掉箭头（点开也没有可选的）。 */
+function renderSenderSummary() {
+  const list = composerMailboxOptions();
+  const row = $('#f-sender-row');
+  if (!list.length) {
+    row.classList.add('hidden');
+    return;
+  }
+  row.classList.remove('hidden');
+  row.classList.toggle('sender-solo', list.length < 2);
+  $('#f-sender-current').textContent = $('#f-mailbox').value;
+}
+
+function toggleSenderExpanded() {
+  // 只有一个发件地址时没有可选项，点开是空转
+  if ($('#f-sender-row').classList.contains('sender-solo')) return;
+  setSenderExpanded(!senderExpanded());
 }
 
 function composerMailboxOptions() {
@@ -1574,14 +1952,13 @@ function composerMailboxOptions() {
 }
 
 function renderMailboxPicker() {
-  const wrap = $('#f-mailbox-label');
-  const sel = $('#f-mailbox');
   const list = composerMailboxOptions();
+  const sel = $('#f-mailbox');
   if (!list.length) {
-    wrap.classList.add('hidden');
+    $('#f-mailbox-row').classList.add('hidden');
+    $('#f-sender-row').classList.add('hidden');
     return;
   }
-  wrap.classList.remove('hidden');
   const cur = state.composing ? state.composing.mailbox : (state.mailbox || state.fromAddress || list[0]);
   sel.innerHTML = '';
   for (const m of list) {
@@ -1592,6 +1969,9 @@ function renderMailboxPicker() {
   }
   sel.value = list.includes(cur) ? cur : list[0];
   if (state.composing) state.composing.mailbox = sel.value;
+  // 每次打开弹窗都回到折叠态：默认只占一行，要改发件人时再点开
+  setSenderExpanded(false);
+  renderSenderSummary();
 }
 
 function resetComposerEditor() {
@@ -1608,37 +1988,69 @@ function resetComposerEditor() {
   }
 }
 
-function openComposer() {
-  if (!state.canSend) {
-    showToast('服务端未配置发送能力（缺少 RESEND_API_KEY / SEND_FROM_ADDRESS）', true);
-    return;
-  }
-  state.composing = { mode: 'compose', files: [], rich: false, original: null, mailbox: state.mailbox || undefined };
-  $('#composer-title').textContent = '写信';
-  $('#f-to').value = '';
-  $('#f-subject').value = '';
-  $('#f-body').value = '';
+/**
+ * 打开写信弹窗的公共收尾。三个入口（写信 / 回复 / 转发）只在「预填什么、显示哪些控件」上不同，
+ * 其余（清空、渲染发件人、记录基线、显示弹窗）必须完全一致 —— 分开写迟早漂移成
+ * 「回复能联想、转发不能」这类只在某个模式出现的怪问题。
+ */
+function openComposerShell(opts) {
+  const {
+    mode, title, to = '', cc = '', bcc = '', subject = '', body = '',
+    original = null, originalId = null, mailbox, info, showMerge, showQuote, focus,
+  } = opts;
+
+  state.composing = { mode, originalId, files: [], rich: false, original, mailbox };
+
+  $('#composer-title').textContent = title;
+  $('#f-to').value = to;
+  $('#f-cc').value = cc;
+  $('#f-bcc').value = bcc;
+  $('#f-subject').value = subject;
+  $('#f-body').value = body;
   $('#f-body-rich').innerHTML = '';
   $('#f-attach-list').innerHTML = '';
-  $('#f-quote').classList.add('hidden');
+  setRecipientsExpanded(Boolean(cc || bcc));
+  $('#f-quote').classList.toggle('hidden', !showQuote);
+  $('#f-forward-note').textContent = opts.forwardNote || '';
+  hideSuggest();
   renderAttachChips();
   renderMailboxPicker();
   resetComposerEditor();
-  $('#composer-info').textContent = `${state.fromName ? state.fromName + ' ' : ''}<${state.fromAddress}>`;
+  $('#composer-info').textContent = `${state.fromName ? state.fromName + ' ' : ''}<${info || state.fromAddress}>`;
   hideDiscardConfirm(false);
   resetMergePick();
-  setMergeRowVisible(true); // 写信模式：显示合并发送
+  setMergeRowVisible(!!showMerge);
   composerLastFocus = null;
-  // 记录基线：此后任何与基线的差异都算「用户输入」
+  // 记录基线：预填的收件人 / 主题 / 引用正文都不算用户输入
   composerBaseline = {
     to: $('#f-to').value,
+    cc: $('#f-cc').value,
+    bcc: $('#f-bcc').value,
     subject: $('#f-subject').value,
     body: $('#f-body').value,
     richText: richPlainText($('#f-body-rich')),
     mailbox: $('#f-mailbox').value,
   };
   $('#modal-mask').classList.remove('hidden');
-  $('#f-to').focus();
+  closeDrawer(); // 移动端：写信弹窗是全屏的，抽屉必须先收起
+  void loadContacts(); // 联想数据懒加载，失败不影响发信
+  $(focus).focus();
+}
+
+function openComposer() {
+  if (!state.canSend) {
+    showToast('服务端未配置发送能力（缺少 RESEND_API_KEY / SEND_FROM_ADDRESS）', true);
+    return;
+  }
+  openComposerShell({
+    mode: 'compose',
+    title: '写信',
+    mailbox: state.mailbox || undefined,
+    info: state.fromAddress,
+    showMerge: true, // 写信模式：显示合并发送
+    showQuote: false,
+    focus: '#f-to',
+  });
 }
 
 function openReplyComposer() {
@@ -1648,41 +2060,68 @@ function openReplyComposer() {
   }
   const m = currentMessage;
   if (!m) return;
-  state.composing = {
-    mode: 'reply',
-    originalId: m.id,
-    files: [],
-    rich: false,
-    original: m,
-    mailbox: m.mailbox || undefined,
-  };
-  $('#composer-title').textContent = '回复';
   const to = m.reply_to && m.reply_to.length ? m.reply_to[0] : m.from_email;
-  $('#f-to').value = to || '';
-  $('#f-subject').value = /^\s*re:/i.test(m.subject || '') ? m.subject : `Re: ${m.subject || ''}`;
-  $('#f-body').value = '';
-  $('#f-body-rich').innerHTML = '';
-  $('#f-attach-list').innerHTML = '';
-  $('#f-quote').classList.remove('hidden');
-  renderAttachChips();
-  renderMailboxPicker();
-  resetComposerEditor();
-  const mailboxInfo = m.mailbox ? m.mailbox : state.fromAddress;
-  $('#composer-info').textContent = `${state.fromName ? state.fromName + ' ' : ''}<${mailboxInfo}>`;
-  hideDiscardConfirm(false);
-  resetMergePick();
-  setMergeRowVisible(false); // 回复模式：收件人由后端从原邮件推导，隐藏该控件避免误导
-  composerLastFocus = null;
-  // 记录基线：预填的收件人/主题不算用户输入
-  composerBaseline = {
-    to: $('#f-to').value,
-    subject: $('#f-subject').value,
-    body: $('#f-body').value,
-    richText: richPlainText($('#f-body-rich')),
-    mailbox: $('#f-mailbox').value,
-  };
-  $('#modal-mask').classList.remove('hidden');
-  $('#f-body').focus();
+  openComposerShell({
+    mode: 'reply',
+    title: '回复',
+    original: m,
+    originalId: m.id,
+    to: to || '',
+    subject: /^\s*re:/i.test(m.subject || '') ? m.subject : `Re: ${m.subject || ''}`,
+    mailbox: m.mailbox || undefined,
+    info: m.mailbox || state.fromAddress,
+    showMerge: false, // 回复模式：合并发送无意义，隐藏该控件避免误导
+    showQuote: true,
+    focus: '#f-body',
+  });
+}
+
+/**
+ * 转发：**任意方向**的邮件都能转发给任意收件人。
+ * 与回复不同，收件人**不预填**（转发本来就是发给新的人），正文预填原文引用块。
+ */
+function openForwardComposer() {
+  if (!state.canSend) {
+    showToast('服务端未配置发送能力', true);
+    return;
+  }
+  const m = currentMessage;
+  if (!m) return;
+  const n = forwardAttachmentCount();
+  openComposerShell({
+    mode: 'forward',
+    title: '转发',
+    original: m,
+    originalId: m.id,
+    subject: /^\s*fwd?\s*:/i.test(m.subject || '') ? m.subject : `Fwd: ${m.subject || ''}`,
+    body: forwardQuoteText(m),
+    mailbox: m.mailbox || undefined,
+    info: m.mailbox || state.fromAddress,
+    showMerge: false,
+    showQuote: false, // 正文里已经带了原文引用，不再需要「引用原文」按钮
+    focus: '#f-to',
+    forwardNote: n ? `将附带原邮件的 ${n} 个附件` : '',
+  });
+}
+
+/** 转发会带上的原邮件附件数量（内联图片不算 —— 服务端也会跳过它们）。 */
+function forwardAttachmentCount() {
+  return currentAttachments.filter((a) => !a.inline).length;
+}
+
+/** 转发正文里的原文引用块（含转发头，纯文本）。 */
+function forwardQuoteText(m) {
+  const from = m.from_name ? `${m.from_name} <${m.from_email || ''}>` : (m.from_email || '—');
+  const head = [
+    '---------- 转发的邮件 ----------',
+    `发件人: ${from}`,
+    `收件人: ${jsonArr(m.to_emails).join(', ') || '—'}`,
+    `主题: ${m.subject || '(无主题)'}`,
+    `时间: ${timeLong(m.received_at)}`,
+    '',
+  ].join('\n');
+  const body = (m.body_text || '').split('\n').map((l) => `> ${l}`).join('\n');
+  return `${head}\n${body || '(无内容)'}\n`;
 }
 
 /* 关闭写信弹窗的「放弃确认」守卫 */
@@ -1723,11 +2162,15 @@ function isComposerDirty() {
   if (!b) {
     // 兜底：没有基线时退回「任一非空即脏」
     if (norm($('#f-to').value) !== '') return true;
+    if (norm($('#f-cc').value) !== '') return true;
+    if (norm($('#f-bcc').value) !== '') return true;
     if (norm($('#f-subject').value) !== '') return true;
     if (isRich()) return richPlainText($('#f-body-rich')) !== '';
     return norm($('#f-body').value) !== '';
   }
   if (norm($('#f-to').value) !== norm(b.to)) return true;
+  if (norm($('#f-cc').value) !== norm(b.cc)) return true;
+  if (norm($('#f-bcc').value) !== norm(b.bcc)) return true;
   if (norm($('#f-subject').value) !== norm(b.subject)) return true;
   if (norm($('#f-mailbox').value) !== norm(b.mailbox)) return true;
   if (isRich()) {
@@ -1779,6 +2222,7 @@ function requestCloseComposer() {
 
 function closeComposer() {
   hideDiscardConfirm(false);
+  hideSuggest();
   composerLastFocus = null;
   composerBaseline = null;
   state.composing = null;
@@ -1864,6 +2308,15 @@ function quoteHtml() {
   return `<blockquote>${esc(who)} ${esc(date)} 写道：<br>${text || '(无内容)'}</blockquote><br>`;
 }
 
+/** 回复引用的纯文本块（富文本模式下走 quoteHtml，两者内容口径保持一致）。 */
+function quoteText() {
+  const m = state.composing && state.composing.original;
+  const who = (m && (m.from_name || m.from_email)) || '';
+  const date = m ? timeLong(m.received_at) : '';
+  const body = m && m.body_text ? m.body_text.split('\n').map((l) => `> ${l}`).join('\n') : '';
+  return `${who} ${date} 写道：\n${body || '(无内容)'}\n`;
+}
+
 function insertQuote() {
   const c = state.composing;
   if (!c) return;
@@ -1873,11 +2326,7 @@ function insertQuote() {
     ed.focus();
   } else {
     const ta = $('#f-body');
-    const m = c.original;
-    const who = (m && (m.from_name || m.from_email)) || '';
-    const date = m ? timeLong(m.received_at) : '';
-    const body = (m && m.body_text) ? m.body_text.split('\n').map((l) => `> ${l}`).join('\n') : '';
-    const block = `${who} ${date} 写道：\n${body || '(无内容)'}\n`;
+    const block = quoteText();
     ta.value = ta.value ? `${ta.value}\n\n${block}` : block;
     ta.focus();
   }
@@ -1918,9 +2367,12 @@ function bindToolbar() {
 async function sendCompose() {
   const c = state.composing;
   if (!c) return;
-  const recipients = parseRecipients($('#f-to').value);
+  const to = parseRecipients($('#f-to').value);
+  const cc = parseRecipients($('#f-cc').value);
+  const bcc = parseRecipients($('#f-bcc').value);
   const subject = $('#f-subject').value.trim();
-  if (!recipients.length) return showToast('请填写收件人', true);
+  // to / cc / bcc 任一非空即可发（只密送的邮件是合法的）
+  if (!to.length && !cc.length && !bcc.length) return showToast('请填写收件人', true);
 
   let body = $('#f-body').value;
   let html = null;
@@ -1934,19 +2386,27 @@ async function sendCompose() {
   }
   if (!body.trim() && !htmlHasText) return showToast('请填写邮件内容', true);
 
-  const mailbox = $('#f-mailbox-label').classList.contains('hidden') ? undefined : $('#f-mailbox').value;
-  // 硬防御：合并发送只对写信接口生效，绝不向 /api/messages/:id/reply 发 merge
+  // 判据是「有没有可选的发件地址」，不是「那一行有没有展开」：折叠只是收起 UI，
+  // 选择值一直有效，必须照常进请求体（否则改选发件人会静默失效）。
+  const mailbox = composerMailboxOptions().length ? $('#f-mailbox').value : undefined;
+  // 硬防御：合并发送只对写信接口生效，绝不向 /reply 或 /forward 发 merge
   const merge = c.mode === 'compose' && $('#f-merge').checked;
+  // 合并发送是「每人单独一封」，密送会让被密送者收到 N 封重复邮件 → 前端先拦，后端也会拒
+  if (merge && bcc.length) return showToast('合并发送不支持密送（BCC），请取消其中一个', true);
 
   const payload = {
-    to: recipients,
+    to,
     subject,
     body: body || undefined,
     html: html && htmlHasText ? html : undefined,
     attachments: c.files.map((f) => ({ filename: f.name, content: f.content, content_type: f.type })),
   };
+  if (cc.length) payload.cc = cc;
+  if (bcc.length) payload.bcc = bcc;
   if (mailbox) payload.mailbox = mailbox;
   if (merge) payload.merge = true;
+  // 转发：原邮件附件由服务端从 R2 复制，前端不需要把它们下载再上传一遍
+  if (c.mode === 'forward') payload.include_original_attachments = true;
 
   const sendBtn = $('#composer-send');
   sendBtn.disabled = true;
@@ -1954,7 +2414,9 @@ async function sendCompose() {
   try {
     const url = c.mode === 'reply'
       ? `/api/messages/${encodeURIComponent(c.originalId)}/reply`
-      : '/api/messages';
+      : c.mode === 'forward'
+        ? `/api/messages/${encodeURIComponent(c.originalId)}/forward`
+        : '/api/messages';
     const res = await api(url, { method: 'POST', body: JSON.stringify(payload) });
 
     if (merge && res && res.merge) {
@@ -1969,8 +2431,11 @@ async function sendCompose() {
         return;
       }
       showToast(`已分别发送给 ${res.sent_count} 位收件人`);
+    } else if (c.mode === 'forward' && res && Array.isArray(res.skipped_attachments) && res.skipped_attachments.length) {
+      // 少发了附件必须说出来，不能让用户以为附件跟着走了
+      showToast(`已转发，但有 ${res.skipped_attachments.length} 个原附件读取失败已跳过：${res.skipped_attachments.join('、')}`, true);
     } else {
-      showToast(c.mode === 'reply' ? '回复已发送' : '邮件已发送');
+      showToast(c.mode === 'reply' ? '回复已发送' : c.mode === 'forward' ? '邮件已转发' : '邮件已发送');
     }
 
     closeComposer();
@@ -2062,9 +2527,15 @@ function setupEvents() {
   $('#f-attachments').addEventListener('change', (e) => void onPickFiles(e));
   $('#f-mode').addEventListener('click', toggleRich);
   $('#f-quote').addEventListener('click', insertQuote);
+  $('#f-cc-toggle').addEventListener('click', toggleRecipientsExpanded);
+  // 发件人：摘要行点开/收起；改选后摘要要跟着变（否则收起来会显示旧地址）
+  $('#f-sender-toggle').addEventListener('click', toggleSenderExpanded);
+  $('#f-mailbox').addEventListener('change', renderSenderSummary);
   // 合并发送：勾选状态与收件人数量都会影响提示文案
   $('#f-merge').addEventListener('change', updateMergeHint);
   $('#f-to').addEventListener('input', updateMergeHint);
+  // 收件人联想：to / cc / bcc 三个字段共用一套下拉
+  bindRecipientSuggest();
   bindToolbar();
 
   document.addEventListener('keydown', (e) => {
@@ -2080,8 +2551,14 @@ function setupEvents() {
 
   // Esc：确认框优先收起；否则请求关闭写信弹窗（无内容时直接关闭）
   // 注意：不跳过输入框，写信时按 Esc 同样生效
+  // 移动端：抽屉开着时 Esc 先收抽屉（此时确认框 / 写信弹窗都还没出现，先关最外那层）
   document.addEventListener('keydown', (e) => {
     if (e.key !== 'Escape') return;
+    if (drawerOpen) {
+      e.preventDefault();
+      closeDrawer();
+      return;
+    }
     if (discardConfirmPending) {
       e.preventDefault();
       hideDiscardConfirm();
@@ -2091,6 +2568,18 @@ function setupEvents() {
     e.preventDefault();
     requestCloseComposer();
   });
+
+  // ---- 移动端：抽屉 + 单栏详情返回 ----
+  $('#drawer-btn').addEventListener('click', () => setDrawer(!drawerOpen));
+  $('#drawer-mask').addEventListener('click', closeDrawer);
+  // 返回列表：closeMessagePane() 内部会 syncLayout()
+  $('#read-back-btn').addEventListener('click', closeMessagePane);
+  // 移动端侧边栏收进抽屉后，顶栏需要一个直接可点的写信入口
+  $('#topbar-compose').addEventListener('click', openComposer);
+  // 旋转 / 分屏 / 桌面端拖窗口：重新对齐布局（syncLayout 幂等）
+  if (typeof globalThis.addEventListener === 'function') {
+    globalThis.addEventListener('resize', syncLayout);
+  }
 
   setupSearch();
 }
@@ -2127,6 +2616,7 @@ async function init() {
   const mailboxAtStart = state.mailbox;
 
   setupEvents();
+  syncLayout(); // 先把布局状态对齐（首屏就可能落在移动端断点内）
   renderNav();
   renderMailboxSelect();
   renderListTitle();

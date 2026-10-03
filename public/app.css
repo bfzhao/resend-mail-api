@@ -35,7 +35,12 @@ html, body {
 
 .hidden { display: none !important; }
 
-#app { display: flex; height: 100vh; overflow: hidden; }
+/*
+ * 视口高度：iOS Safari 的 100vh 包含地址栏，底部内容会被遮住、页面还能上下拖。
+ * dvh 跟随「当前可见视口」，地址栏收起/展开时自动跟随；不认 dvh 的老浏览器
+ * 会忽略第二行、保留 100vh 回退（即原行为）。
+ */
+#app { display: flex; height: 100vh; height: 100dvh; overflow: hidden; }
 
 /* ---------- 侧边栏 ---------- */
 #sidebar {
@@ -407,6 +412,8 @@ html, body {
   display: flex;
   flex-direction: column;
   gap: 12px;
+  /* 收件人联想下拉用绝对定位挂在输入框下方，需要这里做定位上下文 */
+  position: relative;
 }
 #composer-title { font-size: 17px; font-weight: 700; }
 #composer label { font-size: 13px; color: var(--text-dim); }
@@ -518,7 +525,8 @@ html, body {
 #composer label.att-pick { display: inline-flex; flex-direction: row; gap: 5px; }
 #composer .composer-row > label:not(.att-pick) { flex: 0 0 auto; }
 #composer .composer-row > label.grow { flex: 1; }
-#composer label.auto-label select { width: auto; min-width: 200px; }
+/* 发件人独占一行后不必再撑满整个弹窗（桌面端 700px 宽的下拉框很难看） */
+#composer label.auto-label select { width: auto; min-width: 200px; max-width: 340px; }
 
 /* ---------- 合并发送（写信/回复共用一行） ---------- */
 /* 注意：上面的 `#composer label:not(.att-pick)` 把 label 设成了纵向 flex，
@@ -537,6 +545,64 @@ html, body {
 #composer label.merge-pick input[type="checkbox"] { margin: 0; cursor: pointer; }
 .merge-hint { color: var(--text-dim); font-size: 12px; }
 .mail-body { font-size: 15px; }
+
+/* ---------- 发件人：独占一行，默认折叠成摘要 ---------- */
+/* 折叠态只有这一行，所以它必须把「当前用哪个地址发」写全 —— 收起不等于隐藏信息。 */
+.sender-toggle {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  max-width: 100%;
+  text-align: left;
+}
+.sender-label { flex: 0 0 auto; color: var(--text-dim); }
+.sender-current { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sender-caret { flex: 0 0 auto; font-size: 11px; }
+/* 只有一个发件地址：没有可选项，藏掉箭头并去掉「可点」的手感 */
+.sender-solo .sender-caret { display: none; }
+.sender-solo .sender-toggle { cursor: default; }
+.sender-solo .sender-toggle:hover { text-decoration: none; }
+
+/* ---------- 抄送 / 密送 + 收件人联想 ---------- */
+.link-btn {
+  border: none;
+  background: transparent;
+  color: var(--accent);
+  font-size: 13px;
+  font-family: inherit;
+  padding: 0;
+  cursor: pointer;
+}
+.link-btn:hover { text-decoration: underline; }
+
+/* 下拉挂在 #composer 内绝对定位；left/top/width 由 JS 算出来。
+   宽度是「弹窗内容宽度」而不是输入框宽度 —— 见 app.js 的 suggestBoxGeom。 */
+.addr-suggest {
+  position: absolute;
+  z-index: 5;
+  max-height: 240px;
+  overflow-y: auto;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  box-shadow: 0 8px 24px rgba(0,0,0,.14);
+  padding: 4px;
+}
+.addr-suggest-item {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 6px 9px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1.35;
+}
+.addr-suggest-item.active { background: var(--accent-weak); }
+.addr-suggest-item .nm { color: var(--text); font-weight: 600; flex: 0 0 auto; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.addr-suggest-item .em { color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.addr-suggest-item mark { background: #fde68a; color: inherit; padding: 0; border-radius: 2px; }
+.addr-suggest-empty { padding: 6px 9px; font-size: 13px; color: var(--text-dim); }
 
 /* ---------- 详情正文：下载中 / 下载失败占位 ---------- */
 /* 头部（主题/发件人/时间）来自列表项，点击后同步渲染；只有正文需要等详情接口。 */
@@ -564,3 +630,190 @@ html, body {
   .body-pending .spinner { animation: none; border-top-color: var(--border); }
 }
 .env-who .who-name .from-me { font-weight: 600; }
+
+/* =========================================================================
+ * 移动端适配
+ *
+ * 断点 768px：≤768px 进入「单栏 + 抽屉」模式，覆盖手机竖屏全段（320–430px）
+ * 与手机横屏的多数场景（568–926px 中的窄端）。
+ *
+ * 分工：
+ *   - 布局（抽屉、单栏、弹窗全屏）全部靠这里的媒体查询 + `#app` 上的两个状态类：
+ *       `.drawer-open`   抽屉展开
+ *       `.mobile-detail` 单栏下正在看详情（列表让位）
+ *     这两个类由 app.js 的 syncLayout() **统一**维护，别在别处 toggle。
+ *   - 桌面端完全不渲染移动端专属控件（下方基础规则里 display:none）。
+ * ========================================================================= */
+
+/* 移动端专属控件：桌面端一律不显示 */
+.icon-btn, #topbar-compose, #drawer-mask, #read-back { display: none; }
+
+/* 横屏时 iOS 会自行放大正文字号，禁掉以获得稳定排版 */
+html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
+
+@media (max-width: 768px) {
+  /* ---------- 顶栏：汉堡 + 搜索 + 写信 ---------- */
+  #topbar {
+    height: auto;
+    min-height: 54px;
+    padding: 6px 10px;
+    padding-top: calc(6px + env(safe-area-inset-top));
+    gap: 8px;
+  }
+  .icon-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: 0 0 auto;
+    width: 44px;
+    height: 44px;
+    padding: 0;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--panel);
+    color: var(--text);
+    font-size: 18px;
+    line-height: 1;
+    cursor: pointer;
+  }
+  .icon-btn:active { background: var(--hover); }
+  #search-box { max-width: none; }
+  /* 16px：iOS 上 font-size < 16px 的输入框一聚焦就会把整页放大 */
+  #search-input { padding: 10px 12px; font-size: 16px; }
+  #topbar-compose {
+    display: inline-flex;
+    align-items: center;
+    flex: 0 0 auto;
+    min-height: 44px;
+    padding: 0 14px;
+    font-size: 14px;
+  }
+
+  /* ---------- 侧边栏 → 抽屉 ---------- */
+  #sidebar {
+    position: fixed;
+    top: 0; left: 0; bottom: 0;
+    width: min(288px, 84vw);
+    min-width: 0;
+    z-index: 40;
+    transform: translateX(-100%);
+    transition: transform .2s ease;
+    box-shadow: 0 0 28px rgba(0,0,0,.2);
+    padding-top: calc(12px + env(safe-area-inset-top));
+    padding-bottom: calc(12px + env(safe-area-inset-bottom));
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+  #app.drawer-open #sidebar { transform: none; }
+  #drawer-mask {
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: 30;
+    background: rgba(20,24,32,.42);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity .2s ease;
+  }
+  #app.drawer-open #drawer-mask { opacity: 1; pointer-events: auto; }
+  /* 触摸目标 ≥44px */
+  .folder-item { padding: 13px 16px; font-size: 15px; }
+  #mailbox-select { padding: 10px 12px; font-size: 16px; }
+
+  /* ---------- 单栏：列表 ⇄ 详情 ---------- */
+  #list-pane {
+    width: 100%;
+    min-width: 0;
+    max-width: none;
+    border-right: none;
+  }
+  #read-pane { display: none; }
+  #app.mobile-detail #list-pane { display: none; }
+  #app.mobile-detail #read-pane { display: block; }
+
+  /* ---------- 详情顶部返回条（sticky 挂在 #read-pane 的滚动容器上） ---------- */
+  #read-back {
+    display: flex;
+    position: sticky;
+    top: 0;
+    z-index: 6;
+    padding: 8px 12px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+  }
+  #read-back .btn { flex: 1; min-height: 44px; font-size: 15px; }
+
+  /* ---------- 列表 ---------- */
+  #list-head { padding: 10px 12px 8px; }
+  #list-title { font-size: 17px; }
+  .list-item { padding: 12px; column-gap: 8px; }
+  .li-star .star-btn { width: 44px; height: 44px; font-size: 19px; }
+  #list input[type="checkbox"], #select-all { width: 20px; height: 20px; }
+  #bulk-actions { width: 100%; margin-left: 0; }
+  #bulk-actions .btn { min-height: 40px; }
+  .list-more .btn { min-height: 44px; width: 100%; }
+
+  /* ---------- 详情排版 ---------- */
+  .read-message { padding: 12px 12px calc(56px + env(safe-area-inset-bottom)); }
+  .mail-subject { padding: 14px 14px 10px; }
+  .mail-subject h1 { font-size: 18px; }
+  .mail-envelope, .attachments, .rm-thread { padding-left: 14px; padding-right: 14px; }
+  .mail-body-card { padding: 6px 14px 0; }
+  .mail-body { font-size: 15px; }
+  .env-top { flex-wrap: wrap; gap: 10px; }
+  .env-actions { margin-left: 0; width: 100%; gap: 6px; }
+  .env-actions .btn { flex: 1; min-height: 42px; }
+  .env-detail-lines .k { flex: 0 0 56px; }
+  .att-chip { max-width: 100%; }
+  /* 会话行原本给收发双方 320px、时间 120px 的固定列宽，窄屏会把主题挤没 */
+  .rm-thread .t-sender { flex: 0 1 auto; max-width: 42%; }
+  .rm-thread .t-time { flex: 0 0 auto; font-size: 10px; }
+
+  /* ---------- 写信弹窗：全屏 + 内部滚动 ---------- */
+  #modal-mask { align-items: stretch; }
+  #composer {
+    width: 100%;
+    height: 100%;
+    max-height: none;
+    border-radius: 0;
+    padding: 12px 14px calc(12px + env(safe-area-inset-bottom));
+    padding-top: calc(12px + env(safe-area-inset-top));
+    gap: 10px;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+  #composer input[type="text"], #composer select, #composer textarea, .rich-editor { font-size: 16px; }
+  #f-body, .rich-editor { min-height: 160px; }
+  .rich-editor { max-height: none; }
+  .rich-toolbar button { min-height: 38px; padding: 6px 10px; }
+  #composer label.auto-label select { min-width: 0; width: 100%; max-width: none; }
+  .att-item .nm { max-width: 44vw; }
+  /* 发送/取消固定在底部，长正文滚到底也不用再找按钮 */
+  .composer-actions {
+    position: sticky;
+    bottom: 0;
+    padding: 8px 0 4px;
+    background: var(--panel);
+    gap: 8px;
+  }
+  .composer-actions .btn { min-height: 44px; padding: 0 18px; font-size: 15px; }
+
+  /* ---------- 收件人联想：软键盘弹出后可用高度很小 ---------- */
+  .addr-suggest { max-height: 42vh; }
+  /* 纵向排列：姓名一行、邮箱一行。窄屏上横向排列时邮箱会被姓名挤到只剩几个字，
+     而「看清楚完整邮箱」才是用户输入时唯一要确认的事。 */
+  .addr-suggest-item { flex-direction: column; align-items: stretch; gap: 2px; padding: 12px 12px; font-size: 16px; }
+  .addr-suggest-empty { padding: 12px; font-size: 16px; }
+  .addr-suggest-item .nm { max-width: 100%; }
+
+  /* ---------- 发件人摘要行 ---------- */
+  /* 折叠后它是唯一可见的发件人信息，13px 在手机上偏小 */
+  .sender-toggle { font-size: 15px; }
+
+  /* ---------- toast：避开底部安全区 ---------- */
+  #toast {
+    bottom: calc(20px + env(safe-area-inset-bottom));
+    max-width: calc(100vw - 24px);
+    font-size: 14px;
+  }
+}

@@ -41,6 +41,8 @@ export interface OutboundInput {
   fromEmail: string | null;
   to: string[];
   cc: string[];
+  /** 密送。可选：老的调用方（及测试）不传时按空数组处理。 */
+  bcc?: string[];
   subject: string | null;
   html: string | null;
   text: string | null;
@@ -233,6 +235,81 @@ export async function mailboxes(env: Env): Promise<
   // 合并会打乱 SQL 的排序（未读降序），按同一口径在 JS 里重排；分组数为 0 时返回空数组（不凭空造组）。
   out.sort((a, b) => (b.inbox_unread - a.inbox_unread) || (a.mailbox < b.mailbox ? -1 : a.mailbox > b.mailbox ? 1 : 0));
   return out;
+}
+
+export interface ContactRow {
+  name: string | null;
+  email: string;
+  /** 往来次数（收件箱 + 发件箱），用于把常用联系人排前面。 */
+  count: number;
+}
+
+/**
+ * 本地联系人（供收件人输入联想）：从已有邮件往来里聚合，不需要额外的地址簿表。
+ *
+ * - **邮箱**：入站 `from_email` + 出站/入站 `to_emails` / `cc`（JSON 数组，用 `json_each` 展开）。
+ * - **姓名**：只可能来自入站 `from_name`（出站我们只存裸地址）。
+ *   同一地址取**最新一封带姓名**的邮件里的写法 —— 靠 SQLite「裸列与 min()/max() 同取一行」的规则。
+ *
+ * ⚠️ 关于那条裸列规则（2026-10-03 在真实 SQLite 3.51.2 上实测）：
+ *   文档写的是「**恰好一个** min()/max() 聚合时裸列才取该行」，但实测**更宽松**：
+ *   同时存在 `COUNT(*)` / `SUM(...)` 时，裸列**仍然**取 max 那一行。
+ *   也就是说「多加一个聚合」并**不会**让这段查询出错 —— 但这属于未文档化的宽松行为，
+ *   不要依赖它，也不要据此去改这段 SQL。真正会把它改坏的是**方向**：
+ *   换成 `MIN(received_at)`，或把姓名写成 `MAX(from_name)`（取字典序最大而非最新），
+ *   两种写法都会静默返回错误的姓名（`test/contacts.backend.test.js` 的 C2 分别覆盖）。
+ * - **不排除自己的收件信箱**（2026-10-03 用户决定）：`mailbox` 列里既有「我自己的身份」，
+ *   也可能有**同事/团队的地址**（例如账号给 `zhanglili@` 配了收信）—— 这些地址用户**本来就想发信**。
+ *   早期版本按 `DISTINCT mailbox` 全部排除，导致这类同事地址在联想里**静默消失**（用户报障）。
+ *   现在自己的地址也会出现在联想里（用户明确表示「也可以给自己发」）。
+ *
+ * ⚠️ 关于 `json_each` 的两个实测事实（2026-10-03 在真实 SQLite 上验过）：
+ *   1. `json_each(NULL)` / `json_each('[]')` 都是 **0 行**（不会造出空地址）；
+ *   2. 但 `json_each('')` / 任何非法 JSON 会**直接抛 `malformed JSON`**，
+ *      而且 `WHERE` 里的判断**拦不住它** —— 表值函数在 JOIN 阶段就求值了，早于 WHERE。
+ *      实测 `FROM messages, json_each(cc) WHERE trim(cc) <> ''` 遇到 `cc = ''` 仍然抛错。
+ *   所以「是不是合法 JSON 数组」必须写进 `json_each` 的**参数表达式**里（下面的 arrayArg），
+ *   顺带排除 `'{}'` / `'123'` / `'null'` 这类合法但非数组的 JSON，否则会造出 `'123'` 这种幽灵联系人。
+ *   （`json_type()` 不能用在这里：`json_type('')` 本身就会抛错。）
+ */
+export async function contacts(env: Env, limit = 500): Promise<ContactRow[]> {
+  const arrayArg = (col: string) =>
+    `CASE WHEN json_valid(${col}) AND substr(trim(${col}), 1, 1) = '[' THEN ${col} ELSE '[]' END`;
+
+  const addrRows = (
+    await env.DB.prepare(
+      `SELECT lower(email) AS email, COUNT(*) AS cnt FROM (
+         SELECT from_email AS email FROM messages
+           WHERE from_email IS NOT NULL AND trim(from_email) <> ''
+         UNION ALL
+         SELECT je.value AS email FROM messages, json_each(${arrayArg('messages.to_emails')}) je
+         UNION ALL
+         SELECT je.value AS email FROM messages, json_each(${arrayArg('messages.cc')}) je
+       )
+       WHERE email IS NOT NULL AND trim(email) <> ''
+       GROUP BY lower(email)`
+    ).all<{ email: string; cnt: number }>()
+  ).results;
+
+  const nameRows = (
+    await env.DB.prepare(
+      `SELECT lower(from_email) AS email, from_name AS name, MAX(received_at) AS mx
+       FROM messages
+       WHERE from_name IS NOT NULL AND trim(from_name) <> ''
+         AND from_email IS NOT NULL AND trim(from_email) <> ''
+       GROUP BY lower(from_email)`
+    ).all<{ email: string; name: string; mx: number }>()
+  ).results;
+
+  const names = new Map<string, string>();
+  for (const r of nameRows) if (r.name && r.name.trim()) names.set(r.email, r.name.trim());
+
+  const out: ContactRow[] = [];
+  for (const r of addrRows) {
+    out.push({ name: names.get(r.email) ?? null, email: r.email, count: r.cnt });
+  }
+  out.sort((a, b) => b.count - a.count || (a.email < b.email ? -1 : a.email > b.email ? 1 : 0));
+  return out.slice(0, limit);
 }
 
 /** 同一会话内的消息（升序），用于阅读视图上下文。 */
@@ -512,7 +589,7 @@ export async function saveOutbound(env: Env, input: OutboundInput): Promise<stri
     fromEmail: input.fromEmail,
     to: input.to,
     cc: input.cc,
-    bcc: [],
+    bcc: input.bcc ?? [],
     replyTo: [],
     subject: input.subject,
     html: input.html,

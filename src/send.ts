@@ -38,6 +38,7 @@ export interface ResendAttachment {
 interface ResendRequest {
   to: string[];
   cc?: string[];
+  bcc?: string[];
   subject: string;
   html?: string;
   text?: string;
@@ -53,7 +54,9 @@ export async function resendSend(env: Env, req: ResendRequest): Promise<SendResu
   if (!apiKey) return { ok: false, error: '未配置 RESEND_API_KEY' };
   const from = req.from ?? buildFrom(env);
   if (!from) return { ok: false, error: '未配置 SEND_FROM_ADDRESS' };
-  if (!req.to.length) return { ok: false, error: '缺少收件人' };
+  // to / cc / bcc 任一非空即可发信（只有密送的邮件是合法的）
+  const hasRecipient = req.to.length > 0 || (req.cc?.length ?? 0) > 0 || (req.bcc?.length ?? 0) > 0;
+  if (!hasRecipient) return { ok: false, error: '缺少收件人' };
 
   let resp: Response;
   try {
@@ -67,6 +70,7 @@ export async function resendSend(env: Env, req: ResendRequest): Promise<SendResu
         from,
         to: req.to,
         cc: req.cc && req.cc.length ? req.cc : undefined,
+        bcc: req.bcc && req.bcc.length ? req.bcc : undefined,
         subject: req.subject || '(no subject)',
         html: req.html,
         text: req.text,
@@ -92,4 +96,11 @@ export function replySubject(subject: string | null | undefined): string {
   const s = (subject || '').trim();
   if (!s) return '(no subject)';
   return /^\s*re\s*:/i.test(s) ? s : `Re: ${s}`;
+}
+
+/** 生成转发主题：缺省补 Fwd: 前缀（已有 Fwd:/Fw: 前缀则不重复叠加）。 */
+export function forwardSubject(subject: string | null | undefined): string {
+  const s = (subject || '').trim();
+  if (!s) return '(no subject)';
+  return /^\s*fwd?\s*:/i.test(s) ? s : `Fwd: ${s}`;
 }

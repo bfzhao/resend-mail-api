@@ -48,6 +48,10 @@ const pieces = [
     '\n\n  setupSearch();',
     '事件接线'
   ),
+  // 移动端布局模块（isMobile / syncLayout / setDrawer / closeDrawer）。
+  // 上面的「事件接线」slice 里引用了 setDrawer / closeDrawer / drawerOpen，
+  // 不把这段一起抽出来会直接 ReferenceError；它自身只依赖 $ / state / globalThis，桩里都有。
+  slice('/* ---------------- 移动端布局', '/* ---------------- API ---------------- */', '移动端布局'),
 ];
 
 // 未被抽取、但会被引用到的符号
@@ -63,6 +67,9 @@ function openFolder() {}
 function loadFolder() {}
 function isTypingTarget() { return false; }
 function moveSelection() {}
+// 详情面板的关闭/渲染不在本套件的关注范围（且依赖 detailSeq / currentThread 等一整套详情态），
+// 事件接线里引用了它，故给桩。移动端行为由 test/mobile-layout.dom.test.js 用真实实现覆盖。
+function closeMessagePane() {}
 `;
 
 // 探针：把块级 let 绑定暴露出来，便于外部观测与复位（仅测试用）
@@ -112,6 +119,7 @@ class El {
     this.focused = 0;
     this.parent = null;
     this._classes = new Set();
+    this._attrs = {};
     this.classList = {
       add: (c) => this._classes.add(c),
       remove: (c) => this._classes.delete(c),
@@ -139,6 +147,9 @@ class El {
       .replace(/&amp;/g, '&');
   }
   focus() { this.focused++; }
+  // 生产代码会给发件人摘要行写 aria-expanded（真实浏览器里 DOM 元素本来就有这两个方法）
+  setAttribute(k, v) { this._attrs[k] = String(v); }
+  getAttribute(k) { return Object.prototype.hasOwnProperty.call(this._attrs, k) ? this._attrs[k] : null; }
   addEventListener(ev, fn) { on(this.id, ev, fn); }
   appendChild() {}
   contains(other) {
@@ -180,6 +191,11 @@ const sandbox = {
     mailboxList: [],
     folder: 'inbox',
     cache: { countsAt: 0 },
+    // 真实 state 里也有这两个字段（收件人联想用）；补上以免桩与生产形状漂移
+    contacts: [],
+    contactsLoaded: false,
+    // 移动端布局（syncLayout）会读它；同样是「补上以免形状漂移」
+    openId: null,
   },
   $: (s) => el(s),
   __toasts: [],
