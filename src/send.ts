@@ -16,17 +16,50 @@ export function buildFrom(env: Env): string {
   return name ? `${name} <${addr}>` : addr;
 }
 
-/** 按指定邮箱构建发件人；若该邮箱域名不属于默认发送域名则回退默认发件人。 */
-export function senderFromMailbox(env: Env, mailbox: string): string {
+/** 取地址的 local part 作显示名（`zhanglili@notionmanager.com` → `zhanglili`）。 */
+function localPart(addr: string): string {
+  const at = addr.indexOf('@');
+  return at > 0 ? addr.slice(0, at) : addr;
+}
+
+export interface SenderIdentity {
+  /** Resend `from` 字段的完整写法（`名字 <地址>` 或裸地址）。 */
+  from: string;
+  /** 实际使用的发件地址（小写，落库为 `mailbox`）。 */
+  address: string;
+  /** 实际使用的显示名（空串 = 不带显示名）。 */
+  name: string;
+}
+
+/**
+ * 按指定邮箱解析发件人身份（`from` / 地址 / 显示名）。
+ *
+ * ⚠️ 曾经同域的**所有**邮箱都套全局 `SEND_FROM_NAME` 作显示名 —— 于是从
+ * `zhanglili@notionmanager.com` 发出的信在收件方显示成「support」，多个账户
+ * 完全分不出来。生产数据实测：入站 `from_name` 恒为 `"support"`。
+ *
+ * 现在的口径（三档）：
+ *  1. 请求地址就是默认地址（`SEND_FROM_ADDRESS`）→ 用 `SEND_FROM_NAME`（品牌名仍可配置）；
+ *  2. 同域的其他邮箱 → 用**地址前缀**作显示名，各账户可分辨；
+ *  3. 非默认域 / 未指定 → 整体回退默认发件人（既有保护，不变）。
+ */
+export function senderIdentity(env: Env, mailbox: string): SenderIdentity {
   const addr = (mailbox || '').trim().toLowerCase();
   const def = (env.SEND_FROM_ADDRESS || '').trim().toLowerCase();
   const defDomain = def.split('@')[1];
   const mboxDomain = addr.split('@')[1];
-  const name = (env.SEND_FROM_NAME || '').trim();
-  if (addr && defDomain && mboxDomain === defDomain) {
-    return name ? `${name} <${addr}>` : addr;
+  const defaultName = (env.SEND_FROM_NAME || '').trim();
+
+  if (!addr || !defDomain || mboxDomain !== defDomain) {
+    return { from: buildFrom(env), address: def, name: defaultName };
   }
-  return buildFrom(env);
+  const name = addr === def ? defaultName : localPart(addr);
+  return { from: name ? `${name} <${addr}>` : addr, address: addr, name };
+}
+
+/** 按指定邮箱构建发件人；若该邮箱域名不属于默认发送域名则回退默认发件人。 */
+export function senderFromMailbox(env: Env, mailbox: string): string {
+  return senderIdentity(env, mailbox).from;
 }
 
 export interface ResendAttachment {

@@ -55,6 +55,16 @@ const FINGERPRINT = {
   bytes: Buffer.byteLength(APP_JS),
 };
 
+/**
+ * 本地快照的版本号**从 app.js 里现取**，不在这里另写一份。
+ *
+ * 写死 `v: 1` 的后果：CACHE_VERSION 一旦升版，readPersisted() 会把快照判为过期、
+ * 静默走空路径 —— 而 T4b/T4c/T4d 验证的正是「恢复路径」，会变成「快照被拒 → 什么都没恢复」
+ * 的失败（或更糟：断言恰好还成立 → 恢复路径根本没被测到）。取现成的值就不会失配。
+ * 另在 T0 里断言它确实解析出来了，避免正则失配时静默变成 NaN。
+ */
+const CACHE_VERSION_IN_APP = Number((/const CACHE_VERSION = (\d+);/.exec(APP_JS) || [])[1]);
+
 /* ---------------------------------------------------------------------------
  * fetch 打桩（jsdom 不实现 fetch；不打桩则 api() 会静默吞成「网络错误」）
  * -------------------------------------------------------------------------*/
@@ -241,15 +251,20 @@ function inboxFixture() {
  * 不是 `to_emails`。历史上前端只读 `t.to_emails` → 恒为 undefined → 会话行永远显示「我 → ?」。
  * 这里刻意只提供 `to`，字段名一旦写错用例必然失败（而不是"恰好蒙对"）。
  *
+ * ⚠️ 数组顺序必须与**真实接口一致 = 降序（最近在前）**：`repo.listThread()` 的
+ * `ORDER BY received_at DESC` 才是排序真值，前端只负责原样渲染。
+ * 所以这里的 `threadItems` 按 T3(…300) → T2(…200) → T1(…100) 排列。
+ * （后端那侧的排序由 test/inbound-ingest.backend.test.js 的 T12a 守着，本套件守的是渲染顺序。）
+ *
  * 列表首项 T3 是**已读**的：init() 的 maybeAutoOpen 会打开它，会话面板（length > 1）随之渲染。
  */
 function threadFixture() {
   const threadItems = [
-    { // 来信（有名字）
-      id: 'T1', direction: 'inbound', mailbox: 'alpha@x.com',
-      from_name: 'Alice', from_email: 'alice@partner.com',
-      to: ['alpha@x.com'], subject: '报价确认',
-      preview: '见附件', received_at: 1700000100, read: true, deleted: false, current: false,
+    { // 对方再来信（无名字 → 回退邮箱地址），也是当前打开的一封；时间最新 → 排最前
+      id: 'T3', direction: 'inbound', mailbox: 'alpha@x.com',
+      from_name: null, from_email: 'bob@partner.com',
+      to: ['alpha@x.com'], subject: 'Re: 报价确认',
+      preview: '补充', received_at: 1700000300, read: true, deleted: false, current: true,
     },
     { // 我的回信（出站，两个收件人）
       id: 'T2', direction: 'outbound', mailbox: 'support@x.com',
@@ -257,11 +272,11 @@ function threadFixture() {
       to: ['alice@partner.com', 'bob@partner.com'], subject: 'Re: 报价确认',
       preview: '好的', received_at: 1700000200, read: true, deleted: false, current: false,
     },
-    { // 对方再来信（无名字 → 回退邮箱地址），也是当前打开的一封
-      id: 'T3', direction: 'inbound', mailbox: 'alpha@x.com',
-      from_name: null, from_email: 'bob@partner.com',
-      to: ['alpha@x.com'], subject: 'Re: 报价确认',
-      preview: '补充', received_at: 1700000300, read: true, deleted: false, current: true,
+    { // 最早的来信（有名字）
+      id: 'T1', direction: 'inbound', mailbox: 'alpha@x.com',
+      from_name: 'Alice', from_email: 'alice@partner.com',
+      to: ['alpha@x.com'], subject: '报价确认',
+      preview: '见附件', received_at: 1700000100, read: true, deleted: false, current: false,
     },
   ];
 
@@ -295,6 +310,63 @@ function threadFixture() {
       T3: detail(T3, 1, threadItems),
       T2: detail(T2, 1, threadItems),
       T4: detail(T4, 1, []),
+    },
+    counts: { inbox_unread: 0, inbox_total: 2, sent_total: 1, starred_total: 0, trash_total: 0 },
+  };
+}
+
+/**
+ * 会话副本固定装置：模拟线上真实场景（2026-10-08 生产数据）——
+ * 我用 bingfeng@ 发信并**抄送 zhanglili@**，同一封邮件被 Resend 投递回本账号的
+ * zhanglili@，于是库里既有出站副本（T2）又有入站副本（T2c）。
+ * 服务端 `listThread` 已把入站副本折叠掉：thread 里**没有 T2c**，只有 T2 带 `copy_ids:['T2c']`。
+ *
+ * 本用例把用户打开的邮件设成**被折叠的那份副本** T2c（放进 zhanglili@ 的收件箱并置于列表首位，
+ * 让 maybeAutoOpen 打开它），验证会话面板仍把 T2 标成当前行 ——
+ * 否则面板里一行都不高亮，看起来像「我打开的那封不见了」。
+ */
+function threadCopyFixture() {
+  // 时间降序：T3(…300) → T2(…200)；T2c 与 T2 只差 2 秒，是同一封物理邮件
+  const T3 = msg('T3', 1, {
+    from_name: null, from_email: 'bob@partner.com', subject: 'Re: 报价确认',
+    mailbox: 'alpha@x.com', received_at: 1700000300,
+  });
+  const T2c = msg('T2c', 1, {
+    from_name: 'support', from_email: 'support@x.com', subject: 'Re: 报价确认',
+    mailbox: 'zhanglili@x.com', received_at: 1700000203,
+  });
+  const threadItems = [
+    { // 对方来信（最新 → 排最前，与接口的降序一致）
+      id: 'T3', direction: 'inbound', mailbox: 'alpha@x.com',
+      from_name: null, from_email: 'bob@partner.com',
+      to: ['alpha@x.com'], subject: 'Re: 报价确认',
+      preview: '补充', received_at: 1700000300, read: true, deleted: false, current: false,
+    },
+    { // 出站副本（留存行）：同一封物理邮件在本账号内的「其它记录」挂在 copy_ids 上
+      id: 'T2', direction: 'outbound', mailbox: 'support@x.com',
+      from_name: 'support', from_email: 'support@x.com',
+      to: ['alice@partner.com'], subject: 'Re: 报价确认',
+      preview: '好的', received_at: 1700000201, read: true, deleted: false, current: false,
+      copy_ids: ['T2c'],
+    },
+  ];
+
+  return {
+    mailboxes: [
+      { mailbox: 'alpha@x.com', inbox_unread: 0, inbox_total: 1, sent_total: 0 },
+      { mailbox: 'zhanglili@x.com', inbox_unread: 0, inbox_total: 1, sent_total: 0 },
+      { mailbox: 'support@x.com', inbox_unread: 0, inbox_total: 0, sent_total: 1 },
+    ],
+    folders: {
+      // T2c 放首位 → maybeAutoOpen 打开的就是这份被折叠的副本
+      inbox: { items: [T2c, T3], total: 2 },
+      sent: { items: [], total: 0 },
+      starred: { items: [], total: 0 },
+      trash: { items: [], total: 0 },
+    },
+    messages: {
+      T2c: detail(T2c, 1, threadItems),
+      T3: detail(T3, 1, threadItems),
     },
     counts: { inbox_unread: 0, inbox_total: 2, sent_total: 1, starred_total: 0, trash_total: 0 },
   };
@@ -367,7 +439,7 @@ function seededBetaFixture() {
     mailboxes,
     counts,
     seedCache: {
-      v: 1,
+      v: CACHE_VERSION_IN_APP,
       at: Date.now(),
       folderKey: 'beta@x.com|inbox|',
       mailbox: 'beta@x.com',
@@ -402,7 +474,7 @@ function seededBetaFixture() {
     mailboxes,
     counts,
     seedCache: {
-      v: 1,
+      v: CACHE_VERSION_IN_APP,
       at: Date.now(),
       folderKey: 'ghost@x.com|inbox|',
       mailbox: 'ghost@x.com',
@@ -440,7 +512,7 @@ function emptyMailboxesFixture(snapshotMailboxes) {
     mailboxes: [], // ← 服务端账号列表为空
     counts,
     seedCache: {
-      v: 1,
+      v: CACHE_VERSION_IN_APP,
       at: Date.now(),
       folderKey: 'beta@x.com|inbox|',
       mailbox: 'beta@x.com',
@@ -654,6 +726,11 @@ const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } 
     ok(ctx.stub.counters.account >= 1, '/api/account 被请求（fetch 打桩生效）', ctx.stub.counters.account);
     ok(ctx.stub.counters.folders >= 1, '/api/folders/* 被请求（列表数据来自打桩）', ctx.stub.counters.folders);
     ok(evalIn(ctx, 'state.items.length') === 3, '列表渲染出 3 行', evalIn(ctx, 'state.items.length'));
+    // 快照版本号是从 app.js 里正则取的；正则一旦失配会静默变成 NaN，后面恢复路径的用例
+    // 就会「快照永远被判过期」，必须在这里先证明它取到了真值。
+    ok(Number.isInteger(CACHE_VERSION_IN_APP) && CACHE_VERSION_IN_APP > 0,
+      'harness 自检：已从 app.js 解析出 CACHE_VERSION（否则恢复路径用例会静默空转）',
+      `CACHE_VERSION_IN_APP=${CACHE_VERSION_IN_APP}`);
     ok(!!rowFor(ctx, 'A') && !!rowFor(ctx, 'B'), 'A / B 两行都存在于 DOM');
     ok(!!rowFor(ctx, 'A') && rowFor(ctx, 'A').classList.contains('unread'), 'A 行初始为未读（.unread 存在）');
     ok(!!rowFor(ctx, 'B') && !rowFor(ctx, 'B').classList.contains('unread'), 'B 行初始为已读（无 .unread）');
@@ -661,6 +738,15 @@ const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } 
     setCheckbox(ctx, '#select-all', true);
     ok(evalIn(ctx, 'state.selected.size') === 3, '勾选 #select-all 后 state.selected.size=3（事件已接线）', evalIn(ctx, 'state.selected.size'));
     ok(!hidden(ctx, '#list-bulk'), '勾选后批量操作条可见');
+
+    // CACHE_VERSION 升版（1→2）靠的就是「版本不符 → 整份拒绝」这条机制，这里直接验证它本身。
+    // 否则「升版」只是一句注释，没人守着 readPersisted() 真的会拒。
+    evalIn(ctx, `localStorage.setItem('inbox-cache-v1', JSON.stringify({ v: ${CACHE_VERSION_IN_APP - 1}, at: Date.now(), folder: { items: [{ id: 'STALE' }], total: 1 } }))`);
+    ok(evalIn(ctx, 'readPersisted()') === null,
+      '版本不符的快照被整份拒绝（CACHE_VERSION 升版据此让旧快照失效）');
+    evalIn(ctx, `localStorage.setItem('inbox-cache-v1', JSON.stringify({ v: ${CACHE_VERSION_IN_APP}, at: Date.now(), folder: { items: [], total: 0 } }))`);
+    ok(evalIn(ctx, 'readPersisted()') !== null,
+      '负控制：版本相符的快照会被接受（不是「readPersisted 一律返回 null」）');
   });
 
   /* ---- BUG-1 行选中高亮残留 ---- */
@@ -1390,7 +1476,7 @@ const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } 
   }, Object.assign(inboxFixture(), { keepPrefetch: true }));
 
   /* ---- T12 会话行 / 信封卡必须显示「实际收发信箱」---- */
-  await test('T12 会话行显示收发双方的实际信箱（来信含我方收件信箱）', async (ctx) => {
+  await test('T12 会话行显示收发双方的实际信箱 + 按时间降序（最近在前）', async (ctx) => {
     // 负控制：会话面板必须真的渲染出来了，否则下面全部空转
     ok(!!el(ctx, '.rm-thread'), '会话面板已渲染（currentThread.length > 1）');
     const rows = Array.from(ctx.doc.querySelectorAll('.rm-thread .t-item'));
@@ -1399,12 +1485,23 @@ const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } 
       '面板行数与 currentThread 一致（不是上一轮的渲染残留）', evalIn(ctx, 'currentThread.length'));
 
     const texts = rows.map((r) => r.querySelector('.t-sender').textContent);
-    ok(texts[0] === 'Alice → alpha@x.com',
-      '来信：对方名字 → 我方收到的信箱', texts[0]);
-    ok(texts[1] === 'support@x.com → alice@partner.com, bob@partner.com',
-      '我的回信：实际发件信箱 → 完整收件人清单（不再截成首个 local part）', texts[1]);
-    ok(texts[2] === 'bob@partner.com → alpha@x.com',
-      '无名字的来信回退到邮箱地址，仍带我方收件信箱', texts[2]);
+    // ⭐ 顺序：服务端 listThread 已改为 received_at DESC，面板必须原样呈现
+    //   固定装置三封的时间是 T3(…300) > T2(…200) > T1(…100)。
+    ok(texts.join(' || ') === [
+      'bob@partner.com → alpha@x.com',                        // T3 最新（无名字 → 回退邮箱）
+      'support@x.com → alice@partner.com, bob@partner.com',    // T2 我的回信（完整收件人清单）
+      'Alice → alpha@x.com',                                   // T1 最早
+    ].join(' || '),
+      '⭐ 会话行按时间降序（最近 → 最早）：T3 → T2 → T1', texts.join(' | '));
+    ok(texts[0] !== 'Alice → alpha@x.com',
+      '负控制：首行不是最早那封（即「仍是升序」会立刻失败）', texts[0]);
+
+    // 时间列也必须是降序（与 sender 序列互相印证，避免「只是数组被倒过来」）
+    const times = rows.map((r) => r.querySelector('.t-time').textContent);
+    ok(times.every((t) => /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/.test(t)),
+      '时间列格式为 YYYY-MM-DD HH:MM（否则下面的降序比较无意义）', times.join(' | '));
+    ok(times.join('|') === [...times].sort().reverse().join('|'),
+      '时间列逐行递减（最近在前）', times.join(' | '));
 
     // 旧实现的症状：字段名读错（t.to_emails）→ 恒为「我 → ?」。下面两条直接锁死该症状。
     ok(!texts.some((t) => t.includes('?')), '任何会话行都不得出现「?」占位', texts.join(' | '));
@@ -1413,6 +1510,8 @@ const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } 
     const titles = rows.map((r) => r.querySelector('.t-sender').title);
     ok(titles[1] === 'support@x.com → alice@partner.com, bob@partner.com',
       '会话行 title 给出完整收发双方（列宽不足被省略号截断时靠它读全）', titles[1]);
+    ok(titles.join('|') === texts.join('|'), 'title 与可见文案逐行一致（不因倒序而错位）',
+      titles.join(' | '));
   }, threadFixture());
 
   await test('T12b 信封卡：来信显示「收至 我的信箱」，回信显示实际发件信箱', async (ctx) => {
@@ -1450,6 +1549,47 @@ const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } 
     ok(ctx.stub.releaseDetail('T4'), '放行被挂起的详情响应');
     await ticks(ctx.win, 10);
   }, threadFixture());
+
+  /* ---- T12d 折叠掉的那份副本被打开时，留存行必须仍标成「当前」---- */
+  await test('T12d 打开的是被折叠的回环副本时，会话面板仍高亮留存行', async (ctx) => {
+    // 负控制：确实打开的是副本 T2c，而不是留存行 T2（否则本用例什么都没验证）
+    ok(evalIn(ctx, 'state.openId') === 'T2c', '前置：自动打开的是被折叠的副本 T2c',
+      evalIn(ctx, 'state.openId'));
+    const threadIds = evalIn(ctx, 'currentThread.map((t) => t.id).join(",")');
+    ok(threadIds === 'T3,T2',
+      '负控制：会话里**没有** T2c（服务端已折叠），且顺序为降序 T3 → T2', threadIds);
+    ok(evalIn(ctx, 'JSON.stringify(currentThread.find((t) => t.id === "T2").copy_ids)') === '["T2c"]',
+      '负控制：留存行 T2 带着 copy_ids=["T2c"]（折叠关系真的传到了前端）',
+      evalIn(ctx, 'JSON.stringify(currentThread.find((t) => t.id === "T2").copy_ids)'));
+
+    const rows = Array.from(ctx.doc.querySelectorAll('.rm-thread .t-item'));
+    ok(rows.length === 2, '会话面板渲染 2 行（副本已折叠，不是 3 行）', rows.length);
+    const currents = Array.from(ctx.doc.querySelectorAll('.rm-thread .t-item.current'));
+    ok(currents.length === 1, '⭐ 恰好一行被标为当前（不多不少）', currents.length);
+    ok(currents.length === 1 && currents[0].querySelector('.t-sender').textContent === 'support@x.com → alice@partner.com',
+      '⭐ 当前行是**留存行** T2（出站），而不是被折叠掉的副本',
+      currents.length ? currents[0].querySelector('.t-sender').textContent : '（无 current 行）');
+    ok(currents.length === 1 && currents[0] === rows[1],
+      '当前行是第 2 行（不是「碰巧第一行」）—— 证明不是靠索引蒙对',
+      currents.length ? String(rows.indexOf(currents[0])) : 'n/a');
+
+    // 点自己这行不得重复打开（否则会被当成「换了一封」而重新拉详情）。
+    // ⚠️ 先判空再解引用：若上面「恰好一行 current」已失败，这里直接引用 currents[0] 会抛异常
+    //    把整个用例打崩、丢掉后面的断言（历史踩过）。判空时显式记 FAIL，绝不用「跳过」冒充通过。
+    const cur = currents.length === 1 ? currents[0] : null;
+    if (!cur) {
+      ok(false, `无法验证「点当前行不重复打开」：当前行不唯一（${currents.length} 个），上一组断言已失败`);
+    } else {
+      const before = ctx.stub.counters.detail;
+      clickEl(ctx, cur);
+      await ticks(ctx.win, 8);
+      ok(ctx.stub.counters.detail === before,
+        '点击当前行不再发起详情请求（副本行也算「就是这一封」）',
+        `${before} → ${ctx.stub.counters.detail}`);
+      ok(evalIn(ctx, 'state.openId') === 'T2c', '点当前行后打开的仍是 T2c（视图没有被切走）',
+        evalIn(ctx, 'state.openId'));
+    }
+  }, threadCopyFixture());
 
   /* ---- 汇总 ---- */
   console.log('\n================ 失败用例清单 ================');

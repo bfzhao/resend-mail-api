@@ -95,6 +95,21 @@ function makeDB(opts = {}) {
   };
 }
 
+/**
+ * 按**列名**取 INSERT 绑定的参数值。
+ *
+ * ⚠️ 不要再用 `ins.args[10]` 这种位置索引：schema 加一列，后面所有列的下标就整体位移，
+ * 断言会「一致地过期」却依然看着像在检查（2026-10-08 加 `delivered_to` 时实测踩到，
+ * 多条断言同时假红）。这里直接解析 INSERT 的列清单，加列自动跟随。
+ */
+function colArg(insert, name) {
+  const cols = /INSERT INTO\s+\w+\s*\(([^)]*)\)/i.exec(insert.sql);
+  if (!cols) return undefined;
+  const list = cols[1].split(',').map((s) => s.trim().replace(/^"|"$/g, '').toLowerCase());
+  const idx = list.indexOf(name.toLowerCase());
+  return idx < 0 ? undefined : insert.args[idx];
+}
+
 function makeBucket() {
   const puts = [];
   const store = new Map();
@@ -109,11 +124,14 @@ function makeBucket() {
       puts.push({ key, size: bytes.length, opts });
       return {};
     },
-    // get 必须能读回 put 过的对象：转发要从 R2 读原附件
+    // get 必须能读回 put 过的对象：转发要从 R2 读原附件；
+    // size / body 供附件代理（repo.proxyAttachment）设置 Content-Length 与响应体
     async get(key) {
       if (!store.has(key)) return null;
       const bytes = store.get(key);
       return {
+        size: bytes.length,
+        body: bytes,
         arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
       };
     },
@@ -233,6 +251,8 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
       post: (b) => postMessages(worker, env, b),
       reply: (id, b) => postReply(worker, env, id, b),
       forward: (id, b) => postForward(worker, env, id, b),
+      /** 走真实路由的 GET（附件代理等）。 */
+      get: (url) => worker.fetch(new Request(`https://example.com${url}`), env),
     };
   };
 
@@ -678,15 +698,18 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
       '负控制：回信路由确实被驱动（否则下面的发件人断言可能是空转）',
       `${r1.status}/${JSON.stringify(r1.data)}`);
     ok(c1.resend.calls.length === 1, '恰好 1 次 Resend 调用', c1.resend.calls.length);
-    ok(fromOf(c1) === 'support <inbox@notionmanager.com>',
-      '未指定 mailbox -> 沿用原邮件的收件信箱', fromOf(c1));
+    ok(fromOf(c1) === 'inbox <inbox@notionmanager.com>',
+      '未指定 mailbox -> 沿用原邮件的收件信箱（显示名 = 该信箱前缀，不再是全局 support）', fromOf(c1));
+    ok(colArg(c1.db.messageInserts()[0], 'from_name') === 'inbox',
+      '⭐ 落库的 from_name 跟着实际发件信箱走（修复前恒为全局 SEND_FROM_NAME「support」）',
+      colArg(c1.db.messageInserts()[0], 'from_name'));
 
     // ② ⭐ 指定 mailbox：必须用它（这就是用户报的 bug）
     const c2 = ctxOf();
     const r2 = await c2.reply('orig-1', { body: '回复内容', mailbox: 'billing@notionmanager.com' });
     ok(r2.status === 200, '指定 mailbox 时回信成功', `${r2.status}/${JSON.stringify(r2.data)}`);
     ok(c2.resend.calls.length === 1, '恰好 1 次 Resend 调用', c2.resend.calls.length);
-    ok(fromOf(c2) === 'support <billing@notionmanager.com>',
+    ok(fromOf(c2) === 'billing <billing@notionmanager.com>',
       '⭐ body.mailbox 生效：发件人 = 用户改选的信箱（不再是原邮件的收件信箱）', fromOf(c2));
 
     // ③ 落库的 from_email / mailbox 与真正发出的发件人一致（否则发件箱会显示错的发件人）
@@ -708,7 +731,7 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
     // ⑤ 空白 mailbox 视同未指定，不得把发件人变成空
     const c4 = ctxOf();
     await c4.reply('orig-1', { body: '回复内容', mailbox: '   ' });
-    ok(fromOf(c4) === 'support <inbox@notionmanager.com>',
+    ok(fromOf(c4) === 'inbox <inbox@notionmanager.com>',
       'mailbox 只有空白 -> 视同未指定，回退原邮件收件信箱', fromOf(c4));
   }
 
@@ -782,8 +805,9 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
     ok(JSON.stringify(c1.resend.calls[0].body.to) === JSON.stringify(['a@x.com']), 'to 原样保留', JSON.stringify(c1.resend.calls[0].body.to));
     ok(JSON.stringify(c1.resend.calls[0].body.cc) === JSON.stringify(['b@y.com']),
       '⭐ cc 中与 to 重复的地址被剔除（否则 a@x.com 会收到两封）', JSON.stringify(c1.resend.calls[0].body.cc));
-    ok(JSON.parse(c1.db.messageInserts()[0].args[10]) && JSON.stringify(JSON.parse(c1.db.messageInserts()[0].args[10])) === JSON.stringify(['b@y.com']),
-      '落库的 cc 与真正发出的 cc 一致', c1.db.messageInserts()[0].args[10]);
+    const ins0 = c1.db.messageInserts()[0];
+    ok(String(colArg(ins0, 'cc')) === JSON.stringify(['b@y.com']),
+      '落库的 cc 与真正发出的 cc 一致', colArg(ins0, 'cc'));
 
     // ② 只填 bcc 也能发信（to 为空）
     const c2 = mkCtx();
@@ -791,8 +815,8 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
     ok(r2.status === 200, '⭐ 只填密送也能发信（to/cc/bcc 任一非空即可）', `${r2.status}/${JSON.stringify(r2.data)}`);
     ok(JSON.stringify(c2.resend.calls[0].body.to) === '[]', 'to 为空数组', JSON.stringify(c2.resend.calls[0].body.to));
     ok(JSON.stringify(c2.resend.calls[0].body.bcc) === JSON.stringify(['secret@x.com']), '⭐ bcc 透传到 Resend', JSON.stringify(c2.resend.calls[0].body.bcc));
-    ok(JSON.stringify(JSON.parse(c2.db.messageInserts()[0].args[11])) === JSON.stringify(['secret@x.com']),
-      'bcc 落库（发件人自己回看时能看到密送给了谁）', c2.db.messageInserts()[0].args[11]);
+    ok(String(colArg(c2.db.messageInserts()[0], 'bcc')) === JSON.stringify(['secret@x.com']),
+      'bcc 落库（发件人自己回看时能看到密送给了谁）', colArg(c2.db.messageInserts()[0], 'bcc'));
     ok(c2.resend.calls[0].body.cc === undefined, '没有 cc 时不传 cc 字段（不传空数组）');
 
     // ③ bcc 与 to / cc 重复 -> 剔除；bcc 内部去重
@@ -848,8 +872,8 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
     ok(JSON.stringify(c1.resend.calls[0].body.cc) === JSON.stringify(['cc@x.com']), '⭐ 回复的 cc 透传', JSON.stringify(c1.resend.calls[0].body.cc));
     ok(JSON.stringify(c1.resend.calls[0].body.bcc) === JSON.stringify(['bcc@x.com']), '⭐ 回复的 bcc 透传', JSON.stringify(c1.resend.calls[0].body.bcc));
     const ins = c1.db.messageInserts()[0];
-    ok(JSON.stringify(JSON.parse(ins.args[10])) === JSON.stringify(['cc@x.com']), '回复的 cc 落库', ins.args[10]);
-    ok(JSON.stringify(JSON.parse(ins.args[11])) === JSON.stringify(['bcc@x.com']), '回复的 bcc 落库', ins.args[11]);
+    ok(String(colArg(ins, 'cc')) === JSON.stringify(['cc@x.com']), '回复的 cc 落库', colArg(ins, 'cc'));
+    ok(String(colArg(ins, 'bcc')) === JSON.stringify(['bcc@x.com']), '回复的 bcc 落库', colArg(ins, 'bcc'));
 
     // cc 与 to 重复（大小写不同）-> 剔除
     const c2 = ctxOf();
@@ -947,6 +971,41 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
     const c7 = mkCtx();
     const r7 = await c7.forward('nope', { to: 'b@x.com', body: 'x' });
     ok(r7.status === 404, '原邮件不存在 -> 404', `${r7.status}/${JSON.stringify(r7.data)}`);
+  }
+
+  /* ---- B15 附件代理路由：?dl=1 强制下载（真实路由，不是直调 repo） ---- */
+  section('B15 附件代理路由 GET /api/attachments/:id（?dl=1 强制下载）');
+  {
+    const bytes = new TextEncoder().encode('PDFDATA');
+    const attRow = {
+      id: 'att-1', message_id: 'm-1', r2_key: 'attachments/m-1/x-doc.pdf',
+      filename: '报价单.pdf', content_type: 'application/pdf', size: bytes.length,
+      inline: 0, content_id: null, created_at: 1,
+    };
+    const mkAtt = () => {
+      const c = mkCtx(null, {}, { first: (sql) => (/FROM attachments/i.test(sql) ? attRow : null) });
+      c.bucket.seed('attachments/m-1/x-doc.pdf', bytes);
+      return c;
+    };
+
+    const c1 = mkAtt();
+    const r1 = await c1.get('/api/attachments/att-1');
+    ok(r1.status === 200, '不带参数 -> 200（负控制：路由确实被驱动）', r1.status);
+    ok(/^inline/i.test(r1.headers.get('Content-Disposition') || ''),
+      'PDF 不带参数 -> inline（浏览器就地预览）', r1.headers.get('Content-Disposition'));
+    ok(r1.headers.get('Content-Type') === 'application/pdf', 'Content-Type 透传', r1.headers.get('Content-Type'));
+    ok(r1.headers.get('X-Content-Type-Options') === 'nosniff', '保留 nosniff');
+
+    const c2 = mkAtt();
+    const r2 = await c2.get('/api/attachments/att-1?dl=1');
+    ok(/^attachment/i.test(r2.headers.get('Content-Disposition') || ''),
+      '⭐ ?dl=1 -> attachment（下载按钮拿到的是存盘而不是就地打开）', r2.headers.get('Content-Disposition'));
+    const body2 = await r2.text();
+    ok(body2 === 'PDFDATA', '响应体仍是原字节（只是 disposition 变了）', JSON.stringify(body2));
+
+    const c3 = mkCtx(null, {}, { first: () => null });
+    const r3 = await c3.get('/api/attachments/nope');
+    ok(r3.status === 404, '附件不存在 -> 404', r3.status);
   }
 
   /* ---- 汇总 ---- */

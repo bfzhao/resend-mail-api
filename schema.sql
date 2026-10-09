@@ -11,7 +11,8 @@ CREATE TABLE IF NOT EXISTS messages (
     mailbox       TEXT NOT NULL DEFAULT '',         -- 所属收件地址（如 support@example.com）
     from_name     TEXT,
     from_email    TEXT,
-    to_emails     TEXT NOT NULL DEFAULT '[]',       -- JSON 数组
+    to_emails     TEXT NOT NULL DEFAULT '[]',       -- JSON 数组；**入站=真实 To: 头**（修复前是投递地址，见 delivered_to）
+    delivered_to  TEXT,                             -- JSON 数组；入站邮件的**投递地址（信封收件人）**，来自 Resend 的 to/received_for
     cc            TEXT,                             -- JSON 数组
     bcc           TEXT,                             -- JSON 数组
     reply_to      TEXT,                             -- JSON 数组

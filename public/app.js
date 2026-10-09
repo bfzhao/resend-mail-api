@@ -25,7 +25,10 @@ const SYNC_MS = 5 * 60 * 1000;
 
 /* 本地持久化缓存：刷新页面后首屏 0 请求即可显示列表 / 计数徽标 / 账号下拉。 */
 const CACHE_KEY = 'inbox-cache-v1';
-const CACHE_VERSION = 1;
+// v2：会话项新增 `copy_ids`、且顺序由升序改为降序（见 src/repo.ts listThread）。
+// 旧快照里的 thread 数组带着**旧顺序与重复行**，且 TTL 内不会重新校验，
+// 不升版会让「已经修好的会话面板」在刷新后仍显示旧结果（一次全量重拉换立即正确）。
+const CACHE_VERSION = 2;
 const PERSIST_DEBOUNCE_MS = 300;
 
 /* 已打开邮件正文的内存 LRU：最多 40 封或合计 2MB，先到为准。 */
@@ -155,6 +158,10 @@ function syncLayout() {
   app.classList.toggle('is-mobile', mobile);
   app.classList.toggle('mobile-detail', mobile && state.openId !== null);
   app.classList.toggle('drawer-open', mobile && drawerOpen);
+  // 写信弹窗的浮动几何：移动端要把内联 left/top/width/height 清掉（内联值优先于媒体查询），
+  // 桌面端则把几何重新夹进新视口。放在这里而不是另开一个 resize 监听，是为了让
+  // 「断点切换」和「窗口缩放」共用同一个收敛点。
+  syncComposerWindowLayout();
 }
 
 function setDrawer(open) {
@@ -536,6 +543,55 @@ function senderLabel(item) {
 
 function recipientsLabel(toList) {
   return jsonArr(toList).join(', ');
+}
+
+/** 收件人角色文案（信封卡摘要行「你是抄送 / 你是密送」角标用）。 */
+const ROLE_LABEL = { to: '收件人', cc: '抄送', bcc: '密送' };
+
+/**
+ * 「我」在这封**入站**邮件里是以什么身份收到的 → `'to' | 'cc' | 'bcc' | null`。
+ *
+ * ⚠️ 判定顺序必须是 **cc → bcc → to**，不能反过来。原因：修复前入库的行
+ * `to_emails` 存的是**投递地址（信封收件人）**，我方地址必然在里面 —— 先判 to
+ * 就会把「我只是被抄送」的邮件标成「收件人」（这正是用户报障的现象）。
+ * `cc` / `bcc` 两列存的始终是真实头，先看它们才不会误判。
+ *
+ * 修复后入库的行 `to_emails` 已是真实 `To:` 头，顺序无关；两代数据用同一条规则。
+ */
+function myRecipientRole(m) {
+  const mine = String(m.mailbox || '').trim().toLowerCase();
+  if (!mine) return null;
+  const has = (list) => jsonArr(list).some((x) => String(x).trim().toLowerCase() === mine);
+  if (has(m.cc)) return 'cc';
+  if (has(m.bcc)) return 'bcc';
+  if (has(m.to_emails)) return 'to';
+  return null;
+}
+
+/**
+ * 入站邮件详情要显示的「收件人」清单（= 真实 `To:` 头）。
+ *
+ * 两代数据：
+ *  - 修复后入库：详情接口给 `delivered_to`（投递地址），`to_emails` 就是真实 To 头，直接用；
+ *  - 修复前入库：`delivered_to` 显式为 `null`，`to_emails` 其实是投递地址，真实 To 头没落库
+ *    → 只能把投递地址**减去 cc/bcc**（信封 = To∩本域 ∪ Cc∩本域 ∪ Bcc∩本域）。
+ *    减不出来就返回空数组 —— 宁可显示「—」，也不要再把自己显示成收件人。
+ *
+ * 列表项（乐观渲染）没有 `delivered_to` 字段（`undefined`，不是 `null`），
+ * 此时 cc/bcc 也还没拿到，减法无从谈起，直接原样返回。
+ */
+function inboundRecipients(m) {
+  const tos = jsonArr(m.to_emails);
+  if (m.delivered_to !== null) return tos;
+  const others = new Set(
+    [...jsonArr(m.cc), ...jsonArr(m.bcc)].map((x) => String(x).trim().toLowerCase())
+  );
+  return tos.filter((x) => !others.has(String(x).trim().toLowerCase()));
+}
+
+/** 入站邮件详情「收件人」一行的文案（空清单给调用方自己决定占位符）。 */
+function inboundRecipientsLabel(m) {
+  return recipientsLabel(inboundRecipients(m));
 }
 
 /**
@@ -1248,10 +1304,21 @@ function metaLines() {
   };
   if (m.direction === 'inbound') {
     add('发件人', m.from_name ? `${m.from_name} <${m.from_email || ''}>` : (m.from_email || ''));
-    add('收件人', jsonArr(m.to_emails).join(', '));
-    add('抄送', jsonArr(m.cc).join(', '));
-    if (m.mailbox) add('收件地址', m.mailbox);
-    add('时间', timeLong(m.received_at));
+    // ⚠️ 不能直接显示 to_emails：修复前的数据里它是投递地址（信封），会显示成用户自己。
+    // 口径统一走 inboundRecipients()（真实 To: 头）。
+    add('收件人', inboundRecipientsLabel(m));
+    // 抄送/密送只在有内容时列出 —— 与出站分支同一口径。入站邮件绝大多数没有抄送，
+    // 无条件列出会给每一封都白多一行「抄送 —」。
+    if (jsonArr(m.cc).length) add('抄送', jsonArr(m.cc).join(', '));
+    if (jsonArr(m.bcc).length) add('密送', jsonArr(m.bcc).join(', '));
+    // ⛔ 这里曾经还有三行，2026-10-08 第三轮按用户要求删掉（都是纯重复，不是信息丢失）：
+    //   · 「收件地址」= m.mailbox —— 信封卡副标题已经写了「收至 <mailbox>」（`envelopeSubLine()`，
+    //      而且自己发给自己时会自动省略）；侧边栏/收件箱上下文本身也在说明「这是哪个信箱」。
+    //   · 「你的身份」= ROLE_LABEL[role] —— 被抄送/密送时，默认可见的摘要行上就有
+    //      「你是抄送 / 你是密送」角标；是收件人时「收件人」那一行里就有自己。两条路径全覆盖。
+    //   · 「时间」= timeLong() —— 信封卡右上角 fmtDateTime() 渲染的是**同一格式的同一串字符**
+    //      （这两个函数是逐字相同的实现），零增量信息。
+    //   ⚠️ ROLE_LABEL / myRecipientRole() 仍被摘要行角标使用，**不能跟着一起删**。
   } else {
     add('发件人', m.from_email || m.mailbox || '');
     add('收件人', jsonArr(m.to_emails).join(', '));
@@ -1259,7 +1326,6 @@ function metaLines() {
     if (jsonArr(m.cc).length) add('抄送', jsonArr(m.cc).join(', '));
     if (jsonArr(m.bcc).length) add('密送', jsonArr(m.bcc).join(', '));
     add('状态', STATUS_LABEL[m.status] || m.status || '—');
-    add('时间', timeLong(m.received_at));
   }
   return lines;
 }
@@ -1293,6 +1359,9 @@ function renderRead() {
   });
   subjectWrap.appendChild(sStar);
   readEl.appendChild(subjectWrap);
+
+  // 换一封邮件时把附件预览浮层收掉：renderRead 是详情内容的**唯一出口**，放这里天然不漏
+  closeAttachmentPreview();
 
   // 会话上下文
   if (currentThread.length > 1) readEl.appendChild(threadPanel());
@@ -1351,12 +1420,29 @@ function renderRead() {
   // 详情摘要 + 展开行
   const toLine = document.createElement('div');
   toLine.className = 'env-details';
-  const toLabel = isInbound ? '收件人' : '收件人';
   const toggle = document.createElement('a');
   toggle.className = 'toggle-detail';
   toggle.textContent = '查看详情';
   const lines = metaLines();
-  toLine.innerHTML = `<b>${toLabel}：</b>${esc(recipientsLabel(m.to_emails) || (pending ? '…' : ''))} `;
+  // 入站显示**真实 To: 头**（不是投递地址），否则被抄送时会显示成用户自己
+  const toText = isInbound ? inboundRecipientsLabel(m) : recipientsLabel(m.to_emails);
+  toLine.innerHTML = `<b>收件人：</b>${esc(toText || (pending ? '…' : '—'))} `;
+  // 「收件人：—」只有一种成因：这封是**修复前**入库的（`delivered_to` 仍为 null，真实 To 头没落库），
+  // 且投递地址减掉 cc/bcc 后为空。能不能补回来取决于上游保留期 —— Resend 只留 30 天，
+  // 2026-10-08 回填后仍有 10 行已超期、永久取不回。给个 title 说明，免得被当成 bug 反复排查。
+  if (isInbound && !toText && !pending && m.delivered_to === null) {
+    toLine.title = '这封邮件入库时未保存原始收件人（To:）信息，且已超出上游保留期，无法恢复';
+  }
+  // 我只是被抄送/密送时，在默认可见的这一行就给个角标 —— 详情行是折叠的，藏在那里等于没说
+  const role = isInbound ? myRecipientRole(m) : null;
+  if (role === 'cc' || role === 'bcc') {
+    const chip = document.createElement('span');
+    chip.className = 'env-role-chip';
+    chip.textContent = `你是${ROLE_LABEL[role]}`;
+    chip.title = `这封邮件不是发给你的，你是以${ROLE_LABEL[role]}身份收到的`;
+    toLine.appendChild(chip);
+    toLine.appendChild(document.createTextNode(' '));
+  }
   toggle.addEventListener('click', () => envelopeDetailToggle(toggle, lines));
   toLine.appendChild(toggle);
   env.appendChild(toLine);
@@ -1373,21 +1459,7 @@ function renderRead() {
     const list = document.createElement('div');
     list.className = 'att-list';
     for (const a of currentAttachments) {
-      const chip = document.createElement('a');
-      chip.className = 'att-chip';
-      chip.href = a.url;
-      chip.target = '_blank';
-      chip.rel = 'noopener noreferrer';
-      const nm = document.createElement('span');
-      nm.className = 'nm';
-      nm.textContent = a.filename;
-      nm.title = a.filename;
-      chip.appendChild(nm);
-      const sz = document.createElement('span');
-      sz.className = 'sz';
-      sz.textContent = fmtSize(a.size);
-      chip.appendChild(sz);
-      list.appendChild(chip);
+      list.appendChild(attachmentChip(a));
     }
     box.appendChild(list);
     env.appendChild(box);
@@ -1450,6 +1522,21 @@ function detailPlaceholder(pend) {
   return wrap;
 }
 
+/**
+ * 该会话行是否代表「当前正在看的那封邮件」。
+ *
+ * 服务端会把「同一封物理邮件的回环副本」折叠掉（用 `copy_ids` 挂在留存行上，
+ * 见 src/repo.ts 的 foldLoopbackCopies）—— 典型场景：我从 bingfeng@ 发信并抄送
+ * zhanglili@，这封信又被投递回本账号的 zhanglili@，于是库里既有出站副本、又有入站副本。
+ * 此时若用户打开的正是**被折叠的那份**（例如从 zhanglili@ 的收件箱点进来），
+ * 只比 id 会导致面板里一行都不高亮，看起来像「我打开的那封不见了」。
+ */
+function isCurrentThreadRow(t) {
+  if (!currentMessage) return false;
+  if (t.id === currentMessage.id) return true;
+  return jsonArr(t.copy_ids).includes(currentMessage.id);
+}
+
 function threadPanel() {
   const panel = document.createElement('div');
   panel.className = 'mail-card rm-thread';
@@ -1460,10 +1547,11 @@ function threadPanel() {
 
   for (const t of currentThread) {
     const isUnread = !t.read && !t.deleted;
+    const isCurrent = isCurrentThreadRow(t);
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.className = 't-item' +
-      (t.id === currentMessage.id ? ' current' : '') +
+      (isCurrent ? ' current' : '') +
       (isUnread ? ' unread' : '');
 
     if (isUnread) {
@@ -1495,7 +1583,8 @@ function threadPanel() {
     btn.appendChild(time);
 
     btn.addEventListener('click', () => {
-      if (t.id !== currentMessage.id) void openMessage(t.id);
+      // 已经是当前这封（含「它就是被折叠的副本」）就不重复打开
+      if (!isCurrentThreadRow(t)) void openMessage(t.id);
     });
     panel.appendChild(btn);
   }
@@ -1523,6 +1612,177 @@ function fmtSize(n) {
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
   return `${(n / 1024 / 1024).toFixed(1)} MB`;
+}
+
+/* ---------------- 附件：单击预览 + 独立下载 ----------------
+ *
+ * 用户诉求：已知格式（图片 / 视频 / PDF / 纯文本…）点一下就能看，下载另给一个按钮。
+ *
+ * ⚠️ **前端 `attachmentKind()` 与后端 `repo.isInlinePreviewType()` 必须同一口径**：
+ * 前端据此决定「点开是预览还是提示下载」，后端据此决定 `Content-Disposition` 是
+ * inline 还是 attachment。两边不一致会出现「浮层开了、后端却让浏览器下载」的割裂。
+ * 改一边必须改另一边（composer-cc-forward 套件有断言直接比对两份清单）。
+ *
+ * **SVG 明确不预览**：SVG 能内嵌 `<script>`，内联进本应用的同源上下文等于 XSS。
+ * 后端同样把它降级成下载。
+ */
+
+/** 可内嵌预览的非 image/video/audio 类型（与后端 isInlinePreviewType 保持一致）。 */
+const INLINE_PREVIEW_TYPES = ['application/pdf', 'text/plain', 'text/csv', 'text/markdown', 'application/json'];
+
+/** 附件类型 → 预览方式：`image | video | audio | pdf | text | none`。 */
+function attachmentKind(a) {
+  const t = String((a && a.content_type) || '').toLowerCase().split(';')[0].trim();
+  if (!t) return 'none';
+  if (t === 'image/svg+xml') return 'none';
+  if (t.startsWith('image/')) return 'image';
+  if (t.startsWith('video/')) return 'video';
+  if (t.startsWith('audio/')) return 'audio';
+  if (t === 'application/pdf') return 'pdf';
+  if (INLINE_PREVIEW_TYPES.indexOf(t) >= 0) return 'text';
+  return 'none';
+}
+
+/** 预览地址：不带参数，后端按类型给 inline。 */
+function attachmentUrl(a) {
+  return String((a && a.url) || '');
+}
+
+/** 下载地址：`?dl=1` 强制 attachment（否则 PDF/图片会被浏览器就地打开而不是存盘）。 */
+function attachmentDownloadUrl(a) {
+  const url = attachmentUrl(a);
+  return url + (url.indexOf('?') >= 0 ? '&' : '?') + 'dl=1';
+}
+
+/** 附件 chip：文件名可点（预览），右侧独立「下载」按钮。 */
+function attachmentChip(a) {
+  const kind = attachmentKind(a);
+  const chip = document.createElement('span');
+  chip.className = 'att-chip';
+  chip.dataset.kind = kind;
+
+  const open = document.createElement('button');
+  open.type = 'button';
+  open.className = 'att-open';
+  open.title = kind === 'none' ? '该格式不支持在线预览，请点右侧「下载」' : '点击预览';
+  const nm = document.createElement('span');
+  nm.className = 'nm';
+  nm.textContent = a.filename;
+  nm.title = a.filename;
+  open.appendChild(nm);
+  open.addEventListener('click', () => openAttachmentPreview(a));
+  chip.appendChild(open);
+
+  const sz = document.createElement('span');
+  sz.className = 'sz';
+  sz.textContent = fmtSize(a.size);
+  chip.appendChild(sz);
+
+  const dl = document.createElement('a');
+  dl.className = 'att-dl';
+  dl.href = attachmentDownloadUrl(a);
+  dl.setAttribute('download', a.filename || '');
+  dl.title = '下载';
+  dl.textContent = '下载';
+  chip.appendChild(dl);
+
+  return chip;
+}
+
+/** 预览请求序号：关闭 / 换一个附件后，旧的异步文本回调不许再写进浮层。 */
+let attPreviewSeq = 0;
+
+/** 关掉预览浮层。返回「本次是否真的关了」，供 Esc 处理器判断要不要继续往下传。 */
+function closeAttachmentPreview() {
+  const box = $('#att-preview');
+  if (!box || box.classList.contains('hidden')) return false;
+  box.classList.add('hidden');
+  const body = $('#att-preview-body');
+  // 清空内容：`<video>` / `<audio>` 只有在被移出文档后才会停止继续加载
+  if (body) body.innerHTML = '';
+  attPreviewSeq++;
+  return true;
+}
+
+function openAttachmentPreview(a) {
+  const kind = attachmentKind(a);
+  if (kind === 'none') {
+    showToast('该格式不支持在线预览，请点「下载」保存后打开', true);
+    return;
+  }
+  const box = $('#att-preview');
+  const body = $('#att-preview-body');
+  if (!box || !body) return;
+  const seq = ++attPreviewSeq;
+
+  const name = $('#att-preview-name');
+  if (name) name.textContent = a.filename || '';
+  const dl = $('#att-preview-dl');
+  if (dl) dl.href = attachmentDownloadUrl(a);
+
+  const url = attachmentUrl(a);
+  body.innerHTML = '';
+  let node;
+  if (kind === 'image') {
+    node = document.createElement('img');
+    node.src = url;
+    node.alt = a.filename || '';
+  } else if (kind === 'pdf') {
+    // PDF 交给浏览器内置查看器：iframe 内嵌，不离开当前页面
+    node = document.createElement('iframe');
+    node.src = url;
+    node.title = a.filename || 'PDF 预览';
+  } else if (kind === 'video') {
+    node = document.createElement('video');
+    node.src = url;
+    node.controls = true;
+  } else if (kind === 'audio') {
+    node = document.createElement('audio');
+    node.src = url;
+    node.controls = true;
+  } else {
+    // 文本类自己拉回来渲染：用 iframe 会让浏览器把它当独立页面加载，样式和交互都不受控
+    node = document.createElement('pre');
+    node.className = 'att-preview-text';
+    node.textContent = '加载中…';
+    fetch(url)
+      .then((r) => (r.ok ? r.text() : Promise.reject(new Error(`HTTP ${r.status}`))))
+      .then((txt) => {
+        if (seq === attPreviewSeq) node.textContent = txt;
+      })
+      .catch(() => {
+        if (seq === attPreviewSeq) node.textContent = '（内容加载失败，请用「下载」按钮保存后打开）';
+      });
+  }
+  body.appendChild(node);
+  box.classList.remove('hidden');
+}
+
+function setupAttachmentPreview() {
+  const box = $('#att-preview');
+  if (!box) return;
+  const close = $('#att-preview-close');
+  if (close) close.addEventListener('click', closeAttachmentPreview);
+  // 点浮层空白（不是内容盒）关闭
+  box.addEventListener('click', (e) => {
+    if (e.target === e.currentTarget) closeAttachmentPreview();
+  });
+  // Esc 关预览。**必须挂在捕获阶段**并 stopPropagation：
+  // 全局那个 Esc 处理器（收抽屉 / 确认框 / 关写信弹窗）在 setupEvents 里，而那两个 vm 套件
+  // 会把 setupEvents 中间那段整段抽出来单独执行 —— 在那里调用本模块的函数会直接
+  // ReferenceError 打挂套件。挂捕获阶段还有个好处：预览是最外层浮层，Esc 天然优先，
+  // 预览关掉后事件不再下传，不会顺手把抽屉也关了。
+  document.addEventListener(
+    'keydown',
+    (e) => {
+      if (e.key !== 'Escape') return;
+      if (closeAttachmentPreview()) {
+        e.preventDefault();
+        e.stopPropagation();
+      }
+    },
+    true
+  );
 }
 
 /* ---------------- HTML 清洗 ---------------- */
@@ -2031,6 +2291,8 @@ function openComposerShell(opts) {
     mailbox: $('#f-mailbox').value,
   };
   $('#modal-mask').classList.remove('hidden');
+  // 会话内记住上次的浮动几何；移动端 / 没几何时这里会把内联值清空，回落到 CSS 布局
+  applyComposerGeom();
   closeDrawer(); // 移动端：写信弹窗是全屏的，抽屉必须先收起
   void loadContacts(); // 联想数据懒加载，失败不影响发信
   $(focus).focus();
@@ -2219,6 +2481,7 @@ function requestCloseComposer() {
 function closeComposer() {
   hideDiscardConfirm(false);
   hideSuggest();
+  endComposerDrag(); // 关窗时若正拖着，把拖动状态一起收掉（否则 body 的类会残留）
   composerLastFocus = null;
   composerBaseline = null;
   state.composing = null;
@@ -2449,6 +2712,306 @@ async function sendCompose() {
   }
 }
 
+/* ---------------- 写信弹窗：可拖动 / 可缩放 / 可最大化（仅桌面端） ----------------
+ *
+ * 背景：回复 / 转发时弹窗正对着原邮件，想对照着写很别扭。这里把桌面端的写信弹窗做成
+ * 一个可以随手拖走、可以放大、可以最大化的浮动窗口；移动端保持原来的全屏布局。
+ *
+ * ⚠️ 内联 width/height 的优先级**高于**媒体查询，所以切到移动端时必须把内联几何清掉，
+ * 否则会出现「手机上弹窗还是桌面尺寸」。清理由 syncLayout()（布局的唯一收敛点）驱动。
+ *
+ * 几何状态只有一份真值：composerGeom。
+ *   null      = 不浮动 —— 沿用 CSS 的居中 + 自适应高度，即改动前的样子；
+ *   {left,top,width,height} = 浮动窗口，由内联样式驱动。
+ * 任何改几何的地方都必须落到 applyComposerGeom() 这一个出口，不许自己写 style。
+ */
+
+/** 浮动窗口的最小尺寸：再小就挤不下「收件人 / 正文 / 发送」三块。 */
+const COMPOSER_MIN_W = 420;
+const COMPOSER_MIN_H = 320;
+/** 最大化时四周留的边距，免得贴着屏幕边缘。 */
+const COMPOSER_MAX_GAP = 12;
+/** 判定「真的在拖」的最小位移：低于它就只是点了一下标题栏。 */
+const COMPOSER_DRAG_THRESHOLD = 3;
+
+let composerGeom = null;      // { left, top, width, height } | null（见上方说明）
+let composerPrevGeom = null;  // 最大化之前的几何，供「还原」用
+let composerMaximized = false;
+let composerDrag = null;      // 进行中的拖动 / 缩放 { mode, x, y, geom, moved }
+/**
+ * 最近一次 pointerdown 是否落在弹窗内部。
+ *
+ * 用来区分「真的点了遮罩空白」和「在弹窗里按下、把鼠标抬到遮罩上」——后者浏览器会把
+ * click 派发到两者的共同祖先（也就是遮罩自己），于是 target === currentTarget 成立、
+ * 弹窗被误关。拖动标题栏天然就是这种手势，所以这个区分是必需的。
+ */
+let composerPressInside = false;
+
+/** 视口尺寸。与 viewportWidth() 同源；缺失时给桌面默认值，别让 NaN 传染进几何。 */
+function viewportSize() {
+  const w = globalThis.innerWidth;
+  const h = globalThis.innerHeight;
+  return {
+    width: typeof w === 'number' && w > 0 ? w : 1024,
+    height: typeof h === 'number' && h > 0 ? h : 768,
+  };
+}
+
+/**
+ * 把任意几何夹进视口。纯函数（只吃数字），便于在无布局的测试环境里直接验证策略。
+ *
+ * 位置夹取的目标是「**整窗**都在视口内」，而不是「标题栏露一点就行」。
+ * 尺寸在上面已经夹到不超过视口，所以整窗夹进去是可行的 —— 这样标题栏和右下角
+ * 缩放把手就永远都够得着。
+ *
+ * ⚠️ 别退化成「保证标题栏留 80px」那种写法：真实 Chromium 实测过，窗口往下拖
+ * 150px 后右下角就被推到屏幕外，`elementFromPoint` 返回 null，把手既点不到也拖不动 ——
+ * 用户把窗口拖到某个位置后**再也调不回来**。这是浮动窗口最经典的死锁。
+ */
+function clampComposerGeom(g, vp) {
+  const maxW = Math.max(COMPOSER_MIN_W, vp.width - COMPOSER_MAX_GAP * 2);
+  const maxH = Math.max(COMPOSER_MIN_H, vp.height - COMPOSER_MAX_GAP * 2);
+  const width = Math.min(Math.max(g.width, COMPOSER_MIN_W), maxW);
+  const height = Math.min(Math.max(g.height, COMPOSER_MIN_H), maxH);
+  const maxLeft = Math.max(0, vp.width - width);
+  const maxTop = Math.max(0, vp.height - height);
+  const left = Math.min(Math.max(g.left, 0), maxLeft);
+  const top = Math.min(Math.max(g.top, 0), maxTop);
+  return {
+    left: Math.round(left),
+    top: Math.round(top),
+    width: Math.round(width),
+    height: Math.round(height),
+  };
+}
+
+/**
+ * 取 #composer 的「真实元素」。
+ * 两个 vm 套件（compose-guard / mail-merge）用的是极简 DOM 桩，元素没有 style；
+ * 拿不到 style 就说明不是浏览器，几何相关的代码一律跳过（返回 null 由调用方早退）。
+ */
+function composerBox() {
+  const el = $('#composer');
+  return el && el.style ? el : null;
+}
+
+/** 拖动期间给 body 加类（禁掉文字选择）。桩 DOM 的 body 没有 classList，做特性检测。 */
+function setComposerDragging(on) {
+  const b = document.body;
+  if (!b || !b.classList) return;
+  b.classList.toggle('composer-dragging', !!on);
+}
+
+function syncComposerMaxButton() {
+  const btn = $('#composer-max');
+  if (!btn || !btn.style) return;
+  btn.textContent = composerMaximized ? '⤡' : '⤢';
+  if (typeof btn.setAttribute === 'function') {
+    const label = composerMaximized ? '还原大小' : '最大化';
+    btn.setAttribute('title', label);
+    btn.setAttribute('aria-label', label);
+  }
+}
+
+/**
+ * 几何的**唯一出口**：把 composerGeom 全量对齐到内联样式 + 状态类。
+ * 非浮动（移动端 / 没几何）时把内联值清空，让 CSS 重新说了算。
+ */
+function applyComposerGeom() {
+  const el = composerBox();
+  if (!el) return;
+  const floating = !!composerGeom && !isMobile();
+  el.classList.toggle('floating', floating);
+
+  const mask = $('#modal-mask');
+  if (mask && mask.classList) mask.classList.toggle('composer-float', floating);
+
+  const grip = $('#composer-resize');
+  if (grip && grip.style && grip.classList) {
+    grip.classList.toggle('hidden', !floating);
+    // 把手用 fixed 定位：弹窗内部滚动时它不会被滚走（绝对定位会跟着内容跑，
+    // 窗口被压到比内容还矮时就再也点不到了）。
+    if (floating) {
+      grip.style.left = `${composerGeom.left + composerGeom.width - 18}px`;
+      grip.style.top = `${composerGeom.top + composerGeom.height - 18}px`;
+    } else {
+      grip.style.left = '';
+      grip.style.top = '';
+    }
+  }
+
+  if (floating) {
+    el.style.left = `${composerGeom.left}px`;
+    el.style.top = `${composerGeom.top}px`;
+    el.style.width = `${composerGeom.width}px`;
+    el.style.height = `${composerGeom.height}px`;
+  } else {
+    el.style.left = '';
+    el.style.top = '';
+    el.style.width = '';
+    el.style.height = '';
+  }
+  syncComposerMaxButton();
+}
+
+/**
+ * 由 syncLayout() 在断点切换 / 窗口尺寸变化时调用：
+ * 重新夹取几何，并（在移动端）清掉内联值让全屏布局生效。
+ */
+function syncComposerWindowLayout() {
+  if (!composerGeom) return;
+  // 移动端只是「这份几何暂时用不上」：不夹取、也不丢弃，切回桌面端原样恢复。
+  // 若在这里夹一次，窄视口会把用户挑的尺寸**永久压小**（夹取是单向的，缩回去长不回来）。
+  if (!isMobile()) composerGeom = clampComposerGeom(composerGeom, viewportSize());
+  applyComposerGeom();
+}
+
+/** 开始拖动 / 缩放：先把当前（可能由 CSS 决定的）几何量出来，真正移动时才固化成浮动。 */
+function startComposerDrag(mode, e) {
+  if (isMobile()) return false; // 移动端是全屏，不参与浮动
+  const el = composerBox();
+  if (!el || typeof el.getBoundingClientRect !== 'function') return false;
+  const r = el.getBoundingClientRect();
+  composerDrag = {
+    mode,
+    x: e.clientX,
+    y: e.clientY,
+    moved: false,
+    geom: clampComposerGeom(
+      { left: r.left, top: r.top, width: r.width, height: r.height },
+      viewportSize()
+    ),
+  };
+  return true;
+}
+
+/** 拖动 / 缩放的位移换算。resize 只改右下角，move 只改位置。 */
+function dragComposerTo(x, y) {
+  const d = composerDrag;
+  if (!d) return;
+  if (!d.moved) {
+    // 只是点了一下标题栏（没真拖动）：不进浮动，免得「点一下遮罩就变淡」
+    if (Math.abs(x - d.x) + Math.abs(y - d.y) < COMPOSER_DRAG_THRESHOLD) return;
+    d.moved = true;
+    composerMaximized = false; // 手动拖动即退出最大化
+    composerPrevGeom = null;
+    setComposerDragging(true);
+  }
+  const vp = viewportSize();
+  if (d.mode === 'move') {
+    composerGeom = clampComposerGeom(
+      { left: d.geom.left + (x - d.x), top: d.geom.top + (y - d.y), width: d.geom.width, height: d.geom.height },
+      vp
+    );
+  } else {
+    // 缩放的尺寸上限 = 「当前位置到视口右下角」的可用空间。
+    // 少了这一步，放大时会先把窗口撑出屏幕、再被 clampComposerGeom 整体拽回左上角 ——
+    // 用户看到的是「我明明只往右下拖把手，窗口却自己往左上跑」（真实 Chromium 实测踩到）。
+    // 卡住尺寸、让左上角一动不动，才是符合直觉的。
+    const maxW = Math.max(COMPOSER_MIN_W, vp.width - d.geom.left);
+    const maxH = Math.max(COMPOSER_MIN_H, vp.height - d.geom.top);
+    composerGeom = clampComposerGeom(
+      {
+        left: d.geom.left,
+        top: d.geom.top,
+        width: Math.min(d.geom.width + (x - d.x), maxW),
+        height: Math.min(d.geom.height + (y - d.y), maxH),
+      },
+      vp
+    );
+  }
+  applyComposerGeom();
+}
+
+function endComposerDrag() {
+  if (!composerDrag) return;
+  composerDrag = null;
+  setComposerDragging(false);
+}
+
+/** 最大化 / 还原（还原回到最大化之前的几何）。 */
+function toggleComposerMax() {
+  if (isMobile()) return;
+  const el = composerBox();
+  if (!el || typeof el.getBoundingClientRect !== 'function') return;
+  const vp = viewportSize();
+  if (composerMaximized) {
+    if (composerPrevGeom) composerGeom = clampComposerGeom(composerPrevGeom, vp);
+    composerPrevGeom = null;
+    composerMaximized = false;
+  } else {
+    const r = el.getBoundingClientRect();
+    composerPrevGeom = clampComposerGeom(
+      { left: r.left, top: r.top, width: r.width, height: r.height },
+      vp
+    );
+    composerGeom = clampComposerGeom(
+      { left: COMPOSER_MAX_GAP, top: COMPOSER_MAX_GAP, width: vp.width - COMPOSER_MAX_GAP * 2, height: vp.height - COMPOSER_MAX_GAP * 2 },
+      vp
+    );
+    composerMaximized = true;
+  }
+  applyComposerGeom();
+}
+
+/** 回到默认的居中自适应布局（放弃浮动几何）。 */
+function resetComposerGeom() {
+  composerGeom = null;
+  composerPrevGeom = null;
+  composerMaximized = false;
+  applyComposerGeom();
+}
+
+/**
+ * 拖动 / 缩放 / 最大化的接线。在 setupEvents() 里调用。
+ * 用 pointer 事件统一鼠标与触摸；移动端由 isMobile() 早退，所以这里不必再分平台。
+ */
+function setupComposerWindow() {
+  const head = $('#composer-head');
+  const grip = $('#composer-resize');
+  const maxBtn = $('#composer-max');
+  const fitBtn = $('#composer-fit');
+
+  // 标题栏上的按钮是「点」不是「拖」，别把点击当成拖动起点
+  const onButton = (e) => {
+    const t = e.target;
+    return !!(t && typeof t.closest === 'function' && t.closest('button'));
+  };
+
+  if (head) {
+    head.addEventListener('pointerdown', (e) => {
+      if (onButton(e)) return;
+      if (e.button != null && e.button !== 0) return;
+      if (!startComposerDrag('move', e)) return;
+      e.preventDefault();
+    });
+    head.addEventListener('dblclick', (e) => {
+      if (onButton(e)) return;
+      toggleComposerMax();
+    });
+  }
+  if (grip) {
+    grip.addEventListener('pointerdown', (e) => {
+      if (e.button != null && e.button !== 0) return;
+      if (!startComposerDrag('resize', e)) return;
+      e.preventDefault();
+    });
+  }
+  if (maxBtn) maxBtn.addEventListener('click', toggleComposerMax);
+  if (fitBtn) fitBtn.addEventListener('click', resetComposerGeom);
+
+  if (typeof document.addEventListener === 'function') {
+    document.addEventListener('pointermove', (e) => dragComposerTo(e.clientX, e.clientY));
+    document.addEventListener('pointerup', endComposerDrag);
+    document.addEventListener('pointercancel', endComposerDrag);
+    // 每次按下都重新记录「按在弹窗里还是遮罩上」，供遮罩的 click 处理器判断
+    document.addEventListener('pointerdown', (e) => {
+      const t = e.target;
+      composerPressInside = !!(t && typeof t.closest === 'function' && t.closest('#composer'));
+    }, true);
+  }
+}
+
 /* ---------------- 搜索 / 键盘 / 事件 / 同步 ---------------- */
 
 function isTypingTarget(el) {
@@ -2486,6 +3049,10 @@ function setupEvents() {
   $('#composer-cancel').addEventListener('click', requestCloseComposer);
   $('#composer-send').addEventListener('click', () => void sendCompose());
   $('#modal-mask').addEventListener('click', (e) => {
+    // 按下点在弹窗内部、鼠标抬到遮罩上时，浏览器会把 click 派发到共同祖先（遮罩本身），
+    // 光看 target === currentTarget 会把它当成「点空白关闭」。拖动标题栏就是这个手势，
+    // 所以必须结合「按下点在哪」判断（见 composerPressInside）。
+    if (composerPressInside) return;
     if (e.target === e.currentTarget) requestCloseComposer();
   });
 
@@ -2578,6 +3145,11 @@ function setupEvents() {
   }
 
   setupSearch();
+  // 写信弹窗的拖动 / 缩放 / 最大化接线。放在 setupSearch() **之后**：
+  // 上面那段事件接线会被两个 vm 套件按注释标记整段抽取执行，这里不再往里塞东西。
+  setupComposerWindow();
+  // 附件预览浮层（关闭按钮 / 点空白关闭；Esc 挂在全局键盘处理器里）
+  setupAttachmentPreview();
 }
 
 /**

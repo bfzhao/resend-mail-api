@@ -2,7 +2,7 @@ import type { Env, Folder } from './types';
 import { authenticate, unauthorized } from './auth';
 import { handleInbound, handleEvents } from './webhook';
 import * as repo from './repo';
-import { resendSend, replySubject, forwardSubject, textToHtml, senderFromMailbox } from './send';
+import { resendSend, replySubject, forwardSubject, textToHtml, senderIdentity } from './send';
 import type { ResendAttachment } from './send';
 import { json, jsonArr, nowSec, parseAddress, parseAddressList, rootThreadId, uuid, base64ToBytes, bytesToBase64, stripHtml } from './util';
 
@@ -118,10 +118,12 @@ async function routeApi(request: Request, env: Env, path: string, url: URL): Pro
     return json({ error: 'Method Not Allowed' }, 405);
   }
 
-  // 附件代理：/api/attachments/:id
+  // 附件代理：/api/attachments/:id  （?dl=1 强制下载，不带则按类型决定是否内联预览）
   const attachmentMatch = /^\/api\/attachments\/([^/]+)$/.exec(path);
   if (attachmentMatch && method === 'GET') {
-    const resp = await repo.proxyAttachment(env, decodeURIComponent(attachmentMatch[1]));
+    const resp = await repo.proxyAttachment(env, decodeURIComponent(attachmentMatch[1]), {
+      forceDownload: url.searchParams.get('dl') === '1',
+    });
     if (!resp) return json({ error: '附件不存在' }, 404);
     return resp;
   }
@@ -163,7 +165,7 @@ async function getMessageDetail(env: Env, id: string): Promise<Response> {
     url: `/api/attachments/${a.id}`,
   }));
 
-  // 会话上下文（同一 thread_id 内，按时间升序）
+  // 会话上下文（同一 thread_id 内，**降序：最近在前**；回环副本已由 listThread 折叠）
   const thread: Array<Record<string, unknown>> = threadRaw.map((t) => ({
     id: t.id,
     direction: t.direction,
@@ -176,15 +178,21 @@ async function getMessageDetail(env: Env, id: string): Promise<Response> {
     received_at: t.received_at,
     read: t.read === 1,
     deleted: t.deleted === 1,
-    current: t.id === id,
+    // 同一封物理邮件的其它记录 id（被折叠掉的回环副本）。前端据此把「当前打开的是副本」
+    // 也认作当前行；这里顺带把 `current` 一并算对，避免两处口径不一致。
+    copy_ids: t.copy_ids ?? [],
+    current: t.id === id || (t.copy_ids ?? []).includes(id),
   }));
 
-  const { to_emails, cc, bcc, reply_to, ...rest } = message;
+  const { to_emails, delivered_to, cc, bcc, reply_to, ...rest } = message;
   return json({
     message: {
       ...rest,
       id,
       to_emails: jsonArr(to_emails),
+      // 入站：投递地址（信封收件人）。历史行是 null —— 前端据此判定「修复前入库」，
+      // 展示收件人时把投递地址减去 cc/bcc，别把自己标成收件人。
+      delivered_to: delivered_to ? jsonArr(delivered_to) : null,
       cc: jsonArr(cc),
       bcc: jsonArr(bcc),
       reply_to: jsonArr(reply_to),
@@ -339,14 +347,18 @@ function bodyFrom(b: { body?: unknown; html?: unknown }): { text: string; html: 
   return { text, html: textToHtml(text) };
 }
 
-/** 决定发件人：优先请求指定 mailbox，仅当其域名属于已验证发送域名时采用。 */
-function resolveSender(env: Env, mailboxCandidate?: string): { from: string; mailbox: string } {
-  const defaultAddr = (env.SEND_FROM_ADDRESS || '').trim().toLowerCase();
-  const from = senderFromMailbox(env, mailboxCandidate || '');
-  // senderFromMailbox 已回退到默认地址；这里把实际使用的地址取出来作为 mailbox 存库
-  const used = /<([^>]+)>/.exec(from)?.[1] || from || '';
-  const mailbox = used.toLowerCase() || defaultAddr;
-  return { from, mailbox };
+/**
+ * 决定发件人：优先请求指定 mailbox，仅当其域名属于已验证发送域名时采用。
+ * 同时返回**实际使用的显示名**，供出站入库（`from_name`）使用 ——
+ * 否则收件箱里所有账户发出去的信都显示成全局 `SEND_FROM_NAME`。
+ */
+function resolveSender(
+  env: Env,
+  mailboxCandidate?: string
+): { from: string; mailbox: string; fromName: string | null } {
+  const identity = senderIdentity(env, mailboxCandidate || '');
+  const mailbox = identity.address || (env.SEND_FROM_ADDRESS || '').trim().toLowerCase();
+  return { from: identity.from, mailbox, fromName: identity.name || null };
 }
 
 interface MergeInput {
@@ -355,7 +367,7 @@ interface MergeInput {
   subject: string;
   content: { text: string; html: string };
   attachments: ResendAttachment[];
-  sender: { from: string; mailbox: string };
+  sender: { from: string; mailbox: string; fromName: string | null };
 }
 
 /**
@@ -400,7 +412,7 @@ async function composeMerge(env: Env, input: MergeInput): Promise<Response> {
         references: null,
         threadId: uuid(), // 每人独立会话
         mailbox: input.sender.mailbox,
-        fromName: env.SEND_FROM_NAME || null,
+        fromName: input.sender.fromName,
         fromEmail: input.sender.mailbox,
         to: [addr],
         cc: input.cc,
@@ -482,7 +494,7 @@ async function compose(env: Env, request: Request): Promise<Response> {
     references: null,
     threadId: uuid(), // 独立会话
     mailbox: sender.mailbox,
-    fromName: env.SEND_FROM_NAME || null,
+    fromName: sender.fromName,
     fromEmail: sender.mailbox,
     to,
     cc,
@@ -575,7 +587,7 @@ async function reply(env: Env, request: Request, id: string): Promise<Response> 
     references: newReferences || null,
     threadId,
     mailbox: sender.mailbox,
-    fromName: env.SEND_FROM_NAME || null,
+    fromName: sender.fromName,
     fromEmail: sender.mailbox,
     to,
     cc,
@@ -703,7 +715,7 @@ async function forward(env: Env, request: Request, id: string): Promise<Response
     references: null,
     threadId: uuid(), // 转发开启新会话
     mailbox: sender.mailbox,
-    fromName: env.SEND_FROM_NAME || null,
+    fromName: sender.fromName,
     fromEmail: sender.mailbox,
     to,
     cc,

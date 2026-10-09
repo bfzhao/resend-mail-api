@@ -27,6 +27,8 @@ export interface MessageRow {
   from_name: string | null;
   from_email: string | null;
   to_emails: string;
+  /** 入站邮件的投递地址（信封收件人）；历史行为 NULL。见 migrations/004_delivered_to.sql。 */
+  delivered_to: string | null;
   cc: string | null;
   bcc: string | null;
   reply_to: string | null;

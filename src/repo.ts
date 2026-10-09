@@ -1,5 +1,5 @@
 import type { AttachmentRow, Env, Folder, MessageRow } from './types';
-import { nowSec, uuid, contentDisposition } from './util';
+import { nowSec, uuid, contentDisposition, jsonArr } from './util';
 
 export interface PreparedAttachment {
   filename: string;
@@ -21,6 +21,8 @@ export interface InboundInput {
   fromName: string | null;
   fromEmail: string | null;
   to: string[];
+  /** 入站邮件的**投递地址（信封收件人）**；出站为 null。见 migrations/004_delivered_to.sql。 */
+  deliveredTo?: string[] | null;
   cc: string[];
   bcc: string[];
   replyTo: string[];
@@ -312,34 +314,117 @@ export async function contacts(env: Env, limit = 500): Promise<ContactRow[]> {
   return out.slice(0, limit);
 }
 
-/** 同一会话内的消息（升序），用于阅读视图上下文。 */
-export async function listThread(env: Env, threadId: string): Promise<
-  Array<{
-    id: string;
-    direction: string;
-    mailbox: string;
-    from_name: string | null;
-    from_email: string | null;
-    to_emails: string;
-    subject: string | null;
-    preview: string | null;
-    received_at: number;
-    read: number;
-    deleted: number;
-  }>
-> {
+/**
+ * 会话行的形状（阅读视图的上下文条目）。
+ *
+ * ⚠️ `copy_ids` **不是 DB 列** —— 它是 `foldLoopbackCopies()` 折叠时挂上来的
+ * 「同一封物理邮件的其它记录 id」。前端靠它把「当前打开的正好是被折叠的那份副本」
+ * 也算作当前行，否则会话面板里没有任何一行高亮，看起来像「我打开的那封不见了」。
+ */
+export interface ThreadRow {
+  id: string;
+  direction: string;
+  mailbox: string;
+  from_name: string | null;
+  from_email: string | null;
+  to_emails: string;
+  /** 真实 Cc / Bcc 头（JSON 数组文本，可能为 NULL）。折叠回环副本要靠它。 */
+  cc: string | null;
+  bcc: string | null;
+  subject: string | null;
+  preview: string | null;
+  received_at: number;
+  read: number;
+  deleted: number;
+  copy_ids?: string[];
+}
+
+/** 回环副本的时间窗（秒）。线上实测出站/回环两条的入库时间差只有 1~2 秒。 */
+const LOOPBACK_WINDOW_SEC = 300;
+
+function normAddr(v: string | null | undefined): string {
+  return String(v ?? '').trim().toLowerCase();
+}
+
+/** 某行的全部收件人（to + cc + bcc，小写归一）。 */
+function rowRecipients(row: ThreadRow): string[] {
+  return [...jsonArr(row.to_emails), ...jsonArr(row.cc), ...jsonArr(row.bcc)]
+    .map(normAddr)
+    .filter(Boolean);
+}
+
+/**
+ * 折叠「同一封物理邮件在本账号内的回环副本」。
+ *
+ * 背景（2026-10-08 生产数据实测）：账号下配了多个收信信箱（bingfeng@ / support@ / zhanglili@）。
+ * 用 bingfeng@ 发一封给外部收件人、**并抄送 zhanglili@** 时，Resend 会把同一封邮件投递回
+ * zhanglili@，于是库里留下两条记录：
+ *   - 出站：`to=[lara@…]` `cc=[zhanglili@…]`        —— 我发出的副本
+ *   - 入站：`mailbox=zhanglili@` `from=bingfeng@` `to=[lara@…]` `cc=[zhanglili@…]`
+ *                                                    —— 投递回本账号的副本
+ * 二者 from / to / cc / 主题 / in_reply_to 完全相同、入库时间只差 1~2 秒；会话面板的时间
+ * 精确到分钟 → 两行**逐字相同**，用户看到的就是「同一封信显示了两次」。
+ *
+ * 判定「某条入站行是某条出站行的回环副本」需**同时**满足：
+ *   ① 同一会话（调用方已按 thread_id 过滤）；
+ *   ② `from_email` 相同且非空 —— 副本的发件人就是我们自己的发信身份；
+ *   ③ 入站行的**投递信箱**（`mailbox`）出现在该出站行的 to/cc/bcc 里 —— 我发给谁，就从谁那里回来；
+ *   ④ 入库时间相差不超过 LOOPBACK_WINDOW_SEC。
+ * 四条一起卡住才折叠：真实来信（发件人是对方）不满足 ②；对方稍后回信不满足 ④；
+ * 投递给**非本账号**地址的邮件不满足 ③。任何一条不成立都原样保留。
+ *
+ * 折叠方向固定为「留出站、去入站」：会话面板回答的是「这封信的往来」，而不是
+ * 「每个信箱各自收到了什么」—— 被折叠的那份在 zhanglili@ 自己的收件箱里照常显示。
+ *
+ * 副作用：被折叠行若有未读，把留存行的 `read` 置 0 —— 否则折叠会静默吞掉一个未读信号。
+ */
+export function foldLoopbackCopies(rows: ThreadRow[]): ThreadRow[] {
+  const outbounds = rows.filter((r) => r.direction === 'outbound');
+  if (!outbounds.length) return rows;
+
+  const copyOf = new Map<string, string>(); // 入站副本 id -> 出站行 id
+  const kept = rows.filter((r) => {
+    if (r.direction !== 'inbound') return true;
+    const from = normAddr(r.from_email);
+    const box = normAddr(r.mailbox);
+    if (!from || !box) return true;
+    const origin = outbounds.find(
+      (o) =>
+        normAddr(o.from_email) === from &&
+        Math.abs(o.received_at - r.received_at) <= LOOPBACK_WINDOW_SEC &&
+        rowRecipients(o).includes(box)
+    );
+    if (!origin) return true;
+    copyOf.set(r.id, origin.id);
+    return false;
+  });
+
+  for (const [copyId, originId] of copyOf) {
+    const origin = kept.find((r) => r.id === originId);
+    if (!origin) continue;
+    origin.copy_ids = origin.copy_ids ? [...origin.copy_ids, copyId] : [copyId];
+    const copy = rows.find((r) => r.id === copyId);
+    if (copy && !copy.read) origin.read = 0;
+  }
+  return kept;
+}
+
+/**
+ * 同一会话内的消息，**降序（最近在前）**，用于阅读视图上下文。
+ * 返回前已折叠「同一封物理邮件的回环副本」（见 `foldLoopbackCopies`）。
+ *
+ * `id DESC` 只作同一秒内的稳定次序，不承担业务含义。
+ */
+export async function listThread(env: Env, threadId: string): Promise<ThreadRow[]> {
   const rows = await env.DB.prepare(
-    `SELECT id, direction, mailbox, from_name, from_email, to_emails, subject,
+    `SELECT id, direction, mailbox, from_name, from_email, to_emails, cc, bcc, subject,
             substr(coalesce(NULLIF(body_text,''), ''), 1, 160) AS preview,
             received_at, read, deleted
      FROM messages
      WHERE thread_id = ?
-     ORDER BY received_at ASC`
-  ).bind(threadId).all<{
-    id: string; direction: string; mailbox: string; from_name: string | null; from_email: string | null;
-    to_emails: string; subject: string | null; preview: string | null; received_at: number; read: number; deleted: number;
-  }>();
-  return rows.results;
+     ORDER BY received_at DESC, id DESC`
+  ).bind(threadId).all<ThreadRow>();
+  return foldLoopbackCopies(rows.results);
 }
 
 export async function getMessage(env: Env, id: string): Promise<MessageRow | null> {
@@ -481,6 +566,7 @@ function insertMessageStmt(env: Env, row: {
   fromName: string | null;
   fromEmail: string | null;
   to: string[];
+  deliveredTo?: string[] | null;
   cc: string[];
   bcc: string[];
   replyTo: string[];
@@ -500,9 +586,9 @@ function insertMessageStmt(env: Env, row: {
   return env.DB.prepare(
     `INSERT INTO messages
       (id, direction, message_id, in_reply_to, "references", thread_id, mailbox,
-       from_name, from_email, to_emails, cc, bcc, reply_to, subject, body_html,
+       from_name, from_email, to_emails, delivered_to, cc, bcc, reply_to, subject, body_html,
        body_text, received_at, status, resend_id, read, starred, deleted, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)`
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)`
   ).bind(
     row.id,
     row.direction,
@@ -514,6 +600,7 @@ function insertMessageStmt(env: Env, row: {
     row.fromName,
     row.fromEmail,
     JSON.stringify(row.to),
+    row.deliveredTo && row.deliveredTo.length ? JSON.stringify(row.deliveredTo) : null,
     row.cc.length ? JSON.stringify(row.cc) : null,
     row.bcc.length ? JSON.stringify(row.bcc) : null,
     row.replyTo.length ? JSON.stringify(row.replyTo) : null,
@@ -543,6 +630,7 @@ export async function saveInbound(env: Env, input: InboundInput, deliveryEventId
       fromName: input.fromName,
       fromEmail: input.fromEmail,
       to: input.to,
+      deliveredTo: input.deliveredTo,
       cc: input.cc,
       bcc: input.bcc,
       replyTo: input.replyTo,
@@ -620,7 +708,39 @@ export async function getAttachment(env: Env, id: string): Promise<AttachmentRow
   );
 }
 
-export async function proxyAttachment(env: Env, id: string): Promise<Response | null> {
+/**
+ * 该类型能不能**内联**给浏览器预览（而不是强制下载）。
+ *
+ * 只放行「浏览器原生能渲染、且不会在本域执行脚本」的类型：
+ *  - 图片：`image/*`，**但排除 SVG** —— SVG 能带 `<script>`，内联等于把任意发件人的
+ *    脚本放进本应用的同源上下文执行（XSS）；
+ *  - `application/pdf` / `video/*` / `audio/*`：浏览器原生查看器，业界邮件客户端标准做法；
+ *  - 纯文本类：只放行 `text/plain` / `text/csv` / `text/markdown` / `application/json`，
+ *    其余 `text/*`（尤其 `text/html`、`text/xml`）一律下载。
+ *
+ * 注意与 `proxyAttachment` 里的 `text/html → octet-stream` 降级配套：那道防线仍然在。
+ */
+export function isInlinePreviewType(contentType: string): boolean {
+  const t = (contentType || '').toLowerCase().split(';')[0].trim();
+  if (!t) return false;
+  if (t === 'image/svg+xml') return false;
+  if (t.startsWith('image/') || t.startsWith('video/') || t.startsWith('audio/')) return true;
+  if (t === 'application/pdf') return true;
+  return t === 'text/plain' || t === 'text/csv' || t === 'text/markdown' || t === 'application/json';
+}
+
+/**
+ * 附件代理。
+ *
+ * `opts.forceDownload` 对应 `?dl=1`：无论类型一律 `Content-Disposition: attachment`
+ * —— 前端每个附件都配了独立「下载」按钮，走的就是这个参数；不带参数时按
+ * `isInlinePreviewType()` 决定内联（可预览）还是下载。
+ */
+export async function proxyAttachment(
+  env: Env,
+  id: string,
+  opts: { forceDownload?: boolean } = {}
+): Promise<Response | null> {
   const row = await getAttachment(env, id);
   if (!row) return null;
   const obj = await env.BUCKET.get(row.r2_key);
@@ -629,8 +749,8 @@ export async function proxyAttachment(env: Env, id: string): Promise<Response | 
   const type = row.content_type && !row.content_type.startsWith('text/html')
     ? row.content_type
     : 'application/octet-stream';
-  // 内联图片允许预览；其余一律下载，防止把用户上传内容当页面打开。
-  const inline = type.startsWith('image/');
+  // 可预览类型内联给浏览器渲染；其余（含 SVG / HTML）一律下载，防止把用户上传内容当页面打开。
+  const inline = !opts.forceDownload && isInlinePreviewType(type);
   const headers = new Headers();
   headers.set('Content-Type', type);
   headers.set('Content-Disposition', contentDisposition(inline ? 'inline' : 'attachment', row.filename));

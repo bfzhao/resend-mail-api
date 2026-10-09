@@ -95,6 +95,24 @@ function recipientList(email: ReceivedEmail, data: Record<string, unknown>): Ret
   return parseAddressList(data['to']);
 }
 
+/**
+ * 真实 `To:` 头。
+ *
+ * ⚠️ **不要用 `email.to` 当收件人**（踩过）：Resend 收信接口的 `to` 返回的是
+ * **投递地址（信封收件人）**，不是 `To:` 头。生产数据实测 —— 发件人
+ * zhanglili@notionmanager.com 发往 `To: lara@realmarketlabs.com`、`Cc: bingfeng@notionmanager.com`，
+ * 这封信在 bingfeng 的收件箱里落成 `email.to = ["bingfeng@notionmanager.com"]`、
+ * `email.cc = ["bingfeng@notionmanager.com"]`；真实 To 头只保留在 `headers.to` 里。
+ * 直接拿 `email.to` 当收件人 → 详情页「收件人」显示成用户自己。
+ *
+ * Resend 官方文档也印证了这个分工：收信事件的 `from` 只有裸地址，
+ * 显示名保存在 `headers.from` —— 即 `headers` 就是原始头表。
+ * 取不到 `headers.to` 时回退投递地址（行为不倒退）。
+ */
+function headerRecipientList(email: ReceivedEmail): ReturnType<typeof parseAddressList> {
+  return parseAddressList(headerValueMap(email.headers, 'to'));
+}
+
 function pickMailbox(email: ReceivedEmail, data: Record<string, unknown>): string {
   // 1) Resend 官方推荐：received_for 是本封邮件的实际投递地址
   const receivedFor = data['received_for'];
@@ -177,6 +195,9 @@ export async function handleInbound(request: Request, env: Env): Promise<Respons
   const refsRaw = headerValueMap(email.headers, 'References');
   const inReplyRaw = headerValueMap(email.headers, 'In-Reply-To');
   const mailbox = pickMailbox(email, data);
+  // 投递地址（信封收件人）—— Resend 的 `to`；真实 To 头走 headers.to（见 headerRecipientList 的说明）
+  const deliveredTo = recipientList(email, data).map((a) => a.email);
+  const headerTo = headerRecipientList(email).map((a) => a.email);
 
   const input: InboundInput = {
     rowId,
@@ -193,7 +214,8 @@ export async function handleInbound(request: Request, env: Env): Promise<Respons
     mailbox,
     fromName,
     fromEmail,
-    to: recipientList(email, data).map((a) => a.email),
+    to: headerTo.length ? headerTo : deliveredTo,
+    deliveredTo,
     cc: parseAddressList(email.cc ?? data['cc']).map((a) => a.email),
     bcc: parseAddressList(email.bcc ?? data['bcc']).map((a) => a.email),
     replyTo: parseAddressList(email.reply_to ?? []).map((a) => a.email),

@@ -72,7 +72,14 @@
 
   <div id="modal-mask" class="hidden">
     <div id="composer" role="dialog" aria-label="写信">
-      <div id="composer-title">写信</div>
+      <!-- 标题行兼拖动条：桌面端按住这里可以随意移动弹窗（移动端全屏，拖动被禁用） -->
+      <div id="composer-head">
+        <span class="composer-grip" aria-hidden="true">⠿</span>
+        <div id="composer-title">写信</div>
+        <span class="composer-head-gap"></span>
+        <button id="composer-fit" class="composer-tool" type="button" title="恢复默认大小与位置" aria-label="恢复默认大小与位置">⟲</button>
+        <button id="composer-max" class="composer-tool" type="button" title="最大化" aria-label="最大化">⤢</button>
+      </div>
       <div class="composer-row">
         <label class="grow">收件人 <input id="f-to" type="text" placeholder="name@example.com，多个用逗号分隔" autocomplete="off" /></label>
       </div>
@@ -139,6 +146,8 @@
       </div>
       <!-- 收件人联想下拉：由 app.js 定位到当前正在输入的收件人字段下方 -->
       <div id="addr-suggest" class="addr-suggest hidden" role="listbox"></div>
+      <!-- 右下角缩放把手：只在弹窗浮动时显示，位置由 app.js 算出来（fixed 定位，不随内容滚动） -->
+      <div id="composer-resize" class="composer-resize hidden" title="拖动调整大小" aria-hidden="true"></div>
     </div>
   </div>
 
@@ -149,6 +158,19 @@
         <button id="confirm-cancel" class="btn btn-primary" type="button">继续编辑</button>
         <button id="confirm-ok" class="btn btn-danger" type="button">放弃</button>
       </div>
+    </div>
+  </div>
+
+  <!-- 附件预览浮层：点附件名打开；图片/PDF/视频/音频/纯文本内嵌，其余提示改用下载 -->
+  <div id="att-preview" class="hidden" role="dialog" aria-modal="true" aria-label="附件预览">
+    <div class="att-preview-box">
+      <div class="att-preview-head">
+        <span id="att-preview-name" class="nm"></span>
+        <span class="gap"></span>
+        <a id="att-preview-dl" class="btn att-preview-dl" download>下载</a>
+        <button id="att-preview-close" class="btn" type="button">关闭</button>
+      </div>
+      <div id="att-preview-body" class="att-preview-body"></div>
     </div>
   </div>
 
