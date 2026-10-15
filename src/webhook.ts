@@ -1,5 +1,5 @@
 import type { Env } from './types';
-import { json, nowSec, parseAddress, parseAddressList, headerValueMap, stripAngle, stripHtml, uuid, rootThreadId } from './util';
+import { json, nowSec, parseAddress, parseAddressList, headerValueMap, stripAngle, stripHtml, uuid, rootThreadId, parseReferences } from './util';
 import { Resend } from 'resend';
 import { saveInbound, findInboundByResendId } from './repo';
 import type { InboundInput } from './repo';
@@ -126,6 +126,12 @@ function pickMailbox(email: ReceivedEmail, data: Record<string, unknown>): strin
   return '';
 }
 
+/** 取头部里第一个 Message-ID（已去尖括号）。头值可能是 JSON 数组文本，见 util.parseReferences。 */
+function firstRef(raw: string | null): string | null {
+  const first = parseReferences(raw)[0];
+  return first ? stripAngle(first) : null;
+}
+
 export async function handleInbound(request: Request, env: Env): Promise<Response> {
   if (!env.RESEND_WEBHOOK_SECRET) {
     return json({ error: 'webhook secret not configured (RESEND_WEBHOOK_SECRET)' }, 503);
@@ -203,7 +209,9 @@ export async function handleInbound(request: Request, env: Env): Promise<Respons
     rowId,
     resendId: emailId,
     messageId: stripAngle(rawMessageId),
-    inReplyTo: inReplyRaw ? stripAngle(inReplyRaw) : null,
+    // In-Reply-To 同样是「JSON 数组文本」形态（见 util.parseReferences），
+    // 直接 stripAngle 只会去掉外层尖括号、留下 `["...` 残留。
+    inReplyTo: firstRef(inReplyRaw),
     references: refsRaw ?? null,
     threadId: rootThreadId({
       references: refsRaw,

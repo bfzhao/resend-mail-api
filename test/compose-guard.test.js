@@ -1,7 +1,11 @@
 'use strict';
 
 /* =========================================================
- * 写信弹窗「放弃确认」回归测试（零依赖，node test/compose-guard.test.js）
+ * 写信弹窗「关窗守卫」回归测试（零依赖，node test/compose-guard.test.js）
+ *
+ * 语义已于本轮从「弹『是否放弃』确认框」改为「自动存草稿后直接关闭」。
+ * 本套件因此同时守两件事：① 关窗必须落草稿（PUT 到打开时那个 draftId）；
+ * ② 确认框在任何路径下都不得出现。
  *
  * 项目前端是无构建的原生 SPA，没有 npm 测试框架。这里用 Node 内置的 vm
  * 模块把 public/app.js 中写信相关的代码原样抽取出来执行，配合一个极简
@@ -264,6 +268,13 @@ function deferApi() {
   return { resolve: resolveFn, reject: rejectFn };
 }
 
+/**
+ * 等一轮微任务 + 宏任务。
+ * 关窗保存草稿是**同步关窗、异步落盘**（点击要立刻见效，不能等网络往返），
+ * 所以断言「发出了哪个请求」必须等异步那一段跑完。
+ */
+const tick = () => new Promise((r) => setTimeout(r, 0));
+
 /* ---------------- 用例 ---------------- */
 
 async function main() {
@@ -326,72 +337,80 @@ async function main() {
   ok(el('#f-body').value === 'hello', '来回切换未丢内容');
   ok(S.isComposerDirty() === true, '来回切换后仍脏');
 
-  console.log('\n[5] 有内容时：遮罩/取消/Esc 三个入口都弹确认、且都不关闭');
+  console.log('\n[5] 有内容时：遮罩/取消/Esc 三个入口都「存草稿并关闭」');
   for (const [label, act] of [
     ['遮罩空白区', clickMask],
     ['取消按钮', () => fire('#composer-cancel', 'click', {})],
     ['Esc', pressEsc],
   ]) {
     reset();
+    const draftId = st.composing.draftId;
+    let putUrl = '';
+    let putBody = null;
+    S.__apiImpl = (url, opts) => {
+      putUrl = url;
+      putBody = JSON.parse(opts.body);
+      return Promise.resolve({ ok: true });
+    };
     el('#f-subject').value = '草稿';
     act();
-    ok(confirmShown() === true, `${label} -> 弹出确认框`);
-    ok(composerOpen() === true, `${label} -> 写信弹窗仍打开`);
-    ok(st.composing !== null && el('#f-subject').value === '草稿', `${label} -> 内容保留`);
-    ok(T.pending === true, `${label} -> pending=true`);
+    ok(composerOpen() === false, `${label} -> 弹窗关闭`);
+    ok(confirmShown() === false, `${label} -> 不再弹放弃确认框`);
+    ok(st.composing === null, `${label} -> 状态已清理`);
+    ok(lastToast() === '已存入草稿', `${label} -> 提示已存入草稿`);
+    await tick();
+    ok(putUrl === `/api/drafts/${draftId}`, `${label} -> PUT 到打开时生成的那个草稿 id`);
+    ok(putBody !== null && putBody.subject === '草稿', `${label} -> 内容随请求提交`);
   }
 
-  console.log('\n[6] 防重入：确认框已弹出时重复触发');
+  console.log('\n[6] 关窗后重复触发无副作用（state.composing 已清）');
   reset();
   el('#f-subject').value = '草稿';
   clickMask();
-  ok(T.pending === true, '首次触发后 pending=true');
+  ok(composerOpen() === false, '首次触发即关闭');
   clickMask();
   pressEsc();
   pressEsc();
-  ok(confirmShown() === true, '重复触发后确认框仍显示');
-  ok(composerOpen() === true, '重复触发后写信弹窗未被关闭');
-  ok(st.composing !== null, '重复触发后内容未丢失');
+  ok(composerOpen() === false, '重复触发后仍是关闭态');
+  ok(st.composing === null, '状态保持已清理');
+  ok(confirmShown() === false, '全程不弹确认框');
 
-  console.log('\n[7] 点确认框自身不算「点击外部」');
+  console.log('\n[7] 草稿 id：每次打开写信都换新的（不会覆盖上一封）');
   reset();
-  el('#f-subject').value = '草稿';
-  S.requestCloseComposer();
-  const box = new El('#confirm-box');
-  fire('#confirm-mask', 'click', { target: box, currentTarget: confirmMask });
-  ok(confirmShown() === true, '点确认框内部 -> 确认框不关闭');
-  ok(st.composing !== null, '内容未丢失');
-  fire('#confirm-mask', 'click', { target: confirmMask, currentTarget: confirmMask });
-  ok(confirmShown() === false, '点确认框外空白 -> 收起确认框');
-  ok(composerOpen() === true, '写信弹窗仍打开');
+  const draftIdA = st.composing.draftId;
+  ok(typeof draftIdA === 'string' && draftIdA.length > 0, '打开弹窗即生成草稿 id');
+  reset();
+  ok(st.composing.draftId !== draftIdA, '再次打开写信 -> 新的草稿 id');
+  resetReply();
+  ok(st.composing.draftId !== draftIdA && typeof st.composing.draftId === 'string', '回复弹窗也有独立草稿 id');
 
-  console.log('\n[8] 「继续编辑」-> 保留内容 + 焦点归还');
+  console.log('\n[8] 关窗提交的草稿内容与表单一致');
   reset();
-  el('#f-to').value = 'a@b.com';
+  let body8 = null;
+  S.__apiImpl = (url, opts) => { body8 = JSON.parse(opts.body); return Promise.resolve({}); };
+  el('#f-to').value = 'a@b.com, c@d.com';
+  el('#f-subject').value = '主题8';
   el('#f-body').value = 'draft body';
-  const toEl = el('#f-to');
-  fire('#composer', 'focusin', { target: toEl });
-  const focusBefore = toEl.focused; // openComposer 已聚焦过一次
   S.requestCloseComposer();
-  ok(confirmShown() === true, '弹出确认框');
-  fire('#confirm-cancel', 'click', {});
-  ok(confirmShown() === false, '确认框收起');
-  ok(composerOpen() === true, '写信弹窗保留');
-  ok(st.composing !== null && el('#f-body').value === 'draft body', '内容完整保留');
-  ok(T.pending === false, 'pending 已复位');
-  ok(toEl.focused === focusBefore + 1, '焦点回到原编辑元素');
-  S.requestCloseComposer();
-  ok(confirmShown() === true, '再次请求关闭 -> 重新弹出确认框（防重入未卡死）');
+  await tick();
+  ok(body8 !== null && body8.subject === '主题8', '主题已提交');
+  ok(body8 !== null && body8.body === 'draft body', '正文已提交');
+  ok(body8 !== null && body8.to === 'a@b.com, c@d.com', '收件人原样提交（切分口径归服务端）');
+  ok(body8 !== null && body8.rich === false, '标记为非富文本');
+  ok(body8 !== null && body8.mode === 'compose', '记录模式（供恢复时选标题与按钮）');
+  ok(composerOpen() === false, '弹窗已关闭');
 
-  console.log('\n[9] 「放弃」-> 真正关闭并丢弃');
+  console.log('\n[9] 空表单关窗：不写草稿（草稿箱里不留空条目）');
   reset();
-  el('#f-to').value = 'a@b.com';
+  let calls9 = 0;
+  S.__apiImpl = () => { calls9++; return Promise.resolve({}); };
   S.requestCloseComposer();
-  fire('#confirm-ok', 'click', {});
-  ok(confirmShown() === false, '确认框收起');
-  ok(composerOpen() === false, '写信弹窗关闭');
-  ok(st.composing === null, '内容已丢弃');
-  ok(T.pending === false, 'pending 已复位（无残留状态）');
+  await tick();
+  ok(calls9 === 0, '空表单 -> 不发任何请求');
+  ok(composerOpen() === false, '弹窗已关闭');
+  ok(confirmShown() === false, '不弹确认框');
+  ok(st.composing === null, '状态已清理');
+  ok(T.pending === false, 'pending 无残留状态');
 
   console.log('\n[10] 发送成功路径：直接关闭、不弹确认');
   reset();
@@ -423,15 +442,18 @@ async function main() {
   ok(st.composing !== null && el('#f-body').value === 'body', '内容保留');
   ok(lastToast().includes('发送失败'), '提示发送失败');
 
-  console.log('\n[12] Esc：确认框打开时优先收起确认框');
+  console.log('\n[12] Esc：直接关窗并落草稿');
   reset();
+  const id12 = st.composing.draftId;
+  let url12 = '';
+  S.__apiImpl = (url) => { url12 = url; return Promise.resolve({}); };
   el('#f-subject').value = '草稿';
-  S.requestCloseComposer();
-  ok(confirmShown() === true, '先弹出确认框');
   pressEsc();
-  ok(confirmShown() === false, 'Esc 收起确认框');
-  ok(composerOpen() === true, '写信弹窗未关闭');
-  ok(st.composing !== null, '内容保留');
+  ok(composerOpen() === false, 'Esc -> 弹窗关闭');
+  ok(confirmShown() === false, '不再弹确认框');
+  ok(st.composing === null, '状态已清理');
+  await tick();
+  ok(url12 === `/api/drafts/${id12}`, 'Esc 关闭同样落盘草稿');
 
   console.log('\n[13] Esc：输入框内按 Esc 同样生效（不被 isTypingTarget 吞掉）');
   reset();
@@ -442,7 +464,7 @@ async function main() {
     target: el('#f-subject'),
     preventDefault: () => (prevented = true),
   });
-  ok(confirmShown() === true, '在输入框内按 Esc -> 弹确认框');
+  ok(composerOpen() === false, '在输入框内按 Esc -> 关闭弹窗');
   ok(prevented === true, '已 preventDefault');
 
   console.log('\n[14] 遮罩 handler 只在 target===currentTarget 时触发');
@@ -453,14 +475,14 @@ async function main() {
   ok(confirmShown() === false, '点弹窗内部 -> 不弹确认框');
   ok(composerOpen() === true, '点弹窗内部 -> 不关闭');
 
-  console.log('\n[15] 打开写信/回复时重置确认状态');
+  console.log('\n[15] 打开写信/回复时重置状态');
   reset();
   el('#f-subject').value = 'x';
   S.requestCloseComposer();
-  ok(confirmShown() === true, '先制造残留确认框');
   reset();
-  ok(confirmShown() === false, '重新 openComposer 后确认框隐藏');
+  ok(confirmShown() === false, '重新 openComposer 后确认框保持隐藏');
   ok(T.pending === false, '重新 openComposer 后 pending=false');
+  ok(st.composing !== null && typeof st.composing.draftId === 'string', '新弹窗带独立草稿 id');
 
   console.log('\n[16] 回复模式：预填的收件人/主题不算用户输入');
   resetReply();
@@ -472,15 +494,19 @@ async function main() {
   ok(composerOpen() === false, '刚打开就点外部 -> 直接关闭，不弹确认');
   ok(confirmShown() === false, '未弹确认框');
 
-  console.log('\n[17] 回复模式：点「引用原文」后算脏');
+  console.log('\n[17] 回复模式：点「引用原文」后关窗 -> 引用内容随草稿保存');
   resetReply();
   S.insertQuote(); // 真实函数，改写 #f-body.value
   ok(el('#f-body').value.length > 0, '引用原文已写入正文');
   ok(S.isComposerDirty() === true, '点引用原文 -> 脏');
+  let body17 = null;
+  S.__apiImpl = (url, opts) => { body17 = JSON.parse(opts.body); return Promise.resolve({}); };
   S.requestCloseComposer();
-  ok(confirmShown() === true, '点引用原文后点外部 -> 弹确认');
-  ok(composerOpen() === true, '弹窗未关闭');
-  ok(st.composing !== null && el('#f-body').value.includes('原文第一行'), '引用内容保留');
+  await tick();
+  ok(body17 !== null && body17.body.includes('原文第一行'), '引用内容随草稿保存');
+  ok(body17 !== null && body17.mode === 'reply', '草稿记录了「回复」模式');
+  ok(composerOpen() === false, '弹窗已关闭');
+  ok(confirmShown() === false, '不弹确认框');
 
   console.log('\n[18] 回复模式：手动删掉预填收件人也算脏');
   resetReply();
@@ -540,9 +566,10 @@ async function main() {
   ok(composerOpen() === true, '发送失败后弹窗仍在（内容未丢失）');
   ok(st.composing !== null && el('#f-body').value === 'body', '发送失败后内容完整保留');
   ok(T.sendInFlight === false, 'sendInFlight 已复位');
-  // 失败后应恢复正常的放弃确认流程
+  // 失败后应恢复正常关闭流程（此时同样走「存草稿」）
   S.requestCloseComposer();
-  ok(confirmShown() === true, '失败后再次请求关闭 -> 正常弹出放弃确认');
+  ok(composerOpen() === false, '失败后再次请求关闭 -> 存草稿并关闭');
+  ok(confirmShown() === false, '不再弹放弃确认框');
 
   console.log('\n[22] Fix1：正文只认当前可见的编辑器（消除「假提示」）');
   reset();
@@ -580,18 +607,20 @@ async function main() {
   S.requestCloseComposer();
   ok(composerOpen() === false, '只敲空格后点外部 -> 直接关闭，不弹确认');
 
-  console.log('\n[24] Fix3：改「发件人」下拉 -> 脏（不再静默丢失）');
+  console.log('\n[24] Fix3：改「发件人」下拉 -> 脏，且新发件人随草稿保存');
   reset();
   const mbEl = el('#f-mailbox');
   ok(mbEl.value === 'me@example.com', '发件人已预选');
   ok(S.isComposerDirty() === false, '未改动 -> 不脏');
   mbEl.value = 'other@example.com';
+  el('#f-subject').value = 's24'; // 草稿要有实质内容才会落盘（只改发件人不算「有内容」）
   ok(S.isComposerDirty() === true, '改了发件人 -> 脏');
+  let body24 = null;
+  S.__apiImpl = (url, opts) => { body24 = JSON.parse(opts.body); return Promise.resolve({}); };
   S.requestCloseComposer();
-  ok(confirmShown() === true, '改发件人后点外部 -> 弹确认');
-  ok(composerOpen() === true, '弹窗未关闭');
-  mbEl.value = 'me@example.com';
-  ok(S.isComposerDirty() === false, '改回原值 -> 不脏');
+  await tick();
+  ok(body24 !== null && body24.mailbox === 'other@example.com', '草稿带上了新选的发件人');
+  ok(composerOpen() === false, '弹窗已关闭');
 
   console.log('\n[25] N1：富文本仅 &nbsp; -> 点发送应被拦下（修复前会发出空白邮件）');
   reset();

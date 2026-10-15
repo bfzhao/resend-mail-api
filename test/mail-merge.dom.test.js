@@ -395,15 +395,15 @@ async function test(name, fn) {
     ok(composerOpen(ctx) === false, '弹窗直接关闭');
     ok(composing(ctx) === null, 'state.composing 置空');
 
-    // 反向对照：勾选 + 输入收件人 -> 脏 -> 应弹确认
+    // 反向对照：勾选 + 输入收件人 -> 脏 -> 同样「存草稿并关闭」（本轮起不再弹确认）
     await openCompose(ctx);
     setChecked(ctx, '#f-merge', true);
     setValue(ctx, '#f-to', 'a@x.com');
     ok(isDirty(ctx) === true, '勾选 + 有收件人：判脏');
     clickMaskBlank(ctx);
     await ticks(ctx.win, 2);
-    ok(confirmShown(ctx) === true, '有输入时点遮罩 -> 弹出放弃确认');
-    ok(composerOpen(ctx) === true, '有输入时弹窗不直接关闭');
+    ok(confirmShown(ctx) === false, '有输入时点遮罩 -> 不弹放弃确认');
+    ok(composerOpen(ctx) === false, '有输入时点遮罩 -> 存草稿并关闭');
   });
 
   /* ---- T10 取消勾选也不算脏 ---- */

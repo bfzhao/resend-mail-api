@@ -111,7 +111,9 @@ async function boot(cfg = {}) {
   let ready = false;
   for (let i = 0; i < 400; i++) {
     const nav = win.document.querySelector('#folder-nav');
-    if (nav && nav.children.length === 4 && typeof win.setupComposerWindow === 'function') { ready = true; break; }
+    // 用 `> 0` 而不是写死项数：导航项数会随功能增删（本轮新增「草稿」就从 4 变 5），
+    // 写死会让 boot 静默超时，18 个用例一起报「init() 未在预期时间内完成」这种假故障。
+    if (nav && nav.children.length > 0 && typeof win.setupComposerWindow === 'function') { ready = true; break; }
     await tick(win);
   }
   if (!ready) throw new Error('init() 未在预期时间内完成（fetch 打桩或脚本注入失败）');

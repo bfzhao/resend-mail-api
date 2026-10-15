@@ -78,3 +78,23 @@ CREATE TABLE IF NOT EXISTS webhook_deliveries (
     id           TEXT PRIMARY KEY,                  -- svix 事件 id
     processed_at INTEGER NOT NULL
 );
+
+-- 草稿箱（写了一半的邮件）。独立成表的原因见 migrations/005_drafts.sql。
+-- 该表的列改动必须**同时**更新 005 迁移，保持「全量建库」与「增量升级」两条路径一致。
+CREATE TABLE IF NOT EXISTS drafts (
+    id          TEXT PRIMARY KEY,               -- uuid（前端生成，便于自动保存直接 upsert）
+    mailbox     TEXT NOT NULL DEFAULT '',
+    mode        TEXT NOT NULL DEFAULT 'new',    -- new | reply | forward
+    source_id   TEXT,
+    to_emails   TEXT NOT NULL DEFAULT '[]',
+    cc          TEXT,
+    bcc         TEXT,
+    subject     TEXT,
+    body_html   TEXT,
+    body_text   TEXT,
+    rich        INTEGER NOT NULL DEFAULT 0,
+    updated_at  INTEGER NOT NULL,
+    created_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_drafts_updated ON drafts(updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_drafts_mailbox ON drafts(mailbox, updated_at DESC);

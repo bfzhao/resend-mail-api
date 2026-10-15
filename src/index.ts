@@ -4,7 +4,7 @@ import { handleInbound, handleEvents } from './webhook';
 import * as repo from './repo';
 import { resendSend, replySubject, forwardSubject, textToHtml, senderIdentity } from './send';
 import type { ResendAttachment } from './send';
-import { json, jsonArr, nowSec, parseAddress, parseAddressList, rootThreadId, uuid, base64ToBytes, bytesToBase64, stripHtml } from './util';
+import { json, jsonArr, nowSec, parseAddress, parseAddressList, rootThreadId, isSaneThreadId, parseReferences, stripAngle, uuid, base64ToBytes, bytesToBase64, stripHtml } from './util';
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -49,6 +49,41 @@ async function routeApi(request: Request, env: Env, path: string, url: URL): Pro
     const offset = clampInt(url.searchParams.get('offset'), 0, 100000);
     const result = await repo.listFolder(env, { folder, q, unread, mailbox, limit, offset });
     return json({ folder, items: result.items, total: result.total, limit, offset });
+  }
+
+  // 草稿箱列表。草稿在独立表里（见 schema.sql 的 drafts 说明），
+  // 但**返回形状与其它文件夹完全一致**（伪装成一封 direction='draft' 的邮件），
+  // 前端因此能复用同一套列表渲染 / 缓存 / 分页 / 搜索逻辑。
+  if (path === '/api/folders/drafts' && method === 'GET') {
+    const q = url.searchParams.get('q') || null;
+    const mailbox = url.searchParams.get('mailbox') || undefined;
+    const limit = clampInt(url.searchParams.get('limit'), 50, 200);
+    const offset = clampInt(url.searchParams.get('offset'), 0, 100000);
+    const result = await repo.listDrafts(env, { q, mailbox, limit, offset });
+    return json({ folder: 'drafts', items: result.items, total: result.total, limit, offset });
+  }
+
+  // 单条草稿：GET 恢复编辑 / PUT 自动保存（upsert）/ DELETE 丢弃
+  const draftMatch = /^\/api\/drafts\/([^/]+)$/.exec(path);
+  if (draftMatch) {
+    const draftId = decodeURIComponent(draftMatch[1]);
+    if (method === 'GET') {
+      const d = await repo.getDraft(env, draftId);
+      if (!d) return json({ error: '草稿不存在' }, 404);
+      return json({ draft: draftJson(d) });
+    }
+    if (method === 'PUT') {
+      const body = await request.json().catch(() => null);
+      const input = parseDraftInput(draftId, body);
+      if (!input) return json({ error: '参数错误' }, 400);
+      await repo.upsertDraft(env, input);
+      return json({ ok: true, id: draftId });
+    }
+    if (method === 'DELETE') {
+      await repo.deleteDraft(env, draftId);
+      return json({ ok: true });
+    }
+    return json({ error: 'Method Not Allowed' }, 405);
   }
 
   // 侧边栏计数（可按 mailbox 过滤）
@@ -129,6 +164,63 @@ async function routeApi(request: Request, env: Env, path: string, url: URL): Pro
   }
 
   return json({ error: 'Not Found' }, 404);
+}
+
+/* ---------------- 草稿箱辅助 ---------------- */
+
+/** 草稿行 → 前端形状（收件人拆成数组、rich 转布尔、缺省字段补空串）。 */
+function draftJson(d: repo.DraftRow) {
+  return {
+    id: d.id,
+    mailbox: d.mailbox,
+    mode: d.mode,
+    source_id: d.source_id,
+    to: jsonArr(d.to_emails),
+    cc: jsonArr(d.cc),
+    bcc: jsonArr(d.bcc),
+    subject: d.subject || '',
+    body_html: d.body_html || '',
+    body_text: d.body_text || '',
+    rich: d.rich === 1,
+    updated_at: d.updated_at,
+  };
+}
+
+/**
+ * 解析自动保存的请求体。
+ *
+ * 收件人一律走 `normalizeRecipients` 的**同源切分**（逗号 / 分号 / 空白），
+ * 保证「草稿里存下的收件人」与「真正发出去时的收件人」逐字一致 ——
+ * 两套口径会让用户看到草稿里写着 3 个收件人、发出去却只有 2 个。
+ */
+function parseDraftInput(id: string, body: unknown): repo.DraftInput | null {
+  if (!body || typeof body !== 'object') return null;
+  const b = body as Record<string, unknown>;
+  const { to, cc, bcc } = normalizeRecipients(parseRecipient(b.to), parseRecipient(b.cc), parseRecipient(b.bcc));
+  const mode = b.mode === 'reply' || b.mode === 'forward' ? b.mode : 'new';
+  return {
+    id,
+    mailbox: typeof b.mailbox === 'string' ? b.mailbox.trim().toLowerCase() : '',
+    mode,
+    sourceId: typeof b.source_id === 'string' && b.source_id ? b.source_id : null,
+    to,
+    cc,
+    bcc,
+    subject: typeof b.subject === 'string' ? b.subject : '',
+    html: typeof b.html === 'string' ? b.html : '',
+    text: typeof b.body === 'string' ? b.body : '',
+    rich: b.rich === true,
+  };
+}
+
+/** 发信成功后丢弃对应草稿。失败**不影响**发送结果（草稿最多多留一条，用户可手动删）。 */
+async function dropDraft(env: Env, draftId: string | undefined | null): Promise<void> {
+  if (!draftId) return;
+  try {
+    await repo.deleteDraft(env, draftId);
+  } catch (err) {
+    console.error('deleteDraft failed:', err);
+  }
 }
 
 function clampInt(raw: string | null, def: number, max: number): number {
@@ -368,6 +460,8 @@ interface MergeInput {
   content: { text: string; html: string };
   attachments: ResendAttachment[];
   sender: { from: string; mailbox: string; fromName: string | null };
+  /** 全部发送成功后要丢弃的草稿 id。 */
+  draftId?: string;
 }
 
 /**
@@ -431,6 +525,10 @@ async function composeMerge(env: Env, input: MergeInput): Promise<Response> {
     sent.push({ to: addr, id: rowId, resend_id: resendId });
   }
 
+  // **全部成功**才丢弃草稿：部分成功时保留，用户可以从草稿箱重发失败的那几个
+  // （删了草稿又没全发出去，等于把内容丢了）。
+  if (failed.length === 0) await dropDraft(env, input.draftId);
+
   return json({
     ok: failed.length === 0,
     merge: true,
@@ -444,7 +542,7 @@ async function composeMerge(env: Env, input: MergeInput): Promise<Response> {
 
 async function compose(env: Env, request: Request): Promise<Response> {
   const body = (await request.json().catch(() => null)) as
-    | { to?: unknown; cc?: unknown; bcc?: unknown; subject?: unknown; body?: unknown; html?: unknown; mailbox?: unknown; attachments?: unknown; merge?: unknown }
+    | { to?: unknown; cc?: unknown; bcc?: unknown; subject?: unknown; body?: unknown; html?: unknown; mailbox?: unknown; attachments?: unknown; merge?: unknown; draft_id?: unknown }
     | null;
   if (!body) return json({ error: '参数错误' }, 400);
 
@@ -461,6 +559,8 @@ async function compose(env: Env, request: Request): Promise<Response> {
   if (attachments === null) return json({ error: '附件格式错误' }, 400);
 
   const sender = resolveSender(env, typeof body.mailbox === 'string' ? body.mailbox : undefined);
+  // 发信成功后要丢弃的草稿（前端自动保存时用的 id）
+  const draftId = typeof body.draft_id === 'string' ? body.draft_id : '';
 
   // 合并发送：每位收件人各发一封独立邮件（内容与主题不变）
   if (body.merge === true) {
@@ -474,7 +574,7 @@ async function compose(env: Env, request: Request): Promise<Response> {
       const why = attachments.length > 0 ? `（当前 ${attachments.length} 个附件）` : '';
       return json({ error: `单次合并发送最多 ${cap} 位收件人${why}` }, 400);
     }
-    return composeMerge(env, { recipients, cc, subject, content, attachments, sender });
+    return composeMerge(env, { recipients, cc, subject, content, attachments, sender, draftId });
   }
 
   const result = await resendSend(env, {
@@ -509,6 +609,7 @@ async function compose(env: Env, request: Request): Promise<Response> {
   await storeOutboundAttachments(env, rowId, attachments).catch((err) => {
     console.error('storeOutboundAttachments failed:', err);
   });
+  await dropDraft(env, draftId);
 
   return json({ ok: true, id: rowId, resend_id: result.id });
 }
@@ -521,7 +622,7 @@ async function reply(env: Env, request: Request, id: string): Promise<Response> 
   }
 
   const raw = (await request.json().catch(() => null)) as
-    | { to?: unknown; cc?: unknown; bcc?: unknown; body?: unknown; html?: unknown; attachments?: unknown; mailbox?: unknown }
+    | { to?: unknown; cc?: unknown; bcc?: unknown; body?: unknown; html?: unknown; attachments?: unknown; mailbox?: unknown; draft_id?: unknown }
     | null;
   const content = bodyFrom(raw || {});
   if (!content.text.trim() && !content.html.trim()) return json({ error: '回复内容为空' }, 400);
@@ -545,11 +646,14 @@ async function reply(env: Env, request: Request, id: string): Promise<Response> 
   if (attachments === null) return json({ error: '附件格式错误' }, 400);
 
   const origMessageId = original.message_id || original.id;
-  const newReferences = [original.references, `<${origMessageId}>`]
-    .filter((s): s is string => Boolean(s && s.trim()))
-    .map((s) => s.trim())
-    .join(' ')
-    .replace(/\s+/g, ' ');
+  // References 链 = 原邮件的 References + 原邮件的 Message-ID（去重）。
+  // ⚠️ 原邮件的 references 列存的是 Resend 给的 **JSON 数组文本**（见 util.parseReferences），
+  // 旧实现把它整段拼进头部发回 Resend，导致转义层级逐轮嵌套（生产实测已到四层），
+  // 且 thread_id 随之每轮漂移 —— 必须解析成规范的 `<id>` 列表再拼。
+  const refChain = parseReferences(original.references);
+  const seenRefs = new Set(refChain.map((x) => stripAngle(x)));
+  if (origMessageId && !seenRefs.has(origMessageId)) refChain.push(`<${origMessageId}>`);
+  const newReferences = refChain.join(' ');
 
   const subject = replySubject(original.subject);
   // 发件人：优先用户在「发件人」下拉里的选择（与 compose 完全同一口径），
@@ -575,12 +679,17 @@ async function reply(env: Env, request: Request, id: string): Promise<Response> 
   });
   if (!result.ok) return json({ error: result.error }, 400);
 
-  const threadId = rootThreadId({
+  // 会话归属：**优先继承原邮件（干净的）thread_id**。
+  // 只按 References 推导是不够的 —— 对方客户端若只发 In-Reply-To 不发 References，
+  // 推导出的根会退化成「原邮件的 message_id」，于是每往返一轮就新开一个会话，
+  // 表现为「来回好几次却只显示两封」。原 thread_id 畸形（历史数据）时才回退推导。
+  const derivedThread = rootThreadId({
     references: newReferences,
     inReplyTo: origMessageId,
     messageId: origMessageId,
     fallback: original.thread_id ?? uuid(),
   });
+  const threadId = isSaneThreadId(original.thread_id) ? String(original.thread_id) : derivedThread;
 
   const rowId = await repo.saveOutbound(env, {
     inReplyTo: origMessageId,
@@ -602,6 +711,7 @@ async function reply(env: Env, request: Request, id: string): Promise<Response> 
   await storeOutboundAttachments(env, rowId, attachments).catch((err) => {
     console.error('storeOutboundAttachments failed:', err);
   });
+  await dropDraft(env, typeof raw?.draft_id === 'string' ? raw.draft_id : '');
 
   return json({ ok: true, id: rowId, resend_id: result.id, original_id: original.id });
 }
@@ -653,6 +763,7 @@ async function forward(env: Env, request: Request, id: string): Promise<Response
         attachments?: unknown;
         mailbox?: unknown;
         include_original_attachments?: unknown;
+        draft_id?: unknown;
       }
     | null;
 
@@ -734,6 +845,7 @@ async function forward(env: Env, request: Request, id: string): Promise<Response
   await copyAttachmentsToMessage(env, rowId, sourceRows).catch((err) => {
     console.error('forward: copyAttachmentsToMessage failed:', err);
   });
+  await dropDraft(env, typeof raw?.draft_id === 'string' ? raw.draft_id : '');
 
   return json({
     ok: true,

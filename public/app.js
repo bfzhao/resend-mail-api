@@ -9,6 +9,7 @@
 
 const FOLDERS = [
   { key: 'inbox', label: '收件箱' },
+  { key: 'drafts', label: '草稿' },
   { key: 'starred', label: '已加星标' },
   { key: 'sent', label: '已发送' },
   { key: 'trash', label: '已删除' },
@@ -28,7 +29,10 @@ const CACHE_KEY = 'inbox-cache-v1';
 // v2：会话项新增 `copy_ids`、且顺序由升序改为降序（见 src/repo.ts listThread）。
 // 旧快照里的 thread 数组带着**旧顺序与重复行**，且 TTL 内不会重新校验，
 // 不升版会让「已经修好的会话面板」在刷新后仍显示旧结果（一次全量重拉换立即正确）。
-const CACHE_VERSION = 2;
+// v3：会话归组的根因修复（Resend 的 References 是 JSON 数组文本，旧解析产出畸形 thread_id）
+//     —— 旧快照里的 thread 数组是按错误分组拼出来的，必须整份作废；
+//     同时新增「草稿」文件夹，counts 多了 drafts_total 字段。
+const CACHE_VERSION = 3;
 const PERSIST_DEBOUNCE_MS = 300;
 
 /* 已打开邮件正文的内存 LRU：最多 40 封或合计 2MB，先到为准。 */
@@ -58,6 +62,7 @@ const STATUS_LABEL = {
   delivered: '已送达',
   bounced: '退信',
   failed: '失败',
+  draft: '草稿',
   delayed: '延迟',
   queued: '排队中',
   complaint: '投诉',
@@ -74,7 +79,7 @@ const state = {
   q: '',
   total: 0,
   offset: 0,
-  counts: { inbox_unread: 0, inbox_total: 0, sent_total: 0, starred_total: 0, trash_total: 0 },
+  counts: { inbox_unread: 0, inbox_total: 0, sent_total: 0, starred_total: 0, trash_total: 0, drafts_total: 0 },
   composing: null, // { mode, originalId, files:[], rich, original, mailbox }
   canSend: false,
   fromAddress: '',
@@ -84,6 +89,8 @@ const state = {
   contactsLoaded: false,
   openId: null,
   pendingOpenId: null, // 从本地缓存恢复、待列表就绪后重新打开的邮件 id
+  /** 用户拖动分隔条设定的列表宽度（px）。null = 未自定义，走 CSS 默认值与响应式夹取。 */
+  listWidth: null,
   loading: false,
   firstOpen: true,
   cache: {
@@ -162,6 +169,8 @@ function syncLayout() {
   // 桌面端则把几何重新夹进新视口。放在这里而不是另开一个 resize 监听，是为了让
   // 「断点切换」和「窗口缩放」共用同一个收敛点。
   syncComposerWindowLayout();
+  // 同理：列表宽度也要按新视口重新夹取（窗口缩小时不能把详情栏挤没）
+  syncListWidth();
 }
 
 function setDrawer(open) {
@@ -172,6 +181,145 @@ function setDrawer(open) {
 /** 收起抽屉。桌面端调用无副作用（drawerOpen 本来就是 false）。 */
 function closeDrawer() {
   if (drawerOpen) setDrawer(false);
+}
+
+/* ---------------- 列表 / 详情分隔条（可拖动） ----------------
+ * 桌面双栏下，用户拖动中间竖线调整列表宽度。
+ *
+ * 宽度只有一个真值来源：`state.listWidth`（**用户期望宽度**），
+ * 唯一出口是 `applyListWidth()`（写 CSS 变量 `--list-w` + 挂 `list-w-custom` 类）。
+ * 拖动 / 键盘 / 双击复位 / 窗口缩放全部收敛到这里，任何地方不许自己写 style.width。
+ *
+ * ⚠️ `state.listWidth` 存期望值而非夹取后的实际值：否则窗口缩小被夹一次、再放大就回不去了。
+ */
+
+const LIST_W_KEY = 'inbox-list-w';
+const LIST_W_DEFAULT = 430; // 与 app.css 里 :root 的 --list-w 初始值一致
+const LIST_W_MIN = 260; // 再窄主题与发件人都显示不全
+const LIST_W_MAX_RATIO = 0.7; // 最多占视口 70%，详情栏永远留得住
+
+/** 当前视口允许的最大列表宽度。 */
+function listWidthMax() {
+  return Math.max(LIST_W_MIN, Math.floor(viewportWidth() * LIST_W_MAX_RATIO));
+}
+
+function clampListWidth(px) {
+  const n = Math.round(Number(px));
+  if (!Number.isFinite(n)) return LIST_W_DEFAULT;
+  return Math.min(listWidthMax(), Math.max(LIST_W_MIN, n));
+}
+
+/** `px == null` → 恢复默认（清掉自定义类与内联变量，回到 CSS 的 430px + 响应式夹取）。 */
+function applyListWidth(px) {
+  const app = $('#app');
+  if (!app) return;
+  if (px == null) {
+    state.listWidth = null;
+    app.classList.remove('list-w-custom');
+    document.documentElement.style.removeProperty('--list-w');
+    return;
+  }
+  state.listWidth = Math.round(Number(px)) || LIST_W_DEFAULT;
+  document.documentElement.style.setProperty('--list-w', `${clampListWidth(state.listWidth)}px`);
+  app.classList.add('list-w-custom');
+}
+
+/** 视口变化后重新夹取（保留期望值，不把「临时夹小」写回 state）。 */
+function syncListWidth() {
+  if (state.listWidth == null) return;
+  applyListWidth(state.listWidth);
+}
+
+function loadListWidth() {
+  try {
+    const raw = localStorage.getItem(LIST_W_KEY);
+    if (raw == null) return null;
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveListWidth() {
+  try {
+    if (state.listWidth == null) localStorage.removeItem(LIST_W_KEY);
+    else localStorage.setItem(LIST_W_KEY, String(state.listWidth));
+  } catch {
+    /* 存储不可用（隐私模式 / 配额满）：本次会话内仍然生效 */
+  }
+}
+
+/** 列表当前实际宽度，作为键盘步进的基准。 */
+function currentListWidth() {
+  const pane = $('#list-pane');
+  const w = pane && typeof pane.getBoundingClientRect === 'function' ? pane.getBoundingClientRect().width : 0;
+  return w > 0 ? w : (state.listWidth ?? LIST_W_DEFAULT);
+}
+
+let splitDrag = null;
+
+function onSplitterDown(e) {
+  if (isMobile()) return;
+  if (e.button != null && e.button !== 0) return;
+  const sp = $('#splitter');
+  if (!sp) return;
+  // 双击复位：连击时 pointerdown 的 detail 递增（第二次为 2）。
+  // 不用 dblclick，是因为下面的 preventDefault 会干扰 click 序列。
+  if (e.detail >= 2) {
+    applyListWidth(LIST_W_DEFAULT);
+    saveListWidth();
+    e.preventDefault();
+    return;
+  }
+  splitDrag = { x: e.clientX, start: currentListWidth(), id: e.pointerId };
+  const app = $('#app');
+  if (app) app.classList.add('resizing');
+  // 指针捕获：拖动时即使掠过详情区也能持续收到 move/up
+  if (e.pointerId != null && typeof sp.setPointerCapture === 'function') {
+    try {
+      sp.setPointerCapture(e.pointerId);
+    } catch {
+      /* 捕获不可用则退化成普通事件流，功能不受影响 */
+    }
+  }
+  e.preventDefault();
+}
+
+function onSplitterMove(e) {
+  if (!splitDrag) return;
+  if (splitDrag.id != null && e.pointerId != null && e.pointerId !== splitDrag.id) return;
+  applyListWidth(splitDrag.start + (e.clientX - splitDrag.x));
+}
+
+function onSplitterUp(e) {
+  if (!splitDrag) return;
+  if (splitDrag.id != null && e.pointerId != null && e.pointerId !== splitDrag.id) return;
+  splitDrag = null;
+  const app = $('#app');
+  if (app) app.classList.remove('resizing');
+  saveListWidth();
+}
+
+/** 键盘调整（分隔条可聚焦）：← → 步进，Shift 加速，Home 复位。 */
+function onSplitterKey(e) {
+  const step = e.shiftKey ? 50 : 16;
+  if (e.key === 'ArrowLeft') applyListWidth(currentListWidth() - step);
+  else if (e.key === 'ArrowRight') applyListWidth(currentListWidth() + step);
+  else if (e.key === 'Home') applyListWidth(LIST_W_DEFAULT);
+  else return;
+  saveListWidth();
+  e.preventDefault();
+}
+
+function setupSplitter() {
+  const sp = $('#splitter');
+  if (!sp) return;
+  sp.addEventListener('pointerdown', onSplitterDown);
+  sp.addEventListener('pointermove', onSplitterMove);
+  sp.addEventListener('pointerup', onSplitterUp);
+  sp.addEventListener('pointercancel', onSplitterUp);
+  sp.addEventListener('keydown', onSplitterKey);
 }
 
 /* ---------------- API ---------------- */
@@ -516,8 +664,29 @@ function showToast(msg, isError = false) {
   toastTimer = setTimeout(() => el.classList.add('hidden'), 4000);
 }
 
+/**
+ * 把「可能是已解析数组、也可能是库里存的 JSON 文本」的字段统一成数组。
+ *
+ * ⚠️ **两个接口的形态不一样，两种都必须吃得下**：
+ *  - 列表接口 `/api/folders/*` 直接把库列 `to_emails` / `cc` / `bcc` 原样返回 ——
+ *    它们是 **JSON 文本**（`'["a@x.com"]'`）；
+ *  - 详情 / 会话接口返回的是**已解析数组**。
+ *
+ * 旧实现只认数组（`Array.isArray(v) ? v : []`），于是列表里的收件人恒为空 ——
+ * 实测确认：出站行与草稿行全部显示成「致 (未知)」「(无收件人)」。
+ * 这里与 `src/util.ts` 的 jsonArr 保持同一口径（能解析就用，解析不出来当空数组）。
+ */
 function jsonArr(v) {
-  return Array.isArray(v) ? v : [];
+  if (Array.isArray(v)) return v;
+  if (typeof v === 'string' && v.trim()) {
+    try {
+      const parsed = JSON.parse(v);
+      return Array.isArray(parsed) ? parsed.map(String) : [];
+    } catch {
+      return [];
+    }
+  }
+  return [];
 }
 
 function timeLong(sec) {
@@ -683,15 +852,34 @@ function renderNav() {
     label.textContent = f.label;
     btn.appendChild(label);
 
-    if (f.key === 'inbox' && state.counts.inbox_unread > 0) {
+    // 收件箱徽标 = 未读数；草稿徽标 = 草稿条数（草稿没有「未读」语义，两个口径不混用）
+    const badgeN = f.key === 'inbox'
+      ? Number(state.counts.inbox_unread) || 0
+      : f.key === 'drafts'
+        ? Number(state.counts.drafts_total) || 0
+        : 0;
+    if (badgeN > 0) {
       const badge = document.createElement('span');
       badge.className = 'folder-badge';
-      badge.textContent = state.counts.inbox_unread > 999 ? '999+' : String(state.counts.inbox_unread);
+      badge.textContent = badgeN > 999 ? '999+' : String(badgeN);
       btn.appendChild(badge);
     }
     btn.addEventListener('click', () => openFolder(f.key));
     nav.appendChild(btn);
   }
+  renderTitle();
+}
+
+/**
+ * 浏览器标签标题：有新邮件时显示「(N) 收件箱」，没有未读时回退纯「收件箱」。
+ *
+ * 数据源与侧边栏徽标**同一个** `state.counts.inbox_unread`，且由 `renderNav()` 统一驱动 ——
+ * 计数变化只有这一处落地，标题不会和徽标各说各话（也不会在切文件夹时被覆盖回默认值）。
+ * 超过 999 与徽标同口径截断，避免标题被撑爆。
+ */
+function renderTitle() {
+  const n = Number(state.counts.inbox_unread) || 0;
+  document.title = n > 0 ? `(${n > 999 ? '999+' : n}) 收件箱` : '收件箱';
 }
 
 function countQuery() {
@@ -940,34 +1128,43 @@ async function toggleStar(item, btn) {
 }
 
 function itemRow(item) {
+  // 草稿与普通邮件共用同一套列表结构（服务端把草稿也返回成同形状的行，direction='draft'），
+  // 只有三处分叉：勾选框（草稿没有批量操作语义）、发件人位显示收件人、点开是写信弹窗。
+  const isDraft = item.direction === 'draft';
+  // thread_unread 为后端聚合字段；旧缓存/旧 fixture 里可能不存在，回退到单行的 read 状态。
+  const threadUnread = item.thread_unread !== undefined ? item.thread_unread : (item.read ? 0 : 1);
+  const hasUnread = threadUnread > 0;
   const row = document.createElement('div');
-  row.className = 'list-item' + (item.read ? '' : ' unread') + (item.id === state.openId ? ' active' : '');
+  row.className = 'list-item' + (hasUnread ? ' unread' : '') + (item.id === state.openId ? ' active' : '');
   row.dataset.id = item.id;
 
-  const chk = document.createElement('input');
-  chk.type = 'checkbox';
-  chk.className = 'li-check';
-  chk.checked = state.selected.has(item.id);
-  chk.addEventListener('click', (ev) => ev.stopPropagation());
-  chk.addEventListener('change', () => {
-    if (chk.checked) state.selected.add(item.id);
-    else state.selected.delete(item.id);
-    renderSelectBar();
-  });
-  row.appendChild(chk);
+  if (!isDraft) {
+    const chk = document.createElement('input');
+    chk.type = 'checkbox';
+    chk.className = 'li-check';
+    chk.checked = state.selected.has(item.id);
+    chk.addEventListener('click', (ev) => ev.stopPropagation());
+    chk.addEventListener('change', () => {
+      if (chk.checked) state.selected.add(item.id);
+      else state.selected.delete(item.id);
+      renderSelectBar();
+    });
+    row.appendChild(chk);
+  }
 
   const main = document.createElement('div');
   main.className = 'li-main';
   const av = document.createElement('span');
   av.className = 'li-avatar';
-  av.textContent = avatarChar(item);
+  av.textContent = isDraft ? '稿' : avatarChar(item);
   main.appendChild(av);
   const sender = document.createElement('span');
   sender.className = 'li-sender';
-  if (item.direction === 'inbound') sender.textContent = senderLabel(item);
+  if (isDraft) sender.textContent = recipientsLabel(item.to_emails) || '(无收件人)';
+  else if (item.direction === 'inbound') sender.textContent = senderLabel(item);
   else sender.textContent = `致 ${recipientsLabel(item.to_emails) || '(未知)'}`;
   main.appendChild(sender);
-  if (item.direction === 'outbound') {
+  if (item.direction === 'outbound' || isDraft) {
     const chip = document.createElement('span');
     chip.className = 'li-status ' + esc(item.status || 'sent');
     chip.textContent = STATUS_LABEL[item.status] || item.status || 'sent';
@@ -981,6 +1178,13 @@ function itemRow(item) {
   subject.className = 'li-subject';
   subject.textContent = item.subject || '(无主题)';
   sub.appendChild(subject);
+  const tc = item.thread_count || 1;
+  if (tc > 1) {
+    const badge = document.createElement('span');
+    badge.className = 'li-thread-badge';
+    badge.textContent = String(tc);
+    sub.appendChild(badge);
+  }
   if (item.attachments_count > 0) {
     const af = document.createElement('span');
     af.className = 'li-attach';
@@ -1003,11 +1207,42 @@ function itemRow(item) {
 
   const starWrap = document.createElement('span');
   starWrap.className = 'li-star';
-  starWrap.appendChild(starBtn(item));
+  if (isDraft) {
+    // 草稿没有「星标」概念，这个位置改放删除按钮（省得为草稿单独开一套行内操作）
+    const del = document.createElement('button');
+    del.type = 'button';
+    del.className = 'star-btn draft-del';
+    del.title = '删除草稿';
+    del.textContent = '×';
+    del.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      void deleteDraftItem(item.id);
+    });
+    starWrap.appendChild(del);
+  } else {
+    starWrap.appendChild(starBtn(item));
+  }
   row.appendChild(starWrap);
 
-  row.addEventListener('click', () => void openMessage(item.id));
+  row.addEventListener('click', () => {
+    if (isDraft) void openDraftComposer(item.id);
+    else void openMessage(item.id);
+  });
   return row;
+}
+
+/** 删除一条草稿（列表上的 × 按钮）。 */
+async function deleteDraftItem(id) {
+  try {
+    await api(`/api/drafts/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    state.cache.folders.clear(); // 草稿列表与侧边栏计数都变了
+    state.cache.countsAt = 0;
+    void refreshCounts();
+    void loadFolder(false, true);
+    showToast('草稿已删除');
+  } catch (e) {
+    showToast(e.message, true);
+  }
 }
 
 /**
@@ -2257,9 +2492,20 @@ function openComposerShell(opts) {
   const {
     mode, title, to = '', cc = '', bcc = '', subject = '', body = '',
     original = null, originalId = null, mailbox, showMerge, showQuote, focus,
+    draftId = null, bodyHtml = '', rich = false,
   } = opts;
 
-  state.composing = { mode, originalId, files: [], rich: false, original, mailbox };
+  // 草稿 id 在这里就定下来（新建或恢复草稿）：自动保存走 upsert，不必「先创建再拿 id」。
+  state.composing = {
+    mode,
+    originalId,
+    files: [],
+    rich: rich === true,
+    original,
+    mailbox,
+    draftId: draftId || newDraftId(),
+  };
+  draftEverSaved = Boolean(draftId); // 从草稿箱恢复的，服务端本来就有这份记录
 
   $('#composer-title').textContent = title;
   $('#f-to').value = to;
@@ -2267,7 +2513,7 @@ function openComposerShell(opts) {
   $('#f-bcc').value = bcc;
   $('#f-subject').value = subject;
   $('#f-body').value = body;
-  $('#f-body-rich').innerHTML = '';
+  $('#f-body-rich').innerHTML = bodyHtml;
   $('#f-attach-list').innerHTML = '';
   setRecipientsExpanded(Boolean(cc || bcc));
   $('#f-quote').classList.toggle('hidden', !showQuote);
@@ -2382,7 +2628,207 @@ function forwardQuoteText(m) {
   return `${head}\n${body || '(无内容)'}\n`;
 }
 
-/* 关闭写信弹窗的「放弃确认」守卫 */
+/* ---------------- 草稿：自动保存 ----------------
+ * 需求：写了一半的邮件自动进草稿箱，关闭弹窗不再弹「是否放弃」。
+ *
+ * 草稿 id 在**打开弹窗时**就生成（`newDraftId()`），保存走 PUT upsert ——
+ * 这样自动保存不需要「先创建拿到 id」的往返，也不会因为第一次保存失败而丢掉后续。
+ *
+ * 唯一真值：`state.composing.draftId`。所有保存/删除都经 `flushDraft()` 这一个出口。
+ * ⚠️ 附件不随草稿持久化（见交付说明）：内存里的 base64 太大，落库会撑爆 D1 单行上限。
+ *    恢复草稿时附件需要重新添加，弹窗里会给一句提示。
+ */
+
+const DRAFT_SAVE_DEBOUNCE_MS = 1200;
+
+let draftSaveTimer = null;
+/**
+ * 当前这封草稿是否**已经写进过服务端**。
+ * 决定「空表单关窗」要不要发 DELETE —— 从没存过的新弹窗直接不发请求，
+ * 免得每次打开又关掉都在服务端留一次无意义的往返。
+ */
+let draftEverSaved = false;
+
+/** 新草稿 id。优先 crypto.randomUUID（安全上下文），否则退回时间戳 + 随机串。 */
+function newDraftId() {
+  try {
+    const c = globalThis.crypto;
+    if (c && typeof c.randomUUID === 'function') return c.randomUUID();
+  } catch {
+    /* 非安全上下文（file:// 等）：走下面的回退 */
+  }
+  return `d-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function clearDraftTimer() {
+  if (draftSaveTimer) {
+    clearTimeout(draftSaveTimer);
+    draftSaveTimer = null;
+  }
+}
+
+/** 当前表单 → 自动保存请求体。正文按当前可见的编辑器取（与发送口径一致）。 */
+function draftPayload() {
+  const c = state.composing;
+  if (!c) return null;
+  const rich = isRich();
+  const html = rich ? $('#f-body-rich').innerHTML : '';
+  const text = rich ? richPlainText($('#f-body-rich')) : $('#f-body').value;
+  return {
+    mode: c.mode,
+    source_id: c.originalId || null,
+    mailbox: $('#f-mailbox').value || '',
+    to: $('#f-to').value,
+    cc: $('#f-cc').value,
+    bcc: $('#f-bcc').value,
+    subject: $('#f-subject').value,
+    body: text,
+    html,
+    rich,
+  };
+}
+
+/**
+ * 是否值得存成草稿 —— 「要不要落库」的**唯一判据**。
+ *
+ * 口径与 `isComposerDirty()` 共用同一个内核 `contentDiffersFromBaseline()`，
+ * 只差「发件人下拉」一项：
+ *  - 回复/转发弹窗**预填**的收件人、主题不算「写了一半」——
+ *    否则用户点开回复又关掉，草稿箱里就会多出一堆自己没写过的回信；
+ *  - 只敲空格不算；只换发件人也不算（下拉位置不是邮件内容，没什么可存的）；
+ *  - 加了附件算 —— 附件虽然不落库（体积超 D1 单行上限），但用户确实动过手，
+ *    得让他知道东西去哪了（见 closeComposerWithDraft 的提示）。
+ */
+function hasDraftContent() {
+  const c = state.composing;
+  if (!c) return false;
+  if (c.files.length > 0) return true;
+  // 没有基线时退回「任一非空即算」（openComposerShell 正常总会建基线，这里是兜底）
+  if (!composerBaseline) return isComposerDirty();
+  return contentDiffersFromBaseline();
+}
+
+/** 草稿变化后让「草稿箱」的缓存与计数失效（当前不在草稿箱时也要，否则切过去看到旧列表）。 */
+function invalidateDraftCaches() {
+  // 防御：vm 套件的 sandbox 里 state.cache 没有 folders（只桩了 countsAt），
+  // 裸访问会让异步保存路径抛 unhandledRejection、把整个套件打崩。
+  const folders = state.cache && state.cache.folders;
+  if (folders && typeof folders.keys === 'function') {
+    for (const k of Array.from(folders.keys())) {
+      if (k.includes('|drafts|')) folders.delete(k);
+    }
+  }
+  state.cache.countsAt = 0;
+  void refreshCounts();
+}
+
+/**
+ * 落盘一份草稿快照：有内容 → PUT upsert；无内容 → DELETE（避免草稿箱里出现空条目）。
+ *
+ * 失败策略分两种（静默失败是这个项目最危险的 bug 类，不能一律吞掉）：
+ *  - 自动保存（防抖）失败**静默** —— 不该打断写信，下次输入还会再试；
+ *  - 手动关窗触发的保存失败**必须出声**（`surfaceErrors`）—— 那时弹窗已经关了，
+ *    再不提示，用户的内容就真的一声不响地没了。
+ */
+async function saveDraftSnapshot(id, payload, hasContent, opts) {
+  if (!id) return false;
+  // 从没存过 + 现在也没内容 → 无事可做（空弹窗开关不该产生任何请求）
+  if (!hasContent && !draftEverSaved) return true;
+  try {
+    if (!hasContent) {
+      await api(`/api/drafts/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      draftEverSaved = false;
+    } else {
+      await api(`/api/drafts/${encodeURIComponent(id)}`, {
+        method: 'PUT',
+        body: JSON.stringify(payload),
+      });
+      draftEverSaved = true;
+    }
+    invalidateDraftCaches();
+    return true;
+  } catch (e) {
+    if (opts && opts.surfaceErrors) {
+      showToast(`草稿保存失败：${e && e.message ? e.message : e}`, true);
+    }
+    return false;
+  }
+}
+
+/** 防抖到点时的保存：从当前表单现取快照。 */
+function flushDraft() {
+  clearDraftTimer();
+  const c = state.composing;
+  if (!c || !c.draftId) return Promise.resolve();
+  return saveDraftSnapshot(c.draftId, draftPayload(), hasDraftContent());
+}
+
+/** 输入防抖保存。 */
+function scheduleDraftSave() {
+  if (!state.composing) return;
+  clearDraftTimer();
+  draftSaveTimer = setTimeout(() => {
+    draftSaveTimer = null;
+    void flushDraft();
+  }, DRAFT_SAVE_DEBOUNCE_MS);
+}
+
+/**
+ * 从草稿箱打开写信弹窗继续编辑。
+ * 先取回完整草稿（列表接口只带摘要），回复/转发草稿还要把原邮件取回来 ——
+ * 「引用原文」按钮与转发附件都依赖 `original`。
+ */
+async function openDraftComposer(id) {
+  if (!state.canSend) {
+    showToast('服务端未配置发送能力（缺少 RESEND_API_KEY / SEND_FROM_ADDRESS）', true);
+    return;
+  }
+  let d;
+  try {
+    d = (await api(`/api/drafts/${encodeURIComponent(id)}`)).draft;
+  } catch (e) {
+    showToast(e.message, true);
+    return;
+  }
+  if (!d) return;
+
+  let original = null;
+  if (d.source_id && d.mode !== 'new') {
+    try {
+      original = (await api(`/api/messages/${encodeURIComponent(d.source_id)}`)).message;
+    } catch {
+      /* 原邮件可能已被删除：退化成普通写信，草稿内容不丢 */
+    }
+  }
+
+  const isReply = d.mode === 'reply';
+  const isForward = d.mode === 'forward';
+  openComposerShell({
+    mode: isReply ? 'reply' : isForward ? 'forward' : 'compose',
+    title: isReply ? '回复' : isForward ? '转发' : '写信',
+    to: (d.to || []).join(', '),
+    cc: (d.cc || []).join(', '),
+    bcc: (d.bcc || []).join(', '),
+    subject: d.subject || '',
+    body: d.body_text || '',
+    bodyHtml: d.body_html || '',
+    rich: d.rich === true,
+    original,
+    originalId: d.source_id || null,
+    mailbox: d.mailbox || undefined,
+    showMerge: !isReply && !isForward,
+    showQuote: isReply,
+    focus: '#f-to',
+    draftId: d.id,
+  });
+  if (isForward && original) {
+    const n = forwardAttachmentCount();
+    if (n) $('#f-forward-note').textContent = `将附带原邮件的 ${n} 个附件`;
+  }
+  showToast('已打开草稿');
+}
+
+/* 关闭写信弹窗的守卫（语义已从「放弃确认」改为「自动存草稿」，见 requestCloseComposer） */
 
 let discardConfirmPending = false; // 确认框是否已弹出（防重入）
 let composerLastFocus = null; // 确认框收起后要归还焦点的元素
@@ -2406,11 +2852,31 @@ function richPlainText(el) {
 }
 
 /**
+ * 「相对打开弹窗时的快照，内容是否真的变了」——**不含发件人下拉**。
+ *
+ * 这是 `isComposerDirty()` 与 `hasDraftContent()` 的**共同内核**：
+ * 两套口径一旦各写一遍就会漂移（判脏却没存、或没写却存了空草稿）。
+ * 只敲空格不算输入（norm 去首尾空白）；正文只认当前可见的那个编辑器，
+ * 避免隐藏编辑器里的残留造成「假脏」。
+ */
+function contentDiffersFromBaseline() {
+  const b = composerBaseline;
+  if (!b) return false;
+  if (norm($('#f-to').value) !== norm(b.to)) return true;
+  if (norm($('#f-cc').value) !== norm(b.cc)) return true;
+  if (norm($('#f-bcc').value) !== norm(b.bcc)) return true;
+  if (norm($('#f-subject').value) !== norm(b.subject)) return true;
+  if (isRich()) return richPlainText($('#f-body-rich')) !== b.richText;
+  return norm($('#f-body').value) !== norm(b.body);
+}
+
+/**
  * 用户是否已输入任何信息（与打开弹窗时的快照比对）。
  * 收件人 / 主题 / 发件人 / 当前可见的正文编辑器与基线不同，或已添加附件，
  * 即视为「脏」。回复弹窗预填的收件人、主题属于系统行为，不算用户输入。
  * 只敲空格不算输入；切换富文本模式本身不算脏。
- * 正文只认当前可见的那个编辑器，避免隐藏编辑器里的残留造成「假提示」。
+ * 比 `hasDraftContent()` 多算一项「发件人下拉」——换了发信身份算用户操作，
+ * 但光换发件人没有可落库的内容，所以那一项不参与「要不要存草稿」。
  */
 function isComposerDirty() {
   const c = state.composing;
@@ -2426,15 +2892,8 @@ function isComposerDirty() {
     if (isRich()) return richPlainText($('#f-body-rich')) !== '';
     return norm($('#f-body').value) !== '';
   }
-  if (norm($('#f-to').value) !== norm(b.to)) return true;
-  if (norm($('#f-cc').value) !== norm(b.cc)) return true;
-  if (norm($('#f-bcc').value) !== norm(b.bcc)) return true;
-  if (norm($('#f-subject').value) !== norm(b.subject)) return true;
   if (norm($('#f-mailbox').value) !== norm(b.mailbox)) return true;
-  if (isRich()) {
-    if (richPlainText($('#f-body-rich')) !== b.richText) return true;
-  } else if (norm($('#f-body').value) !== norm(b.body)) return true;
-  return false;
+  return contentDiffersFromBaseline();
 }
 
 function showDiscardConfirm() {
@@ -2462,8 +2921,11 @@ function hideDiscardConfirm(restoreFocus = true) {
 }
 
 /**
- * 请求关闭写信弹窗：无内容时直接关闭；有内容时先弹确认。
- * 遮罩空白区点击、取消按钮、Esc 三个入口都走这里。
+ * 请求关闭写信弹窗：**存草稿后直接关闭，不再弹「是否放弃」**。
+ *
+ * 遮罩空白区点击、取消按钮、Esc 三个入口都走这里。既然写了一半的内容会自动落进草稿箱，
+ * 「关窗」就不再是破坏性操作，也就没有需要用户确认的东西了。
+ * 唯一仍然拦住的情况是「正在发送」—— 那时关窗会让用户误以为没发出去。
  */
 function requestCloseComposer() {
   if (!state.composing) return;
@@ -2471,14 +2933,29 @@ function requestCloseComposer() {
     showToast('邮件正在发送中，请稍候…');
     return;
   }
-  if (!isComposerDirty()) {
-    closeComposer();
-    return;
-  }
-  showDiscardConfirm();
+  void closeComposerWithDraft();
+}
+
+/** 落草稿 → 关窗。有内容时给一句提示，让用户知道东西去哪了。 */
+function closeComposerWithDraft() {
+  const c = state.composing;
+  if (!c) return;
+  // 快照必须在 closeComposer() **之前**取：关窗会清掉 state.composing 与表单状态。
+  const id = c.draftId;
+  const hasContent = hasDraftContent();
+  const payload = draftPayload();
+  const inDraftsFolder = state.folder === 'drafts';
+  // 同步关窗：点一下要立刻见效，不能等一次网络往返
+  closeComposer();
+  if (hasContent) showToast('已存入草稿');
+  // 正停在草稿箱就刷新，让刚存下的草稿立刻出现
+  if (inDraftsFolder) void loadFolder(false, true);
+  // 手动关窗触发的保存：失败必须出声（此时弹窗已关，静默 = 内容无声消失）
+  void saveDraftSnapshot(id, payload, hasContent, { surfaceErrors: true });
 }
 
 function closeComposer() {
+  clearDraftTimer(); // 关窗后不许再有在途的自动保存定时器
   hideDiscardConfirm(false);
   hideSuggest();
   endComposerDrag(); // 关窗时若正拖着，把拖动状态一起收掉（否则 body 的类会残留）
@@ -2664,6 +3141,8 @@ async function sendCompose() {
   if (bcc.length) payload.bcc = bcc;
   if (mailbox) payload.mailbox = mailbox;
   if (merge) payload.merge = true;
+  // 带上草稿 id：服务端发送成功后会删掉对应草稿（全成功才删，合并发送部分失败时保留）
+  if (c.draftId) payload.draft_id = c.draftId;
   // 转发：原邮件附件由服务端从 R2 复制，前端不需要把它们下载再上传一遍
   if (c.mode === 'forward') payload.include_original_attachments = true;
 
@@ -3010,6 +3489,14 @@ function setupComposerWindow() {
       composerPressInside = !!(t && typeof t.closest === 'function' && t.closest('#composer'));
     }, true);
   }
+
+  // 草稿自动保存：弹窗内任何输入都触发（事件委托，一次绑定覆盖全部字段与富文本编辑器）。
+  // input + change 双事件：文本框/富文本走 input，下拉（发件人）与复选框只发 change。
+  const composerEl = $('#composer');
+  if (composerEl && typeof composerEl.addEventListener === 'function') {
+    composerEl.addEventListener('input', () => scheduleDraftSave());
+    composerEl.addEventListener('change', () => scheduleDraftSave());
+  }
 }
 
 /* ---------------- 搜索 / 键盘 / 事件 / 同步 ---------------- */
@@ -3148,6 +3635,8 @@ function setupEvents() {
   // 写信弹窗的拖动 / 缩放 / 最大化接线。放在 setupSearch() **之后**：
   // 上面那段事件接线会被两个 vm 套件按注释标记整段抽取执行，这里不再往里塞东西。
   setupComposerWindow();
+  // 列表/详情分隔条的拖动接线。同理放在抽取范围之外。
+  setupSplitter();
   // 附件预览浮层（关闭按钮 / 点空白关闭；Esc 挂在全局键盘处理器里）
   setupAttachmentPreview();
 }
@@ -3184,6 +3673,7 @@ async function init() {
   const mailboxAtStart = state.mailbox;
 
   setupEvents();
+  applyListWidth(loadListWidth()); // 恢复上次拖动设定的列表宽度（无自定义则为 null，走 CSS 默认）
   syncLayout(); // 先把布局状态对齐（首屏就可能落在移动端断点内）
   renderNav();
   renderMailboxSelect();

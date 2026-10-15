@@ -70,21 +70,79 @@ export function stripAngle(s: string | null | undefined): string | null {
 }
 
 /**
+ * 从 References / In-Reply-To 头里抽出全部 Message-ID，返回**带尖括号的规范形式**。
+ *
+ * ⚠️ **生产实测（2026-10-15）**：Resend 收信接口返回的 `headers.references` 值**不是**
+ * RFC 5322 的空格分隔列表，而是 **JSON 数组文本** —— 形如 `["<a@b>","<c@d>"]`。
+ *
+ * 旧实现用 `refs.split(/\s+/)[0]` 取第一条，拿到的是整个 JSON 文本（含 `["` 前缀），
+ * `stripAngle` 又只认首尾尖括号、去不掉方括号，于是 `thread_id` 落成
+ * `["<a@b>","<c@d>"]` 这种畸形值。更糟的是 `reply()` 把这个 JSON 文本原样拼进
+ * 新 References 发回 Resend，对方再回信时转义层级又深一层
+ * （实测已出现 `["<\",\"<\\\",\\\"<\\\\\\\"...` 四层嵌套），
+ * 导致**同一物理线程每往返一轮就换一个 thread_id** —— 用户侧看到的就是
+ * 「来回好几次了，会话面板里却只有两封」。
+ *
+ * 因此不再按分隔符切分，而是**抽取全部 `<...>`**：JSON 数组、空格分隔、单值、
+ * 以及历史上已被嵌套转义污染的值都能抽出正确结果（嵌套串里第一个 `<...>`
+ * 恰好就是真正的根 Message-ID）。
+ *
+ * 返回带尖括号，便于直接拼装头部（`join(' ')` 即合法的 References）。
+ */
+export function parseReferences(raw: string | null | undefined): string[] {
+  if (!raw) return [];
+  const out: string[] = [];
+  const re = /<([^<>]+)>/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(raw)) !== null) {
+    const id = m[1].trim();
+    if (id) out.push(`<${id}>`);
+  }
+  if (out.length) return out;
+  // 兜底：整串里一个 `<...>` 都没有，但本身就是一个**干净的裸 Message-ID**
+  // （非规范写法，旧实现用 stripAngle 是宽容接受的，不能因为这次改动把它弄丢）。
+  // 判据刻意收紧到「单个 token 且不含任何分隔符 / 引号 / 方括号」——
+  // 否则 `["", ""]` 这类畸形串会被切出一堆垃圾 id。
+  const t = raw.trim();
+  if (/^[^\s,<>[\]"']+$/.test(t)) return [`<${t}>`];
+  return [];
+}
+
+/** 取第一个可解析的 Message-ID（无尖括号形式）；没有 `<...>` 时返回 null。 */
+function firstMessageId(raw: string | null | undefined): string | null {
+  const first = parseReferences(raw)[0];
+  return first ? stripAngle(first) : null;
+}
+
+/**
  * 会话根：References 链里最靠前的那条 Message-ID（整条线程共享），
  * 取不到时回退到 in_reply_to / 自身 message_id。结果去掉尖括号便于归组。
+ *
+ * 解析一律走 `parseReferences()`（见其说明：Resend 的 References 是 JSON 数组文本，
+ * 按空白切分会得到畸形根）。`messageId` 额外兼容**不带尖括号**的裸 id
+ * —— 出站邮件的 `message_id` 存的是内部 uuid。
  */
 export function rootThreadId(opts: { references?: string | null; inReplyTo?: string | null; messageId?: string | null; fallback?: string }): string {
-  const refs = (opts.references || '').trim();
-  if (refs) {
-    const first = refs.split(/\s+/)[0];
-    const root = stripAngle(first);
-    if (root) return root;
-  }
-  const inReply = stripAngle(opts.inReplyTo);
+  const root = firstMessageId(opts.references);
+  if (root) return root;
+  const inReply = firstMessageId(opts.inReplyTo);
   if (inReply) return inReply;
-  const own = stripAngle(opts.messageId);
+  const own = firstMessageId(opts.messageId) ?? stripAngle(opts.messageId);
   if (own) return own;
   return opts.fallback ?? '';
+}
+
+/**
+ * `thread_id` 是否是我们自己算出来的**正常值**。
+ *
+ * 历史数据里存过畸形 JSON 文本（见 `parseReferences`），特征是中括号 / 引号 /
+ * 反斜杠 / 尖括号 / 空白。回复时若原邮件的 `thread_id` 干净就直接继承它
+ * （语义上「回复当然属于原邮件的会话」，且能兜住 References 头缺失的来信），
+ * 畸形则退回按 References 重新推导。
+ */
+export function isSaneThreadId(v: string | null | undefined): boolean {
+  const s = (v ?? '').trim();
+  return !!s && !/[\s[\]"\\<>]/.test(s);
 }
 
 /** 从 header 数组里按名称(大小写不敏感)取值，可能有多个重复名。 */

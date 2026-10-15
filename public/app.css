@@ -160,10 +160,49 @@ html, body {
   min-width: min(var(--list-w), 34vw);
   max-width: 46vw;
   background: var(--panel);
-  border-right: 1px solid var(--border);
   display: flex;
   flex-direction: column;
   min-height: 0;
+}
+
+/* ---------- 列表 / 详情分隔条（可拖动） ----------
+ * 视觉上只有 1px 竖线（用伪元素画，不占布局宽度），但命中区宽 6px，好点中。
+ * `touch-action: none` 让触屏拖动不触发页面滚动。
+ */
+#splitter {
+  flex: 0 0 6px;
+  align-self: stretch;
+  position: relative;
+  z-index: 5;
+  cursor: col-resize;
+  background: transparent;
+  touch-action: none;
+}
+#splitter::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 1px;
+  transform: translateX(-50%);
+  background: var(--border);
+  transition: width .12s ease, background .12s ease;
+}
+#splitter:hover::before,
+#splitter:focus-visible::before,
+#app.resizing #splitter::before {
+  width: 3px;
+  background: var(--accent-strong);
+}
+#splitter:focus-visible { outline: none; }
+/* 拖动中：整页禁止选中文本、光标保持 col-resize（否则掠过详情区会变回文本光标） */
+#app.resizing { user-select: none; cursor: col-resize; }
+
+/* 用户手动拖过宽度后，放开 34vw / 46vw 这两道响应式夹取
+ * （JS 已按「最小 260px、最多视口 70%」夹取）。仅在桌面双栏区间生效。 */
+@media (min-width: 981px) {
+  #app.list-w-custom #list-pane { width: var(--list-w); min-width: 0; max-width: none; }
 }
 
 #list-head {
@@ -264,6 +303,20 @@ html, body {
   font-size: 12px;
 }
 .li-attach { flex: 0 0 auto; color: var(--text-dim); font-size: 11px; }
+.li-thread-badge {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 9px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 600;
+}
 .li-time { color: var(--text-dim); font-size: 12px; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .li-star { display: flex; }
 .li-star .star-btn {
@@ -905,6 +958,8 @@ html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
     max-width: none;
     border-right: none;
   }
+  /* 单栏布局下没有「两栏」可调，分隔条整个移除（否则会在列表右侧留一条 6px 空槽） */
+  #splitter { display: none; }
   #read-pane { display: none; }
   #app.mobile-detail #list-pane { display: none; }
   #app.mobile-detail #read-pane { display: block; }

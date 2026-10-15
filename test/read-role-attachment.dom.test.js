@@ -204,7 +204,7 @@ async function boot(cfg) {
       openId = win.eval('typeof state === "object" ? state.openId : null');
       pending = !!win.eval('detailPending');
     } catch { /* 未就绪 */ }
-    if (nav && nav.children.length === 4 && list && list.children.length > 0 && openId && !pending) { ready = true; break; }
+    if (nav && nav.children.length > 0 && list && list.children.length > 0 && openId && !pending) { ready = true; break; }
     await tick(win);
   }
   if (!ready) throw new Error('init() 未在预期时间内完成（fetch 打桩或脚本注入失败）');

@@ -589,7 +589,7 @@ async function boot(cfg = {}) {
       detailSettled = !win.eval('detailPending');
     } catch { /* 脚本未就绪 */ }
     const settledOk = !wantDetailSettled || detailSettled;
-    if (nav && nav.children.length === 4 && list && list.children.length > 0 && openId && settledOk) {
+    if (nav && nav.children.length > 0 && list && list.children.length > 0 && openId && settledOk) {
       ready = true; break;
     }
     await tick(win);
@@ -722,7 +722,7 @@ const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } 
     ok(typeof ctx.win.openMessage === 'function', 'app.js 已注入且 openMessage 为全局函数');
     ok(typeof ctx.win.openFolder === 'function', 'openFolder 为全局函数');
     ok(typeof ctx.win.loadMailboxes === 'function', 'loadMailboxes 为全局函数');
-    ok(el(ctx, '#folder-nav').children.length === 4, 'renderNav 已执行（4 个文件夹）', el(ctx, '#folder-nav').children.length);
+    ok(el(ctx, '#folder-nav').children.length === 5, 'renderNav 已执行（5 个文件夹：收件箱/草稿/星标/已发送/已删除）', el(ctx, '#folder-nav').children.length);
     ok(ctx.stub.counters.account >= 1, '/api/account 被请求（fetch 打桩生效）', ctx.stub.counters.account);
     ok(ctx.stub.counters.folders >= 1, '/api/folders/* 被请求（列表数据来自打桩）', ctx.stub.counters.folders);
     ok(evalIn(ctx, 'state.items.length') === 3, '列表渲染出 3 行', evalIn(ctx, 'state.items.length'));

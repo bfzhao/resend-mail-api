@@ -506,9 +506,10 @@ async function main() {
   ok(lastToast().includes('已发送 0 封') && lastToast().includes('2 封失败'), `toast 反映全失败（实际：${lastToast()}）`);
   ok(!lastToast().includes('发送失败：'), '全失败不走「发送失败」异常分支（说明响应为 200）');
   ok(T.sendInFlight === false, '全失败 -> sendInFlight 已复位');
-  // 全失败后仍可正常走放弃确认流程（内容确实没发出去）
+  // 全失败后仍可正常关窗（本轮起语义是「存草稿并关闭」，内容确实没发出去，所以转存草稿）
   S.requestCloseComposer();
-  ok(confirmShown() === true, '全失败后点外部 -> 正常弹出放弃确认');
+  ok(confirmShown() === false, '全失败后点外部 -> 不弹放弃确认');
+  ok(composerOpen() === false, '全失败后点外部 -> 存草稿并关闭');
 
   console.log('\n[9] merge 分支：后端 400（超上限）走异常分支，内容保留');
   reset();

@@ -400,9 +400,10 @@ async function test(name, fn) {
     ok(composerOpen(ctx), '⭐ 弹窗仍然打开（stopPropagation 生效）');
     ok(!confirmShown(ctx), '⭐ 也没有弹出「放弃编辑」确认框');
 
-    // 下拉已收起时，Esc 恢复既有语义：请求关闭弹窗（此处表单已脏 -> 弹确认框）
+    // 下拉已收起时，Esc 恢复既有语义：请求关闭弹窗（本轮起语义是「存草稿并关闭」，不再弹确认）
     el(ctx, '#f-to').dispatchEvent(keyEvt(ctx.win, 'Escape'));
-    ok(confirmShown(ctx), '下拉收起后 Esc 回到「请求关闭弹窗」的既有行为', `confirm=${confirmShown(ctx)}`);
+    ok(!composerOpen(ctx), '下拉收起后 Esc 回到「请求关闭弹窗」的既有行为（存草稿并关闭）', `open=${composerOpen(ctx)}`);
+    ok(!confirmShown(ctx), '不再弹「放弃编辑」确认框');
   });
 
   /* ---- D10 cc / bcc 字段同样能联想 ---- */

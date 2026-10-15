@@ -193,7 +193,7 @@ async function boot(cfg = {}) {
       openId = win.eval('typeof state === "object" ? state.openId : null');
       settled = !win.eval('detailPending');
     } catch { /* 脚本尚未就绪 */ }
-    if (nav && nav.children.length === 4 && list && list.children.length > 0 && openId && settled) {
+    if (nav && nav.children.length > 0 && list && list.children.length > 0 && openId && settled) {
       ready = true; break;
     }
     await tick(win);
@@ -369,7 +369,7 @@ async function test(name, fn) {
     const c2 = await boot({ width: 375, matchMedia: () => { throw new Error('boom'); } });
     ok(typeof c2.win.matchMedia === 'function', '前置：matchMedia 确实被桩成会抛异常的函数');
     ok(isMobileNow(c2) === true, '⭐ 抛异常时回退到 innerWidth=375 → 移动端（不是崩溃 / 不是恒 false）', isMobileNow(c2));
-    ok(c2.doc.querySelector('#folder-nav').children.length === 4, 'init() 未被异常打断（导航仍渲染完整）');
+    ok(c2.doc.querySelector('#folder-nav').children.length === 5, 'init() 未被异常打断（导航仍渲染完整：收件箱/草稿/星标/已发送/已删除）');
   });
 
   /* ---- M4 单栏：详情进入 / 返回退出 ---- */

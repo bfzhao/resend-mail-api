@@ -71,7 +71,7 @@ export interface ListOpts {
   offset: number;
 }
 
-interface FolderRow {
+export interface FolderRow {
   id: string;
   direction: string;
   /** 该行所属的收件信箱；乐观渲染信封卡时前端靠它显示「收至 …」，故必须随列表一起返回。 */
@@ -86,6 +86,10 @@ interface FolderRow {
   starred: number;
   status: string;
   attachments_count: number;
+  /** 同一会话（thread）内的邮件数量；为 1 时表示独立邮件。 */
+  thread_count: number;
+  /** 同一会话内未读邮件数量；> 0 时列表行应标为未读。 */
+  thread_unread: number;
 }
 
 /** mailbox 过滤条件：空/NULL 分组用哨兵值匹配，其余按精确匹配（与 mailboxes() 口径一致）。 */
@@ -139,22 +143,207 @@ const LIST_SELECT = `SELECT
   FROM messages m`;
 
 export async function listFolder(env: Env, opts: ListOpts): Promise<{ items: FolderRow[]; total: number }> {
-  const w = whereForFolder(opts.folder, opts.q, opts.unread === true, opts.mailbox);
+  // unread 不在 whereForFolder 里处理，而是靠外部窗口函数算出的 thread_unread 过滤，
+  // 这样「只看未读」时能看到「包含未读邮件的整个 thread 的最新一封」，而不是仅那封未读本身。
+  const w = whereForFolder(opts.folder, opts.q, false, opts.mailbox);
   const whereSql = w.sql ? `WHERE ${w.sql}` : '';
+  const unreadCond = opts.unread === true ? 'AND thread_unread > 0' : '';
 
   const items = (
     await env.DB.prepare(
-      `${LIST_SELECT} ${whereSql} ORDER BY m.received_at DESC LIMIT ? OFFSET ?`
+      `WITH folder_threads AS (
+         SELECT DISTINCT COALESCE(NULLIF(thread_id, ''), id) AS pk
+         FROM messages m
+         ${whereSql}
+       ),
+       ranked AS (
+         SELECT
+           m.id, m.direction, m.mailbox, m.from_name, m.from_email, m.subject, m.to_emails,
+           substr(coalesce(NULLIF(m.body_text, ''), ''), 1, 200) AS preview,
+           m.received_at, m.read, m.starred, m.status,
+           (SELECT COUNT(*) FROM attachments a WHERE a.message_id = m.id) AS attachments_count,
+           ROW_NUMBER() OVER (
+             PARTITION BY COALESCE(NULLIF(m.thread_id, ''), m.id)
+             ORDER BY m.received_at DESC, m.id DESC
+           ) AS rn,
+           COUNT(*) OVER (PARTITION BY COALESCE(NULLIF(m.thread_id, ''), m.id)) AS thread_count,
+           SUM(CASE WHEN m.read = 0 THEN 1 ELSE 0 END) OVER (PARTITION BY COALESCE(NULLIF(m.thread_id, ''), m.id)) AS thread_unread
+         FROM messages m
+         WHERE COALESCE(NULLIF(m.thread_id, ''), m.id) IN (SELECT pk FROM folder_threads)
+       )
+       SELECT
+         id, direction, mailbox, from_name, from_email, subject, to_emails,
+         preview, received_at, read, starred, status, attachments_count,
+         thread_count, thread_unread
+       FROM ranked
+       WHERE rn = 1 ${unreadCond}
+       ORDER BY received_at DESC, id DESC
+       LIMIT ? OFFSET ?`
     )
       .bind(...w.params, opts.limit, opts.offset)
       .all<FolderRow>()
   ).results;
 
+  const totalSql =
+    opts.unread === true
+      ? `SELECT COUNT(*) AS n FROM (
+           SELECT COALESCE(NULLIF(thread_id, ''), id) AS pk,
+                  SUM(CASE WHEN read = 0 THEN 1 ELSE 0 END) AS thread_unread
+           FROM messages m
+           WHERE COALESCE(NULLIF(m.thread_id, ''), m.id) IN (
+             SELECT DISTINCT COALESCE(NULLIF(thread_id, ''), id) FROM messages m2 ${whereSql}
+           )
+           GROUP BY pk
+           HAVING thread_unread > 0
+         )`
+      : `SELECT COUNT(DISTINCT COALESCE(NULLIF(m.thread_id, ''), m.id)) AS n FROM messages m WHERE COALESCE(NULLIF(m.thread_id, ''), m.id) IN (SELECT DISTINCT COALESCE(NULLIF(thread_id, ''), id) FROM messages m2 ${whereSql})`;
+
   const totalRow = (
-    await env.DB.prepare(`SELECT COUNT(*) AS n FROM messages m ${whereSql}`).bind(...w.params).first<{ n: number }>()
+    await env.DB.prepare(totalSql).bind(...w.params).first<{ n: number }>()
   )?.n ?? 0;
 
   return { items, total: totalRow };
+}
+
+/* ---------------- 草稿箱 ----------------
+ * 草稿存在独立的 drafts 表（理由见 schema.sql 的建表注释）：
+ * 没有投递语义（无 message_id / thread_id / status / resend_id），
+ * 混进 messages 会让每个文件夹查询都不得不多带一个「排除草稿」条件。
+ */
+
+/** drafts 表的一行。 */
+export interface DraftRow {
+  id: string;
+  mailbox: string;
+  mode: string;
+  source_id: string | null;
+  to_emails: string;
+  cc: string | null;
+  bcc: string | null;
+  subject: string | null;
+  body_html: string | null;
+  body_text: string | null;
+  rich: number;
+  updated_at: number;
+  created_at: number;
+}
+
+export interface DraftInput {
+  id: string;
+  mailbox: string;
+  mode: string;
+  sourceId: string | null;
+  to: string[];
+  cc: string[];
+  bcc: string[];
+  subject: string;
+  html: string;
+  text: string;
+  rich: boolean;
+}
+
+/**
+ * 草稿列表。
+ *
+ * 返回形状**刻意与 listFolder 一致**（伪装成一封 `direction='draft'` 的邮件）：
+ * 前端的列表渲染、缓存指纹、分页、搜索都能原样复用，只有「点开是写信弹窗而非详情」
+ * 这一处分叉。`received_at` 用 `updated_at` 填充 —— 草稿的排序语义是「最后修改时间」。
+ */
+export async function listDrafts(
+  env: Env,
+  opts: { q?: string | null; mailbox?: string; limit: number; offset: number }
+): Promise<{ items: FolderRow[]; total: number }> {
+  const conds: string[] = [];
+  const params: unknown[] = [];
+  if (opts.mailbox) {
+    const c = mailboxCond(opts.mailbox);
+    conds.push(c.sql);
+    params.push(...c.params);
+  }
+  if (opts.q) {
+    const like = `%${opts.q}%`;
+    conds.push('(subject LIKE ? OR to_emails LIKE ? OR body_text LIKE ?)');
+    params.push(like, like, like);
+  }
+  const whereSql = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
+
+  const rows = (
+    await env.DB.prepare(
+      `SELECT id, mailbox, subject, to_emails,
+              substr(coalesce(NULLIF(body_text, ''), ''), 1, 200) AS preview,
+              updated_at
+       FROM drafts ${whereSql} ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?`
+    )
+      .bind(...params, opts.limit, opts.offset)
+      .all<{ id: string; mailbox: string; subject: string | null; to_emails: string; preview: string | null; updated_at: number }>()
+  ).results;
+
+  const total =
+    (await env.DB.prepare(`SELECT COUNT(*) AS n FROM drafts ${whereSql}`).bind(...params).first<{ n: number }>())?.n ?? 0;
+
+  const items: FolderRow[] = rows.map((r) => ({
+    id: r.id,
+    direction: 'draft',
+    mailbox: r.mailbox,
+    from_name: null,
+    from_email: null,
+    subject: r.subject,
+    to_emails: r.to_emails,
+    preview: r.preview,
+    received_at: r.updated_at,
+    read: 1, // 草稿没有未读语义
+    starred: 0,
+    status: 'draft',
+    attachments_count: 0,
+    thread_count: 1,
+    thread_unread: 0,
+  }));
+  return { items, total };
+}
+
+export async function getDraft(env: Env, id: string): Promise<DraftRow | null> {
+  return (await env.DB.prepare('SELECT * FROM drafts WHERE id = ?').bind(id).first<DraftRow>()) ?? null;
+}
+
+/** 新建或覆盖草稿。前端在打开写信弹窗时就生成了 id，自动保存直接 upsert，省一次往返。 */
+export async function upsertDraft(env: Env, d: DraftInput): Promise<void> {
+  const now = nowSec();
+  await env.DB.prepare(
+    `INSERT INTO drafts (id, mailbox, mode, source_id, to_emails, cc, bcc, subject, body_html, body_text, rich, updated_at, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       mailbox = excluded.mailbox,
+       mode = excluded.mode,
+       source_id = excluded.source_id,
+       to_emails = excluded.to_emails,
+       cc = excluded.cc,
+       bcc = excluded.bcc,
+       subject = excluded.subject,
+       body_html = excluded.body_html,
+       body_text = excluded.body_text,
+       rich = excluded.rich,
+       updated_at = excluded.updated_at`
+  )
+    .bind(
+      d.id,
+      d.mailbox,
+      d.mode,
+      d.sourceId,
+      JSON.stringify(d.to),
+      d.cc.length ? JSON.stringify(d.cc) : null,
+      d.bcc.length ? JSON.stringify(d.bcc) : null,
+      d.subject,
+      d.html,
+      d.text,
+      d.rich ? 1 : 0,
+      now,
+      now
+    )
+    .run();
+}
+
+export async function deleteDraft(env: Env, id: string): Promise<void> {
+  await env.DB.prepare('DELETE FROM drafts WHERE id = ?').bind(id).run();
 }
 
 export async function sidebarCounts(env: Env, mailbox?: string): Promise<{
@@ -163,6 +352,7 @@ export async function sidebarCounts(env: Env, mailbox?: string): Promise<{
   sent_total: number;
   starred_total: number;
   trash_total: number;
+  drafts_total: number;
 }> {
   const conds: string[] = [];
   const params: unknown[] = [];
@@ -172,15 +362,22 @@ export async function sidebarCounts(env: Env, mailbox?: string): Promise<{
     params.push(...c.params);
   }
   const whereSql = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
-  const row = await env.DB.prepare(
-    `SELECT
-      SUM(CASE WHEN direction='inbound' AND deleted=0 AND read=0 THEN 1 ELSE 0 END) AS inbox_unread,
-      SUM(CASE WHEN direction='inbound' AND deleted=0 THEN 1 ELSE 0 END) AS inbox_total,
-      SUM(CASE WHEN direction='outbound' AND deleted=0 THEN 1 ELSE 0 END) AS sent_total,
-      SUM(CASE WHEN starred=1 AND deleted=0 THEN 1 ELSE 0 END) AS starred_total,
-      SUM(CASE WHEN deleted=1 THEN 1 ELSE 0 END) AS trash_total
-     FROM messages ${whereSql}`
-  ).bind(...params).first<{ inbox_unread: number | null; inbox_total: number | null; sent_total: number | null; starred_total: number | null; trash_total: number | null }>();
+  // 草稿在独立表里（见 schema.sql 的 drafts 说明），但**沿用同一套 mailbox 过滤条件**，
+  // 否则「全部邮箱」计数 = 各分组计数之和这条不变量会在草稿上破功。
+  const [row, draftRow] = await Promise.all([
+    env.DB.prepare(
+      `SELECT
+        SUM(CASE WHEN direction='inbound' AND deleted=0 AND read=0 THEN 1 ELSE 0 END) AS inbox_unread,
+        SUM(CASE WHEN direction='inbound' AND deleted=0 THEN 1 ELSE 0 END) AS inbox_total,
+        SUM(CASE WHEN direction='outbound' AND deleted=0 THEN 1 ELSE 0 END) AS sent_total,
+        SUM(CASE WHEN starred=1 AND deleted=0 THEN 1 ELSE 0 END) AS starred_total,
+        SUM(CASE WHEN deleted=1 THEN 1 ELSE 0 END) AS trash_total
+       FROM messages ${whereSql}`
+    ).bind(...params).first<{ inbox_unread: number | null; inbox_total: number | null; sent_total: number | null; starred_total: number | null; trash_total: number | null }>(),
+    env.DB.prepare(`SELECT COUNT(*) AS n FROM drafts ${whereSql}`)
+      .bind(...params)
+      .first<{ n: number | null }>(),
+  ]);
 
   return {
     inbox_unread: row?.inbox_unread ?? 0,
@@ -188,6 +385,7 @@ export async function sidebarCounts(env: Env, mailbox?: string): Promise<{
     sent_total: row?.sent_total ?? 0,
     starred_total: row?.starred_total ?? 0,
     trash_total: row?.trash_total ?? 0,
+    drafts_total: draftRow?.n ?? 0,
   };
 }
 
