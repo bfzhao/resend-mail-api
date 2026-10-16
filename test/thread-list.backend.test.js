@@ -124,8 +124,8 @@ function makeEnv(db) {
 function seedMessages(db, rows) {
   for (const r of rows) {
     db.exec(
-      `INSERT INTO messages (id, direction, mailbox, from_email, to_emails, subject, body_text, received_at, read, starred, deleted, thread_id, status)
-       VALUES ('${r.id}', '${r.direction}', '${r.mailbox || ''}', '${r.from_email || ''}', '${JSON.stringify(r.to || [])}', '${r.subject || ''}', '${r.body_text || ''}', ${r.received_at}, ${r.read ? 1 : 0}, ${r.starred ? 1 : 0}, ${r.deleted ? 1 : 0}, '${r.thread_id || ''}', '${r.status || 'sent'}')`
+      `INSERT INTO messages (id, direction, mailbox, from_email, to_emails, cc, bcc, subject, body_text, received_at, read, starred, deleted, thread_id, status)
+       VALUES ('${r.id}', '${r.direction}', '${r.mailbox || ''}', '${r.from_email || ''}', '${JSON.stringify(r.to || [])}', ${r.cc ? `'${JSON.stringify(r.cc)}'` : 'NULL'}, ${r.bcc ? `'${JSON.stringify(r.bcc)}'` : 'NULL'}, '${r.subject || ''}', '${r.body_text || ''}', ${r.received_at}, ${r.read ? 1 : 0}, ${r.starred ? 1 : 0}, ${r.deleted ? 1 : 0}, '${r.thread_id || ''}', '${r.status || 'sent'}')`
     );
   }
 }
@@ -141,6 +141,8 @@ db.exec(`CREATE TABLE messages (
   from_name TEXT,
   from_email TEXT,
   to_emails TEXT,
+  cc TEXT,
+  bcc TEXT,
   subject TEXT,
   body_text TEXT,
   received_at INTEGER,
@@ -295,6 +297,35 @@ run('T9 已发送文件夹也聚合', async () => {
   const res = await repo.listFolder(env, { folder: 'sent', limit: 20, offset: 0 });
   ok(res.items.length === 1, 'sent 返回 1 行', res.items.length);
   ok(res.items[0].thread_count === 2, 'thread_count = 2', res.items[0].thread_count);
+});
+
+/* T10 thread_count 与会话面板口径一致（折叠回环副本） */
+run('T10 徽标封数折叠回环副本后与面板一致', async () => {
+  db.exec('DELETE FROM messages');
+  // 线上真实形态：我（bingfeng@）回信给 lara@ 并抄送本账号另一个信箱 zhanglili@，
+  // Resend 把同一封投递回 zhanglili@ → 库里留下「出站 + 入站回环副本」两条。
+  seedMessages(db, [
+    { id: 'p1', direction: 'inbound', mailbox: 'bingfeng@x.com', from_email: 'lara@x.com', to: ['bingfeng@x.com'], subject: 'Q', body_text: 'q', received_at: t0 - 300, read: 1, thread_id: 'tlp' },
+    { id: 'p2', direction: 'outbound', mailbox: 'bingfeng@x.com', from_email: 'bingfeng@x.com', to: ['lara@x.com'], cc: ['zhanglili@x.com'], subject: 'Re: Q', body_text: 'a', received_at: t0 - 200, read: 1, thread_id: 'tlp' },
+    { id: 'p3', direction: 'inbound', mailbox: 'zhanglili@x.com', from_email: 'bingfeng@x.com', to: ['lara@x.com'], cc: ['zhanglili@x.com'], subject: 'Re: Q', body_text: 'a', received_at: t0 - 199, read: 0, thread_id: 'tlp' },
+  ]);
+  const res = await repo.listFolder(env, { folder: 'inbox', limit: 20, offset: 0 });
+  ok(res.items.length === 1, 'tlp 聚合为 1 行', res.items.length);
+  ok(res.total === 1, 'total = 1（会话数，不受折叠影响）', res.total);
+  ok(res.items[0].thread_count === 2,
+    '⭐ thread_count = 2（3 条原始行折叠掉 1 条回环副本后，与会话面板一致）', res.items[0].thread_count);
+  ok(res.items[0].thread_count !== 3,
+    '负控制：不能是原始行数 3（旧实现会返回 3，正是用户报的「左 3 右 2」）', res.items[0].thread_count);
+
+  // 负控制：无回环副本的普通多封会话不得被改动
+  seedMessages(db, [
+    { id: 'q1', direction: 'inbound', mailbox: 'bingfeng@x.com', from_email: 'bob@x.com', to: ['bingfeng@x.com'], subject: 'N', body_text: 'n', received_at: t0 - 500, read: 1, thread_id: 'tln' },
+    { id: 'q2', direction: 'outbound', mailbox: 'bingfeng@x.com', from_email: 'bingfeng@x.com', to: ['bob@x.com'], subject: 'Re: N', body_text: 'r', received_at: t0 - 400, read: 1, thread_id: 'tln' },
+    { id: 'q3', direction: 'inbound', mailbox: 'bingfeng@x.com', from_email: 'bob@x.com', to: ['bingfeng@x.com'], subject: 'Re: Re: N', body_text: 'r', received_at: t0 - 100, read: 0, thread_id: 'tln' },
+  ]);
+  const res2 = await repo.listFolder(env, { folder: 'inbox', limit: 20, offset: 0 });
+  const tln = res2.items.find((i) => i.id === 'q3');
+  ok(tln && tln.thread_count === 3, '普通 3 封会话原样保留 thread_count = 3', tln && tln.thread_count);
 });
 
 /* 汇总 */

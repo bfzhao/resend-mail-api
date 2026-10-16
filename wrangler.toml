@@ -25,5 +25,23 @@ SEND_FROM_NAME = "support"
 # 付费版单次 10000 子请求，可改为 9000 等更大值。
 MERGE_SUBREQ_BUDGET = "45"
 
+# CF 入向异步解析队列（never-lose 流水线第二段，见 src/inbound-email.ts）。
+# ⚠️ 部署前需先建队列，否则 `wrangler deploy` 会报找不到队列：
+#     wrangler queues create resend-mail-inbound
+[[queues.producers]]
+binding = "INBOUND_QUEUE"
+queue = "resend-mail-inbound"
+
+[[queues.consumers]]
+queue = "resend-mail-inbound"
+# ⚠️ 每条一次调用：一封大附件邮件（base64 + 解析）很吃 CPU/内存，批量会让多封共用同一预算，
+# 免费档 10ms CPU 下更容易整批超限。个人邮箱量小，逐条处理更稳。
+max_batch_size = 1
+max_retries = 5
+
+# 恢复 cron：定期把「已落 R2 但没解析完」的入向邮件重新入队（never-lose 自愈，见 src/inbound-email.ts）。
+[triggers]
+crons = ["*/15 * * * *"]
+
 [dev]
 port = 8787

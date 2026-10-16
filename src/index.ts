@@ -1,6 +1,7 @@
-import type { Env, Folder } from './types';
+import type { Env, Folder, InboundQueueMessage } from './types';
 import { authenticate, unauthorized } from './auth';
 import { handleInbound, handleEvents } from './webhook';
+import { handleInboundEmail, handleInboundQueue, replayPendingInbound } from './inbound-email';
 import * as repo from './repo';
 import { resendSend, replySubject, forwardSubject, textToHtml, senderIdentity } from './send';
 import type { ResendAttachment } from './send';
@@ -32,6 +33,23 @@ export default {
       return env.ASSETS.fetch(request);
     }
     return json({ error: 'Not Found' }, 404);
+  },
+
+  // CF Email Routing 入向：把原始件落 R2 + 登记 + 入队（见 src/inbound-email.ts 的说明）。
+  async email(message: ForwardableEmailMessage, env: Env): Promise<void> {
+    await handleInboundEmail(env, message);
+  },
+
+  // 入向异步解析消费（never-lose 流水线第二段）。
+  async queue(batch: MessageBatch<InboundQueueMessage>, env: Env): Promise<void> {
+    await handleInboundQueue(batch, env);
+  },
+
+  // 恢复 cron（never-lose 兜底）：把「已落 R2 但没解析完」的入向邮件重新入队。
+  // 见 src/inbound-email.ts 的 replayPendingInbound 与 wrangler.toml 的 [triggers]。
+  async scheduled(_event: ScheduledController, env: Env): Promise<void> {
+    const n = await replayPendingInbound(env);
+    if (n) console.log(`inbound: replay enqueued ${n} pending raw message(s)`);
   },
 };
 
@@ -111,6 +129,11 @@ async function routeApi(request: Request, env: Env, path: string, url: URL): Pro
     });
   }
 
+  // 后端状态：CF（D1/R2 占用 + 入站队列）+ Resend（发信额度）。前端一屏看清，提前知道何时该升级。?refresh=1 强制重算存储。
+  if (path === '/api/usage' && method === 'GET') {
+    return json(await repo.getBackendStatus(env, { force: url.searchParams.get('refresh') === '1' }));
+  }
+
   // 批量操作：/api/messages/batch
   if (path === '/api/messages/batch' && method === 'POST') {
     const body = (await request.json().catch(() => null)) as { ids?: unknown; action?: unknown } | null;
@@ -161,6 +184,27 @@ async function routeApi(request: Request, env: Env, path: string, url: URL): Pro
     });
     if (!resp) return json({ error: '附件不存在' }, 404);
     return resp;
+  }
+
+  // 入站异常看板：CF 入向「收了但没解析进收件箱」的邮件（原始件仍安全保存在 R2）。
+  // 这是「什么都不写后台日志、用户无从知晓」的解药——把没收进箱的邮件显式暴露出来。
+  if (path === '/api/inbound/alerts' && method === 'GET') {
+    const alerts = await repo.listInboundAlerts(env);
+    return json({ alerts, count: alerts.length });
+  }
+
+  // 手动重放一条入站异常
+  const inboundRetryMatch = /^\/api\/inbound\/alerts\/([^/]+)\/retry$/.exec(path);
+  if (inboundRetryMatch && method === 'POST') {
+    const ok = await repo.retryInbound(env, decodeURIComponent(inboundRetryMatch[1]));
+    return ok ? json({ ok: true }) : json({ error: '未找到该入站记录' }, 404);
+  }
+
+  // 下载某封入站异常的原始 .eml（收件箱里没有时的人工兜底）
+  const inboundRawMatch = /^\/api\/inbound\/alerts\/([^/]+)\/raw$/.exec(path);
+  if (inboundRawMatch && method === 'GET') {
+    const resp = await repo.proxyInboundRaw(env, decodeURIComponent(inboundRawMatch[1]));
+    return resp || json({ error: '原始邮件不存在' }, 404);
   }
 
   return json({ error: 'Not Found' }, 404);

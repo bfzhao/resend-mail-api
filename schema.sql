@@ -49,6 +49,9 @@ CREATE INDEX IF NOT EXISTS idx_messages_sent_all  ON messages(deleted, received_
 -- 同一封 Resend 收信(email_id)只入一条（并发/重复投递兜底）
 CREATE UNIQUE INDEX IF NOT EXISTS uq_messages_inbound_resend ON messages(resend_id) WHERE direction='inbound' AND resend_id IS NOT NULL;
 
+-- 出站发信额度统计（/api/usage）：按 received_at 统计「经本服务发出」的封数，走这个偏索引避免全表扫描。见 migrations/009_outbound_sent_index.sql。
+CREATE INDEX IF NOT EXISTS idx_messages_outbound_sent ON messages(received_at) WHERE direction='outbound' AND resend_id IS NOT NULL;
+
 -- 附件元数据表（二进制内容在 R2）
 CREATE TABLE IF NOT EXISTS attachments (
     id           TEXT PRIMARY KEY,                  -- uuid
@@ -79,6 +82,26 @@ CREATE TABLE IF NOT EXISTS webhook_deliveries (
     processed_at INTEGER NOT NULL
 );
 
+-- Cloudflare 入向「绝不丢」索引（见 migrations/006_inbound_cf.sql）。
+-- CF Email Routing 是路由器、**不存信**（对比 Resend 存 30 天可重拉），所以收到信的第一件事
+-- 是把原始 .eml 流式落 R2 并在此登记，再入队异步解析 —— 任何时刻原始邮件都有持久副本。
+CREATE TABLE IF NOT EXISTS inbound_raw (
+    id           TEXT PRIMARY KEY,                  -- uuid；同时作为 Queue 指针与 webhook_deliveries 幂等 id
+    r2_key       TEXT NOT NULL,                     -- 原始 .eml 的 R2 key
+    from_email   TEXT,                              -- 信封发件人（SMTP MAIL FROM）
+    to_email     TEXT,                              -- 信封收件人（投递地址）
+    size         INTEGER NOT NULL DEFAULT 0,        -- 原始字节数（message.rawSize）
+    message_id   TEXT,                              -- 头里的 Message-ID（去尖括号），仅用于诊断
+    subject      TEXT,                              -- Subject 头（解析前就记下，供「入站异常」提示）
+    received_at  INTEGER NOT NULL,
+    parsed_at    INTEGER,                           -- 解析完成时间；NULL = 待解析
+    message_row  TEXT,                              -- 解析后写入的 messages.id（幂等：非空=已入库）
+    error        TEXT,                              -- 永久解析失败原因（原始件仍保留在 R2）
+    attempts     INTEGER NOT NULL DEFAULT 0         -- 重试次数（瞬时失败）；超阈值后不再重试
+);
+CREATE INDEX IF NOT EXISTS idx_inbound_raw_pending ON inbound_raw(parsed_at, received_at) WHERE parsed_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_inbound_raw_message_id ON inbound_raw(message_id) WHERE message_id IS NOT NULL;
+
 -- 草稿箱（写了一半的邮件）。独立成表的原因见 migrations/005_drafts.sql。
 -- 该表的列改动必须**同时**更新 005 迁移，保持「全量建库」与「增量升级」两条路径一致。
 CREATE TABLE IF NOT EXISTS drafts (
@@ -98,3 +121,12 @@ CREATE TABLE IF NOT EXISTS drafts (
 );
 CREATE INDEX IF NOT EXISTS idx_drafts_updated ON drafts(updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_drafts_mailbox ON drafts(mailbox, updated_at DESC);
+
+-- 用量统计缓存（前端显示 D1 / R2 占用百分比，提前知道何时该升级）。
+-- 值是**估算**：D1 = 各表文本/二进制列的 UTF-8 字节和；R2 = 列举对象求和。见 src/repo.ts 的 getStorageUsage。
+-- 直接实时算很贵（D1 全表扫描 / R2 列举按 Class A 计费），故按 TTL 缓存在这里。见 migrations/008_app_stats.sql。
+CREATE TABLE IF NOT EXISTS app_stats (
+    key        TEXT PRIMARY KEY,                    -- 如 'd1_bytes' / 'r2_bytes' / 'r2_objects'
+    value      INTEGER NOT NULL DEFAULT 0,
+    updated_at INTEGER NOT NULL
+);

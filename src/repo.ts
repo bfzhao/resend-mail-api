@@ -1,4 +1,4 @@
-import type { AttachmentRow, Env, Folder, MessageRow } from './types';
+import type { AttachmentRow, Env, Folder, InboundRawRow, MessageRow } from './types';
 import { nowSec, uuid, contentDisposition, jsonArr } from './util';
 
 export interface PreparedAttachment {
@@ -142,6 +142,53 @@ const LIST_SELECT = `SELECT
     (SELECT COUNT(*) FROM attachments a WHERE a.message_id = m.id) AS attachments_count
   FROM messages m`;
 
+/**
+ * 校正列表行的 `thread_count`，使其与阅读视图的会话面板口径一致。
+ *
+ * 列表的 `thread_count` 是 SQL 窗口 `COUNT(*)`（**原始行数**），而会话面板
+ * （listThread → foldLoopbackCopies）会把「同一封物理邮件的回环副本」折叠掉。
+ * 不校正就会出现用户报障的「左侧徽标 3 封、点开只有 2 封」。
+ *
+ * 单封会话（thread_count = 1）不可能含回环副本，跳过；只对页内多封会话补一次查询，
+ * 拉齐每个会话的全部行后，用与面板**同一个** foldLoopbackCopies 折叠并回填封数。
+ * （回环副本的判定与面板保持单一真源，不在 SQL 里另写一套平行逻辑。）
+ */
+async function applyFoldedThreadCounts(env: Env, items: FolderRow[]): Promise<void> {
+  const ids = items.filter((it) => (it.thread_count || 1) > 1).map((it) => it.id);
+  if (!ids.length) return;
+  const ph = ids.map(() => '?').join(',');
+  const rows = (
+    await env.DB.prepare(
+      `SELECT id, direction, mailbox, from_name, from_email, to_emails, cc, bcc, subject,
+              substr(coalesce(NULLIF(body_text, ''), ''), 1, 160) AS preview,
+              received_at, read, deleted,
+              COALESCE(NULLIF(thread_id, ''), id) AS pk
+       FROM messages
+       WHERE COALESCE(NULLIF(thread_id, ''), id) IN (
+         SELECT COALESCE(NULLIF(thread_id, ''), id) FROM messages WHERE id IN (${ph})
+       )`
+    )
+      .bind(...ids)
+      .all<ThreadRow & { pk: string }>()
+  ).results;
+
+  // 行 id → 会话主键；会话主键 → 该会话全部行（折叠只按行属性判定，不依赖顺序）。
+  const pkOf = new Map<string, string>();
+  const byPk = new Map<string, ThreadRow[]>();
+  for (const r of rows) {
+    pkOf.set(r.id, r.pk);
+    const g = byPk.get(r.pk);
+    if (g) g.push(r);
+    else byPk.set(r.pk, [r]);
+  }
+  for (const it of items) {
+    if ((it.thread_count || 1) <= 1) continue;
+    const pk = pkOf.get(it.id);
+    const group = pk ? byPk.get(pk) : undefined;
+    if (group) it.thread_count = foldLoopbackCopies(group).length;
+  }
+}
+
 export async function listFolder(env: Env, opts: ListOpts): Promise<{ items: FolderRow[]; total: number }> {
   // unread 不在 whereForFolder 里处理，而是靠外部窗口函数算出的 thread_unread 过滤，
   // 这样「只看未读」时能看到「包含未读邮件的整个 thread 的最新一封」，而不是仅那封未读本身。
@@ -201,6 +248,9 @@ export async function listFolder(env: Env, opts: ListOpts): Promise<{ items: Fol
   const totalRow = (
     await env.DB.prepare(totalSql).bind(...w.params).first<{ n: number }>()
   )?.n ?? 0;
+
+  // 徽标封数与会话面板对齐（折叠回环副本）。见 applyFoldedThreadCounts。
+  await applyFoldedThreadCounts(env, items);
 
   return { items, total: totalRow };
 }
@@ -958,4 +1008,286 @@ export async function proxyAttachment(
 
   if (!obj.body) return null;
   return new Response(obj.body, { headers });
+}
+
+/* ---------------- 入站异常看板（CF 入向「收了但没进收件箱」的可见性） ---------------- */
+
+/** 一条「入站异常」的对外形状。 */
+export interface InboundAlert {
+  id: string;
+  from: string | null;
+  to: string | null;
+  subject: string | null;
+  size: number;
+  received_at: number;
+  error: string | null;
+  attempts: number;
+  /** true = 仍在重试/待处理（尚无 error）；false = 已判定失败。 */
+  pending: boolean;
+}
+
+/** 超过这个秒数仍未解析完成，就算「卡住」而不是「正在处理」。 */
+const INBOUND_PENDING_GRACE_SEC = 600;
+
+/**
+ * 列出「入站异常」：要么已记 error，要么收到超过 10 分钟仍没解析完成。
+ *
+ * 收信路径已保证原始件在 R2、索引在 inbound_raw —— 这个列表把这些「没进收件箱」的邮件
+ * **暴露到界面上**（否则它们只是后台日志，用户永远不知道丢了什么）。
+ * 已入库（message_row 非空）的不算异常。
+ */
+export async function listInboundAlerts(env: Env, limit = 50): Promise<InboundAlert[]> {
+  const rows = await env.DB.prepare(
+    `SELECT id, from_email, to_email, subject, size, received_at, parsed_at, error, attempts
+       FROM inbound_raw
+      WHERE message_row IS NULL
+        AND (error IS NOT NULL OR (parsed_at IS NULL AND received_at < ?))
+      ORDER BY received_at DESC
+      LIMIT ?`
+  )
+    .bind(nowSec() - INBOUND_PENDING_GRACE_SEC, limit)
+    .all<{
+      id: string;
+      from_email: string | null;
+      to_email: string | null;
+      subject: string | null;
+      size: number;
+      received_at: number;
+      parsed_at: number | null;
+      error: string | null;
+      attempts: number;
+    }>();
+  return (rows.results ?? []).map((r) => ({
+    id: r.id,
+    from: r.from_email,
+    to: r.to_email,
+    subject: r.subject,
+    size: r.size,
+    received_at: r.received_at,
+    error: r.error,
+    attempts: r.attempts,
+    pending: r.error == null,
+  }));
+}
+
+/** 取一条 inbound_raw 索引行。 */
+export async function getInboundRaw(env: Env, id: string): Promise<InboundRawRow | null> {
+  return env.DB.prepare('SELECT * FROM inbound_raw WHERE id = ?').bind(id).first<InboundRawRow>();
+}
+
+/**
+ * 手动重放一条入站异常：清掉 error、归零 attempts、`parsed_at` 置 NULL，再入队重解析。
+ * 幂等由消费者保证（message_row / findInboundByResendId）。
+ */
+export async function retryInbound(env: Env, id: string): Promise<boolean> {
+  const row = await env.DB.prepare('SELECT id FROM inbound_raw WHERE id = ?')
+    .bind(id)
+    .first<{ id: string }>();
+  if (!row) return false;
+  await env.DB.prepare('UPDATE inbound_raw SET error = NULL, attempts = 0, parsed_at = NULL WHERE id = ?')
+    .bind(id)
+    .run();
+  if (env.INBOUND_QUEUE) await env.INBOUND_QUEUE.send({ rawId: id });
+  return true;
+}
+
+/** 把某封入站异常的**原始 .eml** 取出来给用户下载（收件箱里没有时的兜底）。 */
+export async function proxyInboundRaw(env: Env, id: string): Promise<Response | null> {
+  const row = await getInboundRaw(env, id);
+  if (!row) return null;
+  const obj = await env.BUCKET.get(row.r2_key);
+  if (!obj || !obj.body) return null;
+  const headers = new Headers();
+  headers.set('Content-Type', 'message/rfc822');
+  headers.set('Content-Disposition', contentDisposition('attachment', `inbound-${id}.eml`));
+  headers.set('Content-Length', String(obj.size));
+  headers.set('X-Content-Type-Options', 'nosniff');
+  headers.set('Cache-Control', 'private, max-age=3600');
+  return new Response(obj.body, { headers });
+}
+
+/* ---------------- 后端基础状态（CF 存储/入站 + Resend 额度），前端一屏看清、提前知道何时该升级 ----------------
+ * 免费档容量：CF D1 单库 500MB、R2 10GB；Resend 100 封/天、3000 封/月。
+ * 存储只能**估算**：
+ *   · D1：无 pragma 权限（页面/文件大小读不到）、也没有数据库大小 API → 累计各表 TEXT/BLOB 列的
+ *     UTF-8 字节。注意 `LENGTH(文本)` 按**字符**算、必须 `CAST(x AS BLOB)` 才按字节。
+ *   · R2：没有「桶大小」接口 → 列举对象逐个累加 size。
+ * 两者都不便宜（D1 全表扫描、R2 列举按 Class A 计费），故结果缓存进 app_stats，默认 6 小时才重算。
+ * 入站计数（inbound_raw COUNT）与发信额度（messages COUNT）很便宜，每次实时算。
+ */
+
+/** 免费档容量上限（字节）。付费档用 env.D1_LIMIT_BYTES / env.R2_LIMIT_BYTES 覆盖。 */
+const D1_FREE_LIMIT = 500 * 1024 * 1024;
+const R2_FREE_LIMIT = 10 * 1024 * 1024 * 1024;
+/** Resend 免费档发信额度（封/天、封/月）。付费档用 env.RESEND_DAY_LIMIT / RESEND_MONTH_LIMIT 覆盖。 */
+const RESEND_DAY_FREE = 100;
+const RESEND_MONTH_FREE = 3000;
+/** 用量缓存时长（秒）：到期后下次请求才重算，避免每次开页面都全表扫描 / 列举对象。 */
+const USAGE_TTL_SEC = 6 * 3600;
+/** 列举 R2 的安全阀：最多翻这么多页（每页 1000），防止对象极多时请求超时。 */
+const R2_LIST_MAX_PAGES = 100;
+
+/** 后端基础状态：CF（D1/R2 占用 + 入站队列）+ Resend（发信额度），供前端一屏看清。 */
+export interface BackendStatus {
+  d1: { usedBytes: number; limitBytes: number; percent: number };
+  r2: { usedBytes: number; limitBytes: number; percent: number; objects: number };
+  /** CF 入向流水线状态（never-lose）：待解析 / 异常 / 累计收信。 */
+  inbound: { pending: number; alerts: number; total: number };
+  /** Resend 出向额度：今日 / 本月已发的封数（按我们自己的出站记录估算）。 */
+  resend: {
+    configured: boolean;
+    day: { used: number; limit: number; percent: number };
+    month: { used: number; limit: number; percent: number };
+  };
+  /** 存储数据时间（D1 / R2 两次采样里较早的 updated_at，秒）。 */
+  updatedAt: number;
+  /** D1/R2 是估算值（见上方说明），前端应标注「约」。 */
+  approximate: boolean;
+}
+
+function pct(used: number, limit: number): number {
+  if (!limit) return 0;
+  return Math.round((used / limit) * 1000) / 10; // 保留一位小数
+}
+
+/** 汇总各表 TEXT/BLOB 列的 UTF-8 字节数，作为 D1 占用的估算（真实文件含索引/pages 会略大）。 */
+async function estimateD1Bytes(env: Env): Promise<number> {
+  const tables = await env.DB.prepare(
+    `SELECT name FROM sqlite_master
+      WHERE type = 'table'
+        AND name NOT LIKE 'sqlite_%'
+        AND name <> 'd1_migrations'
+        AND substr(name, 1, 3) <> '_cf'`
+  ).all<{ name: string }>();
+  let total = 0;
+  for (const t of tables.results ?? []) {
+    const ident = t.name.replace(/"/g, '""');
+    const cols = await env.DB.prepare(
+      `SELECT name FROM pragma_table_info('${t.name.replace(/'/g, "''")}')
+        WHERE type LIKE '%TEXT%' OR type LIKE '%BLOB%'`
+    ).all<{ name: string }>();
+    const names = (cols.results ?? []).map((c) => c.name);
+    if (!names.length) continue;
+    const expr = names.map((n) => `LENGTH(CAST(COALESCE("${n.replace(/"/g, '""')}",'') AS BLOB))`).join(' + ');
+    const row = await env.DB.prepare(`SELECT COALESCE(SUM(${expr}), 0) AS b FROM "${ident}"`).first<{ b: number }>();
+    total += Number(row?.b || 0);
+  }
+  return total;
+}
+
+/** 列举整个 R2 桶，累加对象大小与个数。 */
+async function measureR2(env: Env): Promise<{ bytes: number; objects: number }> {
+  let cursor: string | undefined;
+  let bytes = 0;
+  let objects = 0;
+  let pages = 0;
+  do {
+    const res = await env.BUCKET.list(cursor ? { cursor, limit: 1000 } : { limit: 1000 });
+    for (const o of res.objects) {
+      bytes += o.size;
+      objects++;
+    }
+    cursor = res.truncated ? res.cursor : undefined;
+    pages++;
+  } while (cursor && pages < R2_LIST_MAX_PAGES);
+  return { bytes, objects };
+}
+
+/** CF 入向流水线状态：待解析（parsed_at IS NULL）、异常（与提示条同口径）、累计收信。 */
+async function inboundStatus(env: Env): Promise<{ pending: number; alerts: number; total: number }> {
+  const pending = await env.DB.prepare('SELECT COUNT(*) AS n FROM inbound_raw WHERE parsed_at IS NULL')
+    .first<{ n: number }>();
+  const alerts = await env.DB.prepare(
+    `SELECT COUNT(*) AS n FROM inbound_raw
+      WHERE message_row IS NULL
+        AND (error IS NOT NULL OR (parsed_at IS NULL AND received_at < ?))`
+  )
+    .bind(nowSec() - INBOUND_PENDING_GRACE_SEC)
+    .first<{ n: number }>();
+  const total = await env.DB.prepare('SELECT COUNT(*) AS n FROM inbound_raw').first<{ n: number }>();
+  return { pending: Number(pending?.n || 0), alerts: Number(alerts?.n || 0), total: Number(total?.n || 0) };
+}
+
+/**
+ * Resend 出向额度用量：统计我们自己发出（resend_id 非空）的封数。
+ * 免费档 100/天、3000/月，UTC 0 点与月初重置。注意：只统计经本服务发出的，
+ * 若同一 Resend 账号还从别处发信，这里会偏低。
+ */
+async function resendUsage(env: Env): Promise<{ day: number; month: number }> {
+  const now = nowSec();
+  const d = new Date(now * 1000);
+  const dayStart = Math.floor(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()) / 1000);
+  const monthStart = Math.floor(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1) / 1000);
+  const row = await env.DB.prepare(
+    `SELECT
+       COALESCE(SUM(CASE WHEN received_at >= ? THEN 1 ELSE 0 END), 0) AS day,
+       COALESCE(SUM(CASE WHEN received_at >= ? THEN 1 ELSE 0 END), 0) AS month
+     FROM messages
+     WHERE direction = 'outbound' AND resend_id IS NOT NULL`
+  )
+    .bind(dayStart, monthStart)
+    .first<{ day: number; month: number }>();
+  return { day: Number(row?.day || 0), month: Number(row?.month || 0) };
+}
+
+async function readStat(env: Env, key: string): Promise<{ value: number; updated_at: number } | null> {
+  return env.DB.prepare('SELECT value, updated_at FROM app_stats WHERE key = ?')
+    .bind(key)
+    .first<{ value: number; updated_at: number }>();
+}
+
+async function writeStat(env: Env, key: string, value: number, at: number): Promise<void> {
+  await env.DB.prepare(
+    `INSERT INTO app_stats (key, value, updated_at) VALUES (?, ?, ?)
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+  )
+    .bind(key, value, at)
+    .run();
+}
+
+/**
+ * 取后端基础状态：CF（D1/R2 占用 + 入站队列）+ Resend（发信额度）。
+ * D1/R2 走缓存（`force` 强制重算）；入站计数与发信额度很便宜，每次实时算。
+ */
+export async function getBackendStatus(env: Env, opts: { force?: boolean } = {}): Promise<BackendStatus> {
+  const now = nowSec();
+  const stale = (s: { updated_at: number } | null): boolean => opts.force || !s || now - s.updated_at > USAGE_TTL_SEC;
+
+  let d1 = await readStat(env, 'd1_bytes');
+  if (stale(d1)) {
+    const bytes = await estimateD1Bytes(env);
+    await writeStat(env, 'd1_bytes', bytes, now);
+    d1 = { value: bytes, updated_at: now };
+  }
+
+  let r2 = await readStat(env, 'r2_bytes');
+  let r2Objects = await readStat(env, 'r2_objects');
+  if (stale(r2)) {
+    const m = await measureR2(env);
+    await writeStat(env, 'r2_bytes', m.bytes, now);
+    await writeStat(env, 'r2_objects', m.objects, now);
+    r2 = { value: m.bytes, updated_at: now };
+    r2Objects = { value: m.objects, updated_at: now };
+  }
+
+  const [inbound, resend] = await Promise.all([inboundStatus(env), resendUsage(env)]);
+
+  const d1Limit = Number(env.D1_LIMIT_BYTES) || D1_FREE_LIMIT;
+  const r2Limit = Number(env.R2_LIMIT_BYTES) || R2_FREE_LIMIT;
+  const dayLimit = Number(env.RESEND_DAY_LIMIT) || RESEND_DAY_FREE;
+  const monthLimit = Number(env.RESEND_MONTH_LIMIT) || RESEND_MONTH_FREE;
+  const d1Used = d1?.value ?? 0;
+  const r2Used = r2?.value ?? 0;
+  return {
+    d1: { usedBytes: d1Used, limitBytes: d1Limit, percent: pct(d1Used, d1Limit) },
+    r2: { usedBytes: r2Used, limitBytes: r2Limit, percent: pct(r2Used, r2Limit), objects: r2Objects?.value ?? 0 },
+    inbound,
+    resend: {
+      configured: Boolean(env.RESEND_API_KEY),
+      day: { used: resend.day, limit: dayLimit, percent: pct(resend.day, dayLimit) },
+      month: { used: resend.month, limit: monthLimit, percent: pct(resend.month, monthLimit) },
+    },
+    updatedAt: Math.min(d1?.updated_at ?? now, r2?.updated_at ?? now),
+    approximate: true,
+  };
 }

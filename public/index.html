@@ -17,6 +17,9 @@
         <select id="mailbox-select" title="切换收件地址"></select>
       </div>
       <nav id="folder-nav"></nav>
+      <!-- 后端基础状态：CF 存储占用/入站队列 + Resend 发信额度（估算）；贴近上限或有异常/积压时变色。
+           平时隐藏；由 app.js 的 loadBackendStatus() 填充。 -->
+      <div id="backend-status" class="hidden"></div>
       <div id="sidebar-status" hidden>未连接 API</div>
     </aside>
 
@@ -24,6 +27,9 @@
     <div id="drawer-mask"></div>
 
     <div id="workspace">
+      <!-- 入站异常提示：CF 入向「收到了但没解析进收件箱」的邮件（原始件仍在 R2 可下载）。
+           平时隐藏；由 app.js 的 loadInboundAlerts() 填充。 -->
+      <div id="inbound-alerts" class="hidden" role="status" aria-live="polite"></div>
       <header id="topbar">
         <!-- 移动端：打开文件夹抽屉（桌面端由 CSS 隐藏） -->
         <button id="drawer-btn" class="icon-btn" type="button" aria-label="打开文件夹" aria-controls="sidebar">☰</button>

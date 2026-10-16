@@ -32,7 +32,10 @@ const CACHE_KEY = 'inbox-cache-v1';
 // v3：会话归组的根因修复（Resend 的 References 是 JSON 数组文本，旧解析产出畸形 thread_id）
 //     —— 旧快照里的 thread 数组是按错误分组拼出来的，必须整份作废；
 //     同时新增「草稿」文件夹，counts 多了 drafts_total 字段。
-const CACHE_VERSION = 3;
+// v4：列表行的 thread_count 改为「折叠回环副本后」的封数（见 src/repo.ts applyFoldedThreadCounts），
+//     与会话面板口径对齐。旧快照里的列表徽标仍是折叠前的原始行数（如 3 vs 2），
+//     而列表 revalidate 的指纹不含 thread_count，不升版会一直显示旧徽标。
+const CACHE_VERSION = 4;
 const PERSIST_DEBOUNCE_MS = 300;
 
 /* 已打开邮件正文的内存 LRU：最多 40 封或合计 2MB，先到为准。 */
@@ -3649,9 +3652,140 @@ async function periodicSync() {
   if (document.hidden) return;
   void refreshCounts(false); // 内部按 TTL.counts 判断
   void loadMailboxes(false); // 内部按 TTL.mailboxes 判断
+  void loadInboundAlerts();  // 入站异常提示（每次同步都查，保证卡住的邮件能被看到）
+  void loadBackendStatus();  // 后端状态（CF 存储/入站 + Resend 额度；存储走 TTL 缓存，很便宜）
   if (isReadMode() || state.loading) return;
   const c = state.cache.folders.get(folderKey());
   if (!c || Date.now() - c.at >= TTL.folder) void loadFolder(false, false);
+}
+
+/* ---------------- 入站异常提示（CF 入向「收了但没进收件箱」） ----------------
+ * CF Email Routing 不存信，收信链路是「先落 R2 + 登记，再异步解析」；一旦解析因
+ * CPU/内存（免费档 10ms）、瞬时故障或大附件而没能完成，邮件就只躺在后台 —— 用户无从知晓。
+ * 这里把它显式暴露成顶部提示条：显示发件人/主题/大小/原因，并给「重试 / 下载原件」两个动作。 */
+
+let inboundAlertsExpanded = false;
+
+async function loadInboundAlerts() {
+  let data;
+  try {
+    data = await api('/api/inbound/alerts');
+  } catch {
+    return; // 附加能力：拉取失败静默，不打扰主流程
+  }
+  renderInboundAlerts((data && data.alerts) || []);
+}
+
+function renderInboundAlerts(alerts) {
+  const box = $('#inbound-alerts');
+  if (!box) return;
+  if (!alerts.length) {
+    box.classList.add('hidden');
+    box.textContent = '';
+    return;
+  }
+  box.classList.remove('hidden');
+  const items = alerts.map((a) => {
+    const subject = a.subject
+      ? `<span class="ia-subject" title="${esc(a.subject)}">${esc(a.subject)}</span>`
+      : '<span class="ia-subject"><span class="ia-empty">（无主题）</span></span>';
+    const metaParts = [];
+    if (a.from) metaParts.push(`来自 ${esc(a.from)}`);
+    if (a.to) metaParts.push(`投递给 ${esc(a.to)}`);
+    if (a.size) metaParts.push(fmtSize(a.size));
+    if (a.received_at) metaParts.push(fmtDateTime(a.received_at));
+    const errText = a.error ? esc(a.error) : '仍在处理，或邮件过大（免费档 CPU 限制）';
+    return `<li class="ia-item" data-id="${esc(a.id)}">
+        <div class="ia-main">
+          ${subject}
+          <span class="ia-meta">${metaParts.join(' · ')}</span>
+          <span class="ia-error">${errText}</span>
+        </div>
+        <div class="ia-actions">
+          <button class="btn ia-retry" type="button">重试</button>
+          <a class="btn" href="/api/inbound/alerts/${encodeURIComponent(a.id)}/raw">下载原件</a>
+        </div>
+      </li>`;
+  }).join('');
+  box.innerHTML = `<div class="ia-head">
+      <span class="ia-icon" aria-hidden="true">⚠️</span>
+      <span class="ia-title">有 ${alerts.length} 封邮件已收到，但还没进入收件箱</span>
+      <button class="link-btn ia-toggle" type="button">${inboundAlertsExpanded ? '收起' : '查看'}</button>
+    </div>
+    <ul class="ia-list"${inboundAlertsExpanded ? '' : ' hidden'}>${items}</ul>`;
+  if (!box.dataset.bound) {
+    box.dataset.bound = '1';
+    box.addEventListener('click', onInboundAlertClick);
+  }
+}
+
+async function onInboundAlertClick(e) {
+  const toggle = e.target.closest('.ia-toggle');
+  if (toggle) {
+    inboundAlertsExpanded = !inboundAlertsExpanded;
+    const list = $('#inbound-alerts .ia-list');
+    if (list) list.classList.toggle('hidden', !inboundAlertsExpanded);
+    toggle.textContent = inboundAlertsExpanded ? '收起' : '查看';
+    return;
+  }
+  const retry = e.target.closest('.ia-retry');
+  if (!retry) return;
+  const item = retry.closest('.ia-item');
+  const id = item && item.dataset.id;
+  if (!id) return;
+  retry.disabled = true;
+  retry.textContent = '重试中…';
+  try {
+    await api(`/api/inbound/alerts/${encodeURIComponent(id)}/retry`, { method: 'POST' });
+    showToast('已重新入队，稍后会再次尝试解析');
+    setTimeout(() => void loadInboundAlerts(), 1500);
+  } catch (err) {
+    showToast(err.message, true);
+    retry.disabled = false;
+    retry.textContent = '重试';
+  }
+}
+
+/* ---------------- 后端基础状态：CF（存储/入站队列）+ Resend（发信额度） ----------------
+ * 一屏看清后端：CF 免费档 D1 500MB / R2 10GB、Resend 免费档 100 封/天 · 3000 封/月。
+ * D1/R2 是后端估算并按 TTL 缓存；入站计数与发信额度实时。贴近上限 / 有异常积压时变色提醒。 */
+
+async function loadBackendStatus() {
+  let u;
+  try {
+    u = await api('/api/usage');
+  } catch {
+    return; // 附加能力：拉取失败静默，不打扰主流程
+  }
+  renderBackendStatus(u);
+}
+
+function renderBackendStatus(u) {
+  const box = $('#backend-status');
+  if (!box || !u || !u.d1 || !u.r2) return;
+  const inbound = u.inbound || { pending: 0, alerts: 0 };
+  const resend = u.resend || null;
+  const percents = [u.d1.percent, u.r2.percent];
+  if (resend && resend.configured) percents.push(resend.day.percent, resend.month.percent);
+  const max = percents.length ? Math.max(...percents) : 0;
+  box.classList.remove('hidden', 'warn', 'danger');
+  if (max >= 95) box.classList.add('danger');
+  else if (max >= 80) box.classList.add('warn');
+
+  const rows = [
+    `<span class="bs-row" title="${esc(`D1 约 ${fmtSize(u.d1.usedBytes)} / ${fmtSize(u.d1.limitBytes)}`)}">D1 <b>${u.d1.percent}%</b></span>`,
+    `<span class="bs-row" title="${esc(`R2 约 ${fmtSize(u.r2.usedBytes)} / ${fmtSize(u.r2.limitBytes)} · ${u.r2.objects} 个对象`)}">R2 <b>${u.r2.percent}%</b></span>`,
+    `<span class="bs-row${inbound.alerts ? ' bs-attn' : ''}" title="待解析 / 异常 / 累计收信">收件 <b>${inbound.pending}</b> 待处理${inbound.alerts ? ` · <b>${inbound.alerts}</b> 异常` : ''}</span>`,
+  ];
+  if (resend && resend.configured) {
+    rows.push(
+      `<span class="bs-row" title="${esc(`Resend 今日 ${resend.day.used}/${resend.day.limit} · 本月 ${resend.month.used}/${resend.month.limit}`)}">发件 <b>${resend.day.used}</b>/${resend.day.limit} · 月 <b>${resend.month.used}</b>/${resend.month.limit}</span>`
+    );
+  }
+  box.innerHTML =
+    '<span class="bs-title">后端状态</span>' +
+    rows.join('') +
+    `<span class="bs-note">${esc(u.approximate ? '存储为估算值' : '')}${u.approximate ? '·' : ''}贴近上限或积压会变色提醒</span>`;
 }
 
 /* ---------------- 初始化 ---------------- */
@@ -3698,6 +3832,8 @@ async function init() {
     loadMailboxes(true),
     refreshCounts(true),
     loadFolder(),
+    loadInboundAlerts(),
+    loadBackendStatus(),
   ]);
 
   if (state.mailbox !== mailboxAtStart) void loadFolder(false, true); // 缓存里的账号已失效，按纠正后的账号重拉
