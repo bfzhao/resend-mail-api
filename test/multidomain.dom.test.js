@@ -242,13 +242,16 @@ async function test(name, fn) {
     ok(rows.length === 1, 'other.com 视图只显示 1 封（B）', `rows=${rows.length}`);
   });
 
-  await test('D3 负控制：仅一个域名时域名条隐藏', async (ctx) => {
+  await test('D3 仅一个域名：域名条仍可见且只显示该域名（无「全部域名」块）', async (ctx) => {
     // Re-boot with a single-domain account.
     for (const c of liveCtxs.splice(0)) c.close();
     const single = await boot({ account: { can_send: true, from_name: 'Me', from_address: 'a@example.com', domain: 'example.com', domains: ['example.com'] } });
     const bar = el(single, '#domain-bar');
     ok(!!bar, '#domain-bar 存在于 DOM');
-    ok(bar.classList.contains('hidden'), '只配置一个域名 -> 域名条隐藏', JSON.stringify(chips(single).map((c) => c.textContent)));
+    ok(!bar.classList.contains('hidden'), '只配置一个域名 -> 域名条仍可见', JSON.stringify(chips(single).map((c) => c.textContent)));
+    const labels = chips(single).map((c) => c.textContent);
+    ok(labels.length === 1 && labels[0] === 'example.com', '只显示一个域名块且无「全部域名」', JSON.stringify(labels));
+    ok(chips(single)[0].classList.contains('active'), '唯一域名块处于选中态');
   });
 
   console.log(`\n===== 结果: ${pass} passed, ${fail} failed =====`);

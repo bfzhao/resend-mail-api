@@ -94,10 +94,6 @@ html, body {
   color: var(--text);
 }
 
-/* Add-domain entry: opens the domain wizard to configure extra domains after the first one. */
-#domain-manage { padding: 0 12px 8px; }
-.add-domain-btn { font-size: 13px; }
-
 #folder-nav { flex: 1; overflow-y: auto; }
 .folder-item {
   display: flex;
@@ -178,32 +174,46 @@ html, body {
 
 #topbar-actions { display: flex; gap: 8px; margin-left: auto; align-items: center; }
 
-/* Multi-domain: domain filter strip (app.js removes `hidden` only when several domains are configured).
-   Clicking a domain narrows the inbox/sidebar/sender dropdown to that domain. */
+/* Multi-domain: the domain list sits to the right of the search box (renderDomainBar in app.js); ＋ 域名 opens the
+   add-domain wizard. Clicking a domain narrows the inbox/sidebar/sender dropdown to that domain. */
 #domain-bar {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 8px 16px;
-  background: var(--panel);
-  border-bottom: 1px solid var(--border);
+  gap: 6px;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 42vw;
   overflow-x: auto;
-  flex: 0 0 auto;
 }
 .domain-chip {
   flex: 0 0 auto;
   border: 1px solid var(--border);
   background: var(--panel-2);
   color: var(--text);
-  font-size: 13px;
+  font-size: 12px;
   font-family: inherit;
-  padding: 4px 12px;
+  padding: 4px 10px;
   border-radius: 999px;
   cursor: pointer;
   white-space: nowrap;
 }
 .domain-chip:hover { border-color: var(--accent-strong); }
 .domain-chip.active { background: var(--accent-strong); border-color: var(--accent-strong); color: #fff; }
+/* Add-domain entry pinned to the top-right of the top bar. */
+.add-domain-btn {
+  flex: 0 0 auto;
+  margin-left: auto;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--text);
+  font-size: 13px;
+  font-family: inherit;
+  padding: 5px 12px;
+  border-radius: 999px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.add-domain-btn:hover { border-color: var(--accent-strong); }
 
 /* ---------- Two-column body ---------- */
 #main-split { flex: 1; display: flex; min-height: 0; }
@@ -946,7 +956,10 @@ html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
     padding: 6px 10px;
     padding-top: calc(6px + env(safe-area-inset-top));
     gap: 8px;
+    flex-wrap: wrap;
   }
+  /* The domain list drops to its own full-width row on mobile (order: 10), keeping the search box on the first row. */
+  #domain-bar { order: 10; flex: 1 1 100%; max-width: none; }
   .icon-btn {
     display: inline-flex;
     align-items: center;

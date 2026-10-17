@@ -9,7 +9,7 @@
  * Exit code: 0 = all passed; 1 = some failed.
  *
  * Covers:
- *   1) The sidebar exposes an "add domain" button; clicking it opens the domain wizard in "adding" mode
+ *   1) The top bar (top-right) exposes an "add domain" button; clicking it opens the domain wizard in "adding" mode
  *      (title/subject switch, the setup-only "skip" control is gone, the domain field starts empty);
  *   2) Client-side guard: submitting with missing fields shows an error and sends no request;
  *   3) Happy path: the form POSTs /api/setup/domain (with worker_name) and, on success, closes the overlay and
@@ -171,7 +171,7 @@ async function test(name, fn) {
 (async () => {
   console.log(`被测版本: app.js md5=${FINGERPRINT['public/app.js']}  index.html md5=${FINGERPRINT['public/index.html']}`);
 
-  await test('A1 侧栏「添加域名」入口：点击打开向导（adding 模式）', async (ctx) => {
+  await test('A1 顶栏「添加域名」入口：点击打开向导（adding 模式）', async (ctx) => {
     const btn = el(ctx, '#add-domain-btn');
     ok(!!btn, '#add-domain-btn 存在于 DOM');
     ok(!gate(ctx), '前置：未打开向导时不注入 #gate（懒创建）');
@@ -203,8 +203,10 @@ async function test(name, fn) {
 
   await test('A3 提交成功：POST /api/setup/domain（带 worker_name），关闭浮层并刷新域名条', async (ctx) => {
     ctx.stub.calls.length = 0;
-    // Before: only one domain -> strip hidden.
-    ok(el(ctx, '#domain-bar').classList.contains('hidden'), '前置：添加前域名条隐藏（仅一个域名）');
+    // Before: a single domain -> the list is visible and shows exactly that one domain (no "全部域名" chip yet).
+    ok(!el(ctx, '#domain-bar').classList.contains('hidden'), '前置：仅一个域名时域名条也可见');
+    const beforeChips = Array.from(ctx.doc.querySelectorAll('#domain-bar .domain-chip')).map((c) => c.textContent);
+    ok(beforeChips.length === 1 && beforeChips[0] === 'example.com', '前置：只显示 example.com 一个域名块', JSON.stringify(beforeChips));
 
     clickEl(ctx, el(ctx, '#add-domain-btn'));
     await ticks(ctx.win, 3);

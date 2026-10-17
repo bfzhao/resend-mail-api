@@ -863,29 +863,31 @@ function addrDomain(addr) {
   return at > 0 && at < s.length - 1 ? s.slice(at + 1) : '';
 }
 
-/** Render the domain filter strip. Hidden when fewer than two domains are configured (nothing to filter). */
+/** Render the domain list next to the search box. Hidden only when no domain is configured. */
 function renderDomainBar() {
   const bar = $('#domain-bar');
   if (!bar) return;
   const list = Array.isArray(state.domains) ? state.domains : [];
-  if (list.length < 2) {
+  if (list.length < 1) {
     bar.classList.add('hidden');
     bar.innerHTML = '';
     return;
   }
   bar.classList.remove('hidden');
   bar.innerHTML = '';
-  const make = (value, label) => {
+  const single = list.length === 1;
+  const make = (value, label, active) => {
     const btn = document.createElement('button');
     btn.type = 'button';
-    btn.className = 'domain-chip' + (state.domain === value ? ' active' : '');
+    btn.className = 'domain-chip' + (active || state.domain === value ? ' active' : '');
     btn.dataset.domain = value;
     btn.textContent = label;
     btn.addEventListener('click', () => switchDomain(value));
     return btn;
   };
-  bar.appendChild(make('', '全部域名'));
-  for (const d of list) bar.appendChild(make(d, d));
+  // "全部域名" only adds meaning once several domains exist; with a single domain we show just that one (marked active).
+  if (list.length >= 2) bar.appendChild(make('', '全部域名', false));
+  for (const d of list) bar.appendChild(make(d, d, single));
 }
 
 /** Switch the domain filter: re-fetch the list, counts and mailbox list for the new domain. */

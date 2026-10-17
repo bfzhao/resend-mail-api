@@ -16,10 +16,6 @@
       <div id="mailbox-wrap" class="hidden">
         <select id="mailbox-select" title="切换收件地址"></select>
       </div>
-      <!-- Add-domain entry (multi-domain): opens the same wizard used at setup, to configure extra domains later. -->
-      <div id="domain-manage">
-        <button id="add-domain-btn" class="link-btn add-domain-btn" type="button">＋ 添加域名</button>
-      </div>
       <nav id="folder-nav"></nav>
       <!-- Backend basics: CF storage usage / inbound queue + Resend send quota (estimated); changes color near the limit or on errors/backlog.
            Hidden by default; filled by loadBackendStatus() in app.js. -->
@@ -40,14 +36,15 @@
         <div id="search-box">
           <input id="search-input" type="search" placeholder="搜索邮件…" autocomplete="off" />
         </div>
+        <!-- Domain list (multi-domain): filled by renderDomainBar() in app.js; shown to the right of the search box.
+             Clicking a domain filters the inbox/sidebar/sender dropdown to it. -->
+        <div id="domain-bar" class="hidden" role="tablist" aria-label="域名筛选"></div>
+        <!-- Add-domain entry: opens the wizard to configure extra domains later. -->
+        <button id="add-domain-btn" class="add-domain-btn" type="button" title="添加域名">＋ 域名</button>
         <!-- Mobile: once the sidebar moves into the drawer, the top bar needs a directly clickable compose entry (hidden by CSS on desktop) -->
         <button id="topbar-compose" class="btn btn-primary" type="button">写信</button>
         <div id="topbar-actions" class="hidden"></div>
       </header>
-
-      <!-- Domain filter strip (multi-domain): filled by renderDomainBar() in app.js; shown only when several domains are configured.
-           Clicking a domain filters the inbox/sidebar/sender dropdown to it. -->
-      <div id="domain-bar" class="hidden" role="tablist" aria-label="域名筛选"></div>
 
       <div id="main-split">
         <!-- Left: message list -->
