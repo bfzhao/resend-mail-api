@@ -1,24 +1,24 @@
 'use strict';
 
 /* =============================================================================
- * 草稿箱前端 —— 真实 jsdom + 完整 index.html + 完整 app.js
+ * Drafts (compose drafts) frontend -- real jsdom + full index.html + full app.js
  *
- * 运行：
- *   NODE_PATH=C:\Users\Bingfeng\.workbuddy-ai\binaries\node\workspace\node_modules \
+ * Run:
+ *   NODE_PATH=<NODE_PATH> \
  *     <node.exe> test/drafts-ui.dom.test.js
  *
- * 退出码：0 = 全部通过；1 = 存在失败。
+ * Exit code: 0 = all passed; 1 = some failed.
  *
- * 覆盖：
- *   · 侧边栏「草稿」入口与徽标（与收件箱未读徽标**口径不混用**）
- *   · 草稿列表复用同一套列表渲染（服务端把草稿伪装成 direction='draft' 的行）
- *   · 点草稿行 -> 打开写信弹窗并预填（而不是打开详情）
- *   · 行内 × 删除草稿（且不能顺带打开弹窗）
- *   · 恢复草稿后发送 -> 请求体必须带 draft_id（服务端据此删掉草稿）
+ * Covers:
+ *   · Sidebar "drafts" entry and badge (its meaning is **not mixed up** with the inbox unread badge)
+ *   · The draft list reuses the same list renderer (the server disguises drafts as rows with direction='draft')
+ *   · Clicking a draft row -> opens the composer and prefills it (rather than opening the detail)
+ *   · Inline × deletes the draft (and must not also open the composer)
+ *   · Sending after restoring a draft -> the request body must carry draft_id (the server deletes the draft based on it)
  *
- * 「写了一半自动存草稿 / 关窗存草稿」的行为在 test/compose-guard*.test.js 覆盖，这里不重复。
+ * The "auto-save draft while writing / save draft on close" behavior is covered by test/compose-guard*.test.js and not repeated here.
  *
- * 本文件不修改 public/ 下任何源码。
+ * This file does not modify any source under public/.
  * ===========================================================================*/
 
 const fs = require('fs');
@@ -27,7 +27,7 @@ const crypto = require('crypto');
 const { JSDOM } = require('jsdom');
 
 const ROOT = path.join(__dirname, '..');
-// QA_APP_JS / QA_INDEX_HTML 仅用于「变异验证」：指向人工构造的缺陷版本（放仓库外）。
+// QA_APP_JS / QA_INDEX_HTML are only for "mutation verification": point to hand-crafted defective versions (kept outside the repo).
 const APP_JS_PATH = process.env.QA_APP_JS || path.join(ROOT, 'public', 'app.js');
 const INDEX_PATH = process.env.QA_INDEX_HTML || path.join(ROOT, 'public', 'index.html');
 const APP_JS = fs.readFileSync(APP_JS_PATH, 'utf8');
@@ -39,7 +39,7 @@ const FINGERPRINT = {
 };
 
 /* ---------------------------------------------------------------------------
- * fetch 打桩
+ * fetch stub
  * -------------------------------------------------------------------------*/
 
 function makeStub(cfg) {
@@ -87,7 +87,7 @@ function makeStub(cfg) {
 }
 
 /* ---------------------------------------------------------------------------
- * 启动实例
+ * Boot instance
  * -------------------------------------------------------------------------*/
 
 const tick = (win) => new Promise((r) => win.setTimeout(r, 0));
@@ -103,7 +103,7 @@ async function boot(cfg = {}) {
   if (cfg.matchMedia) win.matchMedia = cfg.matchMedia;
 
   const stub = makeStub(cfg);
-  win.fetch = stub.fetchImpl; // 必须在注入 app.js 之前
+  win.fetch = stub.fetchImpl; // must be before injecting app.js
 
   const script = win.document.createElement('script');
   script.textContent = APP_JS;
@@ -124,7 +124,7 @@ async function boot(cfg = {}) {
 }
 
 /* ---------------------------------------------------------------------------
- * 辅助
+ * Helpers
  * -------------------------------------------------------------------------*/
 
 const clickEvt = (win) => new win.MouseEvent('click', { bubbles: true, cancelable: true });
@@ -163,10 +163,10 @@ async function test(name, fn, bootCfg) {
   }
 }
 
-/* ---- 公共 fixture ---- */
-// ⚠️ `to_emails` 用**JSON 文本**（不是数组）：这是 `/api/folders/*` 的真实返回形态
-//    （服务端 LIST_SELECT 直接取库列，不解析）。用数组写 fixture 会掩盖
-//    「列表里收件人恒为空 -> 显示『致 (未知)』」这个真实缺陷。
+/* ---- shared fixture ---- */
+// ⚠️ `to_emails` uses **JSON text** (not an array): this is the real shape returned by `/api/folders/*`
+//    (the server's LIST_SELECT takes the DB column directly, without parsing). Writing the fixture as an array would mask
+//    the real defect "recipients in the list are always empty -> shows 'To (unknown)'".
 const DRAFT_ROWS = [
   {
     id: 'dr-1', direction: 'draft', mailbox: 'me@example.com', from_name: null, from_email: null,
@@ -194,13 +194,13 @@ const DRAFT_FULL = {
 const COUNTS = { inbox_unread: 7, inbox_total: 20, sent_total: 5, starred_total: 1, trash_total: 0, drafts_total: 2 };
 
 /* ===========================================================================
- * 用例
+ * Test cases
  * ===========================================================================*/
 (async function main() {
   console.log('草稿箱前端 —— 独立 jsdom 验证');
   console.log(`被测版本: ${Object.entries(FINGERPRINT).map(([k, v]) => `${k}=${v.slice(0, 8)}`).join('  ')}`);
 
-  /* ---- D0 环境自检 ---- */
+  /* ---- D0 environment self-check ---- */
   await test('D0 环境自检：侧边栏出现「草稿」入口', async (ctx) => {
     ok(typeof ctx.win.openDraftComposer === 'function', 'openDraftComposer 为全局函数（草稿模块已加载）');
     const keys = evalIn(ctx, 'FOLDERS.map((f) => f.key).join(",")');
@@ -211,7 +211,7 @@ const COUNTS = { inbox_unread: 7, inbox_total: 20, sent_total: 5, starred_total:
     ok(btn && btn.querySelector('.folder-label').textContent === '草稿', '按钮文案是「草稿」', btn && btn.querySelector('.folder-label').textContent);
   }, { counts: COUNTS, draftRows: DRAFT_ROWS, drafts: [DRAFT_FULL] });
 
-  /* ---- D1 徽标口径：未读 vs 草稿条数，不得混用 ---- */
+  /* ---- D1 badge semantics: unread vs draft count, must not be mixed up ---- */
   await test('D1 徽标：收件箱=未读数、草稿=条数，两个口径不混用', async (ctx) => {
     const inb = navBtn(ctx, 'inbox').querySelector('.folder-badge');
     const drf = navBtn(ctx, 'drafts').querySelector('.folder-badge');
@@ -225,7 +225,7 @@ const COUNTS = { inbox_unread: 7, inbox_total: 20, sent_total: 5, starred_total:
     ok(!!navBtn(ctx, 'inbox').querySelector('.folder-badge'), '收件箱徽标照常（负控制：不是整体没渲染）');
   }, { counts: Object.assign({}, COUNTS, { drafts_total: 0 }), draftRows: [], drafts: [] });
 
-  /* ---- D2 点「草稿」→ 拉草稿列表 ---- */
+  /* ---- D2 click "drafts" -> fetch the draft list ---- */
   await test('D2 点「草稿」：请求 /api/folders/drafts 并渲染列表', async (ctx) => {
     ctx.stub.calls.length = 0;
     clickEl(ctx, '#folder-nav .folder-item[data-folder="drafts"]');
@@ -236,7 +236,7 @@ const COUNTS = { inbox_unread: 7, inbox_total: 20, sent_total: 5, starred_total:
     ok(rows(ctx).length === 2, '列表渲染 2 行草稿', String(rows(ctx).length));
   }, { counts: COUNTS, draftRows: DRAFT_ROWS, drafts: [DRAFT_FULL] });
 
-  /* ---- D3 草稿行的结构差异 ---- */
+  /* ---- D3 structural differences of a draft row ---- */
   await test('D3 草稿行：无勾选框、头像「稿」、发件人位显示收件人、状态 chip', async (ctx) => {
     clickEl(ctx, '#folder-nav .folder-item[data-folder="drafts"]');
     await ticks(ctx.win, 5);
@@ -253,15 +253,15 @@ const COUNTS = { inbox_unread: 7, inbox_total: 20, sent_total: 5, starred_total:
       '⭐ 有 li-status chip 且文案是「草稿」', chip && `${chip.className} / ${chip.textContent}`);
     ok(!!r1.querySelector('.li-star .draft-del'), '⭐ 星标位改成了删除按钮（不是星标）', r1.querySelector('.li-star').innerHTML);
     ok(r2.querySelector('.li-subject').textContent === '(无主题)', '无主题时有兜底文案', r2.querySelector('.li-subject').textContent);
-    // 普通文件夹的行仍然有勾选框（负控制）
+    // Rows in a normal folder still have a checkbox (negative control)
     clickEl(ctx, '#folder-nav .folder-item[data-folder="inbox"]');
     await ticks(ctx.win, 5);
   }, { counts: COUNTS, draftRows: DRAFT_ROWS, drafts: [DRAFT_FULL] });
 
-  /* ---- D3b 列表行的收件人字段是 JSON 文本（接口实测形态）---- */
+  /* ---- D3b the recipient field of list rows is JSON text (measured interface shape) ---- */
   await test('D3b ⭐ 列表接口的 to_emails 是 JSON 文本，收件人必须真的显示出来', async (ctx) => {
-    // 用真实接口形态（JSON 文本）驱动渲染：前端 jsonArr 只认数组的话，
-    // 这里会渲染成「致 (未知)」「(无收件人)」—— 实测确认过这个缺陷。
+    // Drive rendering with the real interface shape (JSON text): if the frontend jsonArr only accepts arrays,
+    // this renders as "To (unknown)" / "(no recipient)" -- this defect was confirmed by actual measurement.
     clickEl(ctx, '#folder-nav .folder-item[data-folder="sent"]');
     await ticks(ctx.win, 5);
     const r = el(ctx, '#list .list-item[data-id="sn-1"]');
@@ -276,7 +276,7 @@ const COUNTS = { inbox_unread: 7, inbox_total: 20, sent_total: 5, starred_total:
     ok(evalIn(ctx, `Array.isArray(jsonArr('')) && jsonArr('').length === 0`), '空串 -> 空数组');
   }, { counts: COUNTS, draftRows: DRAFT_ROWS, drafts: [DRAFT_FULL], sentRows: SENT_ROWS });
 
-  /* ---- D4 点草稿行 → 打开写信弹窗 ---- */
+  /* ---- D4 click a draft row -> open the composer ---- */
   await test('D4 点草稿行：打开写信弹窗并预填（不是打开详情）', async (ctx) => {
     clickEl(ctx, '#folder-nav .folder-item[data-folder="drafts"]');
     await ticks(ctx.win, 5);
@@ -287,7 +287,7 @@ const COUNTS = { inbox_unread: 7, inbox_total: 20, sent_total: 5, starred_total:
     ok(composerOpen(ctx), '写信弹窗已打开');
     ok(val(ctx, '#f-to') === 'a@x.com, b@y.com', '收件人已预填', val(ctx, '#f-to'));
     ok(val(ctx, '#f-subject') === '写了一半的主题', '主题已预填', val(ctx, '#f-subject'));
-    // 富文本编辑器是 contenteditable 的 div（没有 .value），只能看 innerHTML
+    // The rich text editor is a contenteditable div (no .value), so we can only inspect innerHTML
     const richHtml = evalIn(ctx, 'document.querySelector("#f-body-rich").innerHTML');
     ok(String(richHtml).indexOf('正文预览') >= 0, '正文已预填（富文本，保留 HTML）', String(richHtml).slice(0, 40));
     ok(evalIn(ctx, 'isRich()') === true, '草稿的 rich=true 被还原成富文本模式', String(evalIn(ctx, 'isRich()')));
@@ -295,7 +295,7 @@ const COUNTS = { inbox_unread: 7, inbox_total: 20, sent_total: 5, starred_total:
     ok(evalIn(ctx, 'state.openId') === null, '没有把草稿当成邮件打开详情（openId 仍为空）', String(evalIn(ctx, 'state.openId')));
   }, { counts: COUNTS, draftRows: DRAFT_ROWS, drafts: [DRAFT_FULL] });
 
-  /* ---- D5 行内删除 ---- */
+  /* ---- D5 inline delete ---- */
   await test('D5 行内 × 删除草稿：只发 DELETE、不打开弹窗', async (ctx) => {
     clickEl(ctx, '#folder-nav .folder-item[data-folder="drafts"]');
     await ticks(ctx.win, 5);
@@ -311,7 +311,7 @@ const COUNTS = { inbox_unread: 7, inbox_total: 20, sent_total: 5, starred_total:
     ok(callsTo(ctx, '/api/folders/drafts').length >= 1, '删除后重新拉草稿列表（行要从界面上消失）');
   }, { counts: COUNTS, draftRows: DRAFT_ROWS, drafts: [DRAFT_FULL] });
 
-  /* ---- D6 空草稿箱 ---- */
+  /* ---- D6 empty drafts folder ---- */
   await test('D6 草稿箱为空：显示空态文案，不残留旧行', async (ctx) => {
     clickEl(ctx, '#folder-nav .folder-item[data-folder="drafts"]');
     await ticks(ctx.win, 5);
@@ -321,7 +321,7 @@ const COUNTS = { inbox_unread: 7, inbox_total: 20, sent_total: 5, starred_total:
     ok(/没有/.test(empty.textContent) || /空/.test(empty.textContent), '空态文案可读', JSON.stringify(empty.textContent));
   }, { counts: Object.assign({}, COUNTS, { drafts_total: 0 }), draftRows: [], drafts: [] });
 
-  /* ---- D7 恢复草稿后发送必须带 draft_id ---- */
+  /* ---- D7 sending after restoring a draft must carry draft_id ---- */
   await test('D7 恢复草稿后发送：请求体必须带 draft_id（服务端据此删草稿）', async (ctx) => {
     clickEl(ctx, '#folder-nav .folder-item[data-folder="drafts"]');
     await ticks(ctx.win, 5);
@@ -338,7 +338,7 @@ const COUNTS = { inbox_unread: 7, inbox_total: 20, sent_total: 5, starred_total:
     ok(!composerOpen(ctx), '发送成功后弹窗关闭');
   }, { counts: COUNTS, draftRows: DRAFT_ROWS, drafts: [DRAFT_FULL] });
 
-  /* ---- D8 草稿箱里搜索：q 参数要带上 ---- */
+  /* ---- D8 search inside the drafts folder: the q param must be included ---- */
   await test('D8 草稿箱内搜索：q 参数进入请求（复用同一套搜索）', async (ctx) => {
     clickEl(ctx, '#folder-nav .folder-item[data-folder="drafts"]');
     await ticks(ctx.win, 5);
@@ -353,7 +353,7 @@ const COUNTS = { inbox_unread: 7, inbox_total: 20, sent_total: 5, starred_total:
     info(`最后一次草稿请求：${(callsTo(ctx, '/api/folders/drafts').slice(-1)[0] || {}).url}`);
   }, { counts: COUNTS, draftRows: DRAFT_ROWS, drafts: [DRAFT_FULL] });
 
-  /* ---- 汇总 ---- */
+  /* ---- summary ---- */
   console.log('\n================ 失败用例清单 ================');
   const failed = results.filter((r) => !r.ok);
   if (!failed.length) console.log('（无）');

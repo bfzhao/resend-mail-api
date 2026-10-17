@@ -8,6 +8,7 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "typecheck": "tsc --noEmit",
+    "schema:sync": "node scripts/sync-schema.js",
     "db:migrate": "wrangler d1 execute resend-webhooks-db --file=./schema.sql --remote",
     "db:migrate:local": "wrangler d1 execute resend-webhooks-db --file=./schema.sql --local",
     "db:migrate:up": "wrangler d1 execute resend-webhooks-db --file=./migrations/001_thread_mailbox.sql --remote",

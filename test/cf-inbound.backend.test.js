@@ -1,20 +1,20 @@
 'use strict';
 
 /* =============================================================================
- * CF 入向迁移（Resend → Cloudflare Email Routing）后端语义回归
+ * CF inbound migration (Resend -> Cloudflare Email Routing) backend semantics regression
  *
- * 运行（本沙箱需 tsc 垫片，见 inbound-ingest.backend.test.js 末尾说明）：
- *   NODE_OPTIONS="--require <临时目录>/mm-tsc-shim.js" node test/cf-inbound.backend.test.js
- * 正常环境：
+ * Run (this sandbox needs the tsc shim, see the notes at the end of inbound-ingest.backend.test.js):
+ *   NODE_OPTIONS="--require <temp dir>/mm-tsc-shim.js" node test/cf-inbound.backend.test.js
+ * Normal environment:
  *   node test/cf-inbound.backend.test.js
  *
- * 退出码：0 = 全通过；1 = 有失败；2 = 环境缺失（node:sqlite / tsc 不可用）。
+ * Exit codes: 0 = all pass; 1 = failures; 2 = missing environment (node:sqlite / tsc unavailable).
  *
- * 盯住的不变量：
- *   ⭐ 数据兼容：CF 入向解析结果 → **同一套** messages/attachments 表（列与 Resend 入向逐字相同）。
- *   ⭐ 绝不丢：[email()] 先把 raw 落 R2 + 登记 inbound_raw，再入队；queue 解析入库两段式。
- *   ⭐ 幂等：Queue 至少一次投递 → 同一封被消费两次不得重复入库。
- *   ⭐ 信封投递地址(mailbox/delivered_to) vs 真实 To: 头 —— 与 Resend 路径同一口径。
+ * Invariants being watched:
+ *   ⭐ Data compatibility: the CF inbound parse result -> the **same** messages/attachments tables (columns byte-for-byte identical to Resend inbound).
+ *   ⭐ Never lose: [email()] first puts raw into R2 + registers inbound_raw, then enqueues; queue parses and stores in two stages.
+ *   ⭐ Idempotency: Queue at-least-once delivery -> the same message consumed twice must not be stored twice.
+ *   ⭐ Envelope delivery address (mailbox/delivered_to) vs the real To: header -- same convention as the Resend path.
  * ===========================================================================*/
 
 const fs = require('fs');
@@ -36,7 +36,7 @@ const WORK_DIR = path.join(os.tmpdir(), `cf-inbound-qa-build-${process.pid}`);
 const SRC_COPY = path.join(WORK_DIR, 'src');
 const BUILD_DIR = path.join(WORK_DIR, 'out');
 
-/** 与 inbound-ingest 同款：整份 src/ 复制到仓库外编译（临时目录先链接 node_modules 才能解析裸模块）。 */
+/** Same as inbound-ingest: copy the whole src/ outside the repo to compile (the temp dir must link node_modules first to resolve bare modules). */
 function build() {
   const tsc = path.join(ROOT, 'node_modules', 'typescript', 'bin', 'tsc');
   if (!fs.existsSync(tsc)) throw new Error(`找不到 tsc: ${tsc}`);
@@ -79,7 +79,7 @@ function cleanup() {
   try { fs.rmSync(WORK_DIR, { recursive: true, force: true }); } catch { /* ignore */ }
 }
 
-/* ---- 真实 SQLite 冒充 D1（schema.sql 真实 DDL） ---- */
+/* ---- real SQLite masquerading as D1 (schema.sql's real DDL) ---- */
 function makeD1() {
   const schema = fs.readFileSync(path.join(ROOT, 'schema.sql'), 'utf8');
   const db = new DatabaseSync(':memory:');
@@ -110,12 +110,12 @@ function makeD1() {
   };
 }
 
-/* ---- R2 桩：内存 Map，支持 ReadableStream / Uint8Array 落盘、get().arrayBuffer() ---- */
+/* ---- R2 stub: in-memory Map, supports ReadableStream / Uint8Array writes, get().arrayBuffer() ---- */
 async function streamToBytes(value) {
   if (value instanceof Uint8Array) return value;
   if (value instanceof ArrayBuffer) return new Uint8Array(value);
   if (typeof value === 'string') return new TextEncoder().encode(value);
-  // Web ReadableStream（message.raw）
+  // Web ReadableStream (message.raw)
   const reader = value.getReader();
   const chunks = [];
   let total = 0;
@@ -177,7 +177,7 @@ function streamOf(bytes) {
   return new ReadableStream({ start(c) { c.enqueue(bytes); c.close(); } });
 }
 
-/** 伪造 CF `ForwardableEmailMessage`。raw 一次性流；setReject 记录下来供断言。 */
+/** Forge a CF `ForwardableEmailMessage`. raw is a one-shot stream; setReject records for assertions. */
 function fakeMessage({ from, to, headers, rawBytes }) {
   const rejects = [];
   return {
@@ -194,7 +194,7 @@ function fakeMessage({ from, to, headers, rawBytes }) {
   };
 }
 
-/** 伪造 Queue 批次：逐条 ack/retry 可断言。 */
+/** Forge a Queue batch: per-message ack/retry is assertable. */
 function makeBatch(ids) {
   const acks = [];
   const retries = [];
@@ -208,7 +208,7 @@ function makeBatch(ids) {
   return { batch: { queue: 'resend-mail-inbound', messages }, acks, retries };
 }
 
-/* ---- 迷你断言器 ---- */
+/* ---- mini asserter ---- */
 let pass = 0;
 const results = [];
 function ok(cond, msg, detail) {
@@ -217,14 +217,14 @@ function ok(cond, msg, detail) {
 }
 function section(t) { console.log(`\n=== ${t} ===`); }
 
-const ENVELOPE = { from: 'alice@ext.example', to: 'bingfeng@notionmanager.com' };
+const ENVELOPE = { from: 'alice@ext.example', to: 'dana@example.com' };
 
-/** 一封 multipart/mixed（alternative 正文 + inline cid 图 + 普通附件）的原始 MIME。 */
+/** The raw MIME of one multipart/mixed (alternative body + inline cid image + regular attachment). */
 function rawMime() {
   return [
     'From: Alice Sender <alice@ext.example>',
-    'To: Lara <lara@realmarketlabs.com>',
-    'Cc: bingfeng@notionmanager.com',
+    'To: Frank <frank@example.net>',
+    'Cc: dana@example.com',
     'Subject: Hello 测试',
     'Message-ID: <abc123@ext.example>',
     'In-Reply-To: <root001@ext.example>',
@@ -290,7 +290,7 @@ function rawMime() {
   ok(Number(db.queryOne('SELECT COUNT(*) AS n FROM messages').n) === 1, 'D1 桩真的写进了 SQLite（否则后面空转）');
   await db.prepare('DELETE FROM messages WHERE id=?').bind('self').run();
 
-  /* ---- T1 email() 只做「保住这封信」：raw 落 R2 + 登记 + 入队 ---- */
+  /* ---- T1 email() only does "preserve this message": raw to R2 + register + enqueue ---- */
   section('T1 ⭐ email() 落 R2 + 登记 inbound_raw + 入队（不解析）');
   const raw1 = new TextEncoder().encode(rawMime());
   const m1 = fakeMessage({ from: ENVELOPE.from, to: ENVELOPE.to, headers: { 'Message-ID': '<abc123@ext.example>' }, rawBytes: raw1 });
@@ -305,7 +305,7 @@ function rawMime() {
   ok(queue.sent.length === 1, '入队 1 条指针消息', queue.sent.length);
   ok(queue.sent[0] && queue.sent[0].rawId === rawRow.id, '队列消息只带 rawId 指针', queue.sent[0] && queue.sent[0].rawId);
 
-  /* ---- T2 queue() 解析入库：数据形状与 Resend 入向逐字一致 ---- */
+  /* ---- T2 queue() parses and stores: data shape byte-for-byte identical to Resend inbound ---- */
   section('T2 ⭐ queue() 解析 → 同一套 messages/attachments 表');
   const b1 = makeBatch([queue.sent[0].rawId]);
   await inbound.handleInboundQueue(b1.batch, env);
@@ -314,13 +314,13 @@ function rawMime() {
   const row = db.queryOne("SELECT * FROM messages WHERE direction='inbound'");
   ok(!!row, '邮件已写入 messages', row && row.id);
   ok(row && row.mailbox === ENVELOPE.to, '⭐ mailbox = 投递地址', row && row.mailbox);
-  ok(row && JSON.stringify(JSON.parse(row.to_emails)) === JSON.stringify(['lara@realmarketlabs.com']),
+  ok(row && JSON.stringify(JSON.parse(row.to_emails)) === JSON.stringify(['frank@example.net']),
     '⭐ to_emails = 真实 To: 头（不是投递地址）', row && row.to_emails);
   ok(row && row.to_emails !== JSON.stringify([ENVELOPE.to]),
     '负控制：to_emails 确实不是信封投递地址（区分度成立）', row && row.to_emails);
   ok(row && JSON.stringify(JSON.parse(row.delivered_to)) === JSON.stringify([ENVELOPE.to]),
     'delivered_to = 信封投递地址', row && row.delivered_to);
-  ok(row && JSON.stringify(JSON.parse(row.cc)) === JSON.stringify(['bingfeng@notionmanager.com']),
+  ok(row && JSON.stringify(JSON.parse(row.cc)) === JSON.stringify(['dana@example.com']),
     'cc = 真实 Cc 头', row && row.cc);
   ok(row && row.subject === 'Hello 测试', 'subject 正确（RFC2047/UTF-8 头）', row && row.subject);
   ok(row && row.message_id === 'abc123@ext.example', 'message_id 去尖括号', row && row.message_id);
@@ -332,7 +332,7 @@ function rawMime() {
   ok(row && /cid:logo123/.test(row.body_html || ''), 'body_html 保留 cid: 内联引用（供前端替换）', row && row.body_html);
   ok(row && (row.body_text || '').includes('plain body line'), 'body_text 来自 text/plain 部分', row && JSON.stringify(row.body_text));
 
-  /* ---- T3 附件：inline cid 图 vs 普通附件 ---- */
+  /* ---- T3 attachments: inline cid image vs regular attachment ---- */
   section('T3 ⭐ 附件落 R2 + attachments 行（inline/普通区分）');
   const atts = db.query("SELECT * FROM attachments WHERE message_id = ?", row.id);
   ok(atts.length === 2, '2 个附件都已入库', atts.length);
@@ -347,7 +347,7 @@ function rawMime() {
   ok(rawAfter && rawAfter.parsed_at !== null && rawAfter.message_row === row.id,
     '⭐ 解析后回填 parsed_at + message_row', rawAfter && `${rawAfter.parsed_at}/${rawAfter.message_row}`);
 
-  /* ---- T4 幂等：Queue 至少一次重复消费不得重复入库 ---- */
+  /* ---- T4 idempotency: Queue at-least-once duplicate consumption must not store twice ---- */
   section('T4 ⭐ 幂等：重复消费同一指针 → 不新增行');
   const before = Number(db.queryOne("SELECT COUNT(*) AS n FROM messages WHERE direction='inbound'").n);
   const b2 = makeBatch([queue.sent[0].rawId]);
@@ -356,16 +356,16 @@ function rawMime() {
   ok(b2.acks.length === 1, '重复指针仍被 ack（已入库 → 跳过）', b2.acks.length);
   ok(after === before, '⭐ messages 行数不变（幂等）', `${before} → ${after}`);
 
-  /* ---- T5 无队列绑定：仍保住原始件（不解析也不丢） ---- */
+  /* ---- T5 no queue binding: still preserve the raw message (neither parse nor lose) ---- */
   section('T5 未配队列时 email() 仍落 R2 + 登记（不丢）');
   const envNoQ = { DB: db, BUCKET: bucket, INBOUND_QUEUE: undefined };
-  const m2 = fakeMessage({ from: 'bob@ext.example', to: 'support@notionmanager.com', headers: { 'Message-ID': '<noq@ext.example>' }, rawBytes: new TextEncoder().encode('From: bob@ext.example\r\n\r\nhi') });
+  const m2 = fakeMessage({ from: 'bob@ext.example', to: 'support@example.com', headers: { 'Message-ID': '<noq@ext.example>' }, rawBytes: new TextEncoder().encode('From: bob@ext.example\r\n\r\nhi') });
   await inbound.handleInboundEmail(envNoQ, m2.msg);
   const noq = db.queryOne('SELECT * FROM inbound_raw WHERE message_id = ?', 'noq@ext.example');
   ok(!!noq && noq.parsed_at === null, '登记成功但未解析（ очередь缺失不影响「不丢」）', noq && noq.id);
   ok(bucket.store.has(noq.r2_key), '原始件确实在 R2', noq && noq.r2_key);
 
-  /* ---- T6 负控制：R2 原始件缺失 → 记 error 并 ack（不放毒消息） ---- */
+  /* ---- T6 negative control: R2 raw object missing -> record error and ack (do not poison the queue) ---- */
   section('T6 负控制：R2 原始件丢失 → error + ack');
   const b3 = makeBatch([noq.id]);
   await bucket.delete(noq.r2_key);
@@ -374,14 +374,14 @@ function rawMime() {
   ok(b3.acks.length === 1 && b3.retries.length === 0, '缺原始件 → ack（不无限重试）', `${b3.acks.length}/${b3.retries.length}`);
   ok(noqAfter && /missing/.test(noqAfter.error || ''), 'error 记录原因', noqAfter && noqAfter.error);
 
-  /* ---- T7 负控制：错误/缺失 rawId 不得崩、直接 ack ---- */
+  /* ---- T7 negative control: bad/missing rawId must not crash, just ack ---- */
   section('T7 负控制：空/未知指针');
   const b4 = makeBatch([undefined, 'no-such-id']);
   b4.batch.messages[0].body = {};
   await inbound.handleInboundQueue(b4.batch, env);
   ok(b4.acks.length === 2 && b4.retries.length === 0, '空指针 / 未知 id 均安全 ack', `${b4.acks.length}/${b4.retries.length}`);
 
-  /* ---- T8 ⭐ R2 落盘失败：先登记了意图 → 库里有 error 原文（线上排查「送达失败但库为空」的关键） ---- */
+  /* ---- T8 ⭐ R2 write fails: the intent was registered first -> the DB holds the original error text (the key to troubleshooting "delivery failed but DB is empty" in production) ---- */
   section('T8 ⭐ R2 put 失败 → 保留登记行 + error 原文 + 拒收');
   const failBucket = {
     async put() { throw new Error('boom-r2'); },
@@ -390,7 +390,7 @@ function rawMime() {
   };
   const q8 = makeQueue();
   const envFailR2 = { DB: db, BUCKET: failBucket, INBOUND_QUEUE: q8 };
-  const m8 = fakeMessage({ from: 'x@ext.example', to: 'y@notionmanager.com', headers: { 'Message-ID': '<r2fail@ext.example>' }, rawBytes: new TextEncoder().encode('From: x@ext.example\r\n\r\nhi') });
+  const m8 = fakeMessage({ from: 'x@ext.example', to: 'y@example.com', headers: { 'Message-ID': '<r2fail@ext.example>' }, rawBytes: new TextEncoder().encode('From: x@ext.example\r\n\r\nhi') });
   await inbound.handleInboundEmail(envFailR2, m8.msg);
   const row8 = db.queryOne('SELECT * FROM inbound_raw WHERE message_id = ?', 'r2fail@ext.example');
   ok(m8.rejects.length === 1, '⭐ R2 失败 → 明确拒收（不假装成功）', m8.rejects.join(','));
@@ -398,7 +398,7 @@ function rawMime() {
   ok(row8 && /r2 put failed/.test(row8.error || '') && /boom-r2/.test(row8.error || ''), '⭐ error 记录了真实原因（不再是空白）', row8 && row8.error);
   ok(q8.sent.length === 0, 'R2 失败 → 不入队（避免消费者拿到不存在的原件）', q8.sent.length);
 
-  /* ---- T9 ⭐ D1 登记失败：不得假装成功（此时库为空是「正确信号」，非静默丢失） ---- */
+  /* ---- T9 ⭐ D1 registration fails: must not pretend success (an empty DB here is the "correct signal", not a silent loss) ---- */
   section('T9 ⭐ D1 登记失败 → 拒收且不产生幻影成功');
   const failInsertDb = {
     prepare(sql) {
@@ -413,46 +413,46 @@ function rawMime() {
   const q9 = makeQueue();
   const envFailDb = { DB: failInsertDb, BUCKET: bucket, INBOUND_QUEUE: q9 };
   const before9 = Number(db.queryOne('SELECT COUNT(*) AS n FROM inbound_raw').n);
-  const m9 = fakeMessage({ from: 'x@ext.example', to: 'y@notionmanager.com', headers: { 'Message-ID': '<dbfail@ext.example>' }, rawBytes: new TextEncoder().encode('From: x@ext.example\r\n\r\nhi') });
+  const m9 = fakeMessage({ from: 'x@ext.example', to: 'y@example.com', headers: { 'Message-ID': '<dbfail@ext.example>' }, rawBytes: new TextEncoder().encode('From: x@ext.example\r\n\r\nhi') });
   await inbound.handleInboundEmail(envFailDb, m9.msg);
   const after9 = Number(db.queryOne('SELECT COUNT(*) AS n FROM inbound_raw').n);
   ok(m9.rejects.length === 1, 'D1 登记失败 → 拒收', m9.rejects.join(','));
   ok(after9 === before9, '无幻影登记行（inbound_raw 未增加）', `${before9} → ${after9}`);
   ok(q9.sent.length === 0, '登记未成功 → 不入队', q9.sent.length);
 
-  /* ---- T10 ⭐ 恢复 cron：把「已落 R2 未解析完」的邮件重新入队（never-lose 自愈闭环） ---- */
+  /* ---- T10 ⭐ recovery cron: re-enqueue emails "already in R2 but not fully parsed" (never-lose self-healing loop) ---- */
   section('T10 ⭐ replayPendingInbound 重放待办');
   const q10 = makeQueue();
-  const m10 = fakeMessage({ from: 'r@ext.example', to: 's@notionmanager.com', headers: { 'Message-ID': '<replay@ext.example>' }, rawBytes: new TextEncoder().encode('From: r@ext.example\r\n\r\nhi') });
-  await inbound.handleInboundEmail({ DB: db, BUCKET: bucket, INBOUND_QUEUE: undefined }, m10.msg); // 无队列 → 待办
+  const m10 = fakeMessage({ from: 'r@ext.example', to: 's@example.com', headers: { 'Message-ID': '<replay@ext.example>' }, rawBytes: new TextEncoder().encode('From: r@ext.example\r\n\r\nhi') });
+  await inbound.handleInboundEmail({ DB: db, BUCKET: bucket, INBOUND_QUEUE: undefined }, m10.msg); // no queue -> pending
   const pending = db.queryOne('SELECT * FROM inbound_raw WHERE message_id = ?', 'replay@ext.example');
   ok(pending && pending.parsed_at === null, '前置：入队缺失时该行处于待办（parsed_at NULL）', pending && pending.id);
   const n10 = await inbound.replayPendingInbound({ DB: db, BUCKET: bucket, INBOUND_QUEUE: q10 });
   ok(n10 >= 1 && q10.sent.some((m) => m.rawId === pending.id), '⭐ cron 重新入队了待办行', `${n10}/${q10.sent.map((m) => m.rawId).join(',')}`);
   ok((await inbound.replayPendingInbound({ DB: db, BUCKET: bucket, INBOUND_QUEUE: undefined })) === 0, '未配队列时 replay 安全返回 0（不崩）');
 
-  /* ---- T11 ⭐ 入库瞬时失败超阈值 → 仍保留为待办，等 cron 重放（不永久卡死） ---- */
+  /* ---- T11 ⭐ store transient failure exceeds threshold -> still kept as pending, awaiting cron replay (no permanent deadlock) ---- */
   section('T11 ⭐ save 瞬时失败超阈值仍保留待办');
   const id11 = 'raw-save-exhaust';
   db.prepare('INSERT INTO inbound_raw (id, r2_key, from_email, to_email, size, message_id, received_at, parsed_at, message_row, error, attempts) VALUES (?,?,?,?,?,?,?,NULL,NULL,?,0)')
-    .bind(id11, `inbound-raw/${id11}.eml`, 'a@ext.example', 'b@notionmanager.com', 3, 'exh@ext.example', 1, 'save kept failing (×5): boom')
+    .bind(id11, `inbound-raw/${id11}.eml`, 'a@ext.example', 'b@example.com', 3, 'exh@ext.example', 1, 'save kept failing (×5): boom')
     .run();
   const q11 = makeQueue();
   const n11 = await inbound.replayPendingInbound({ DB: db, BUCKET: bucket, INBOUND_QUEUE: q11 });
   ok(q11.sent.some((m) => m.rawId === id11), '⭐ 瞬时失败行仍被 cron 重放（不会永久卡死）', n11);
 
-  /* ---- T12 ⭐ 入站异常看板：只有「没进收件箱」的才出现，正在处理的 10 分钟内不打扰 ---- */
+  /* ---- T12 ⭐ inbound anomaly dashboard: only "not in the inbox" ones appear, in-progress ones within 10 minutes are not disturbed ---- */
   section('T12 ⭐ listInboundAlerts 暴露「收了但没进收件箱」的邮件');
   const repo = require(path.join(entry, 'repo.js'));
   const now = Math.floor(Date.now() / 1000);
   const insRaw = (id, { recv, parsed, msgRow, error }) =>
     db.prepare('INSERT INTO inbound_raw (id, r2_key, from_email, to_email, size, message_id, subject, received_at, parsed_at, message_row, error, attempts) VALUES (?,?,?,?,?,?,?,?,?,?,?,0)')
-      .bind(id, `inbound-raw/${id}.eml`, 'x@ext.example', 'y@notionmanager.com', 100, `${id}@ext`, '主题'+id, recv, parsed, msgRow, error)
+      .bind(id, `inbound-raw/${id}.eml`, 'x@ext.example', 'y@example.com', 100, `${id}@ext`, '主题'+id, recv, parsed, msgRow, error)
       .run();
-  insRaw('al-old-pending', { recv: now - 3600, parsed: null, msgRow: null, error: null });      // 老待办 → 出现
-  insRaw('al-fresh-pending', { recv: now, parsed: null, msgRow: null, error: null });            // 刚收到 → 不出现
-  insRaw('al-failed', { recv: now - 60, parsed: null, msgRow: null, error: 'parse failed: boom' }); // 已失败 → 出现
-  insRaw('al-resolved', { recv: now - 3600, parsed: now - 3500, msgRow: 'msg-1', error: 'x' });  // 已入库 → 不出现
+  insRaw('al-old-pending', { recv: now - 3600, parsed: null, msgRow: null, error: null });      // old pending -> appears
+  insRaw('al-fresh-pending', { recv: now, parsed: null, msgRow: null, error: null });            // just received -> does not appear
+  insRaw('al-failed', { recv: now - 60, parsed: null, msgRow: null, error: 'parse failed: boom' }); // already failed -> appears
+  insRaw('al-resolved', { recv: now - 3600, parsed: now - 3500, msgRow: 'msg-1', error: 'x' });  // already stored -> does not appear
   const alerts = await repo.listInboundAlerts({ DB: db, BUCKET: bucket });
   const ids = alerts.map((a) => a.id);
   ok(ids.includes('al-old-pending'), '⭐ 老待办（>10min 未解析）出现在异常列表', ids.join(','));
@@ -463,7 +463,7 @@ function rawMime() {
   ok(failedAlert && failedAlert.pending === false && failedAlert.error === 'parse failed: boom', 'error 行标记 pending=false 且带原因', failedAlert && failedAlert.error);
   ok(failedAlert && failedAlert.subject === '主题al-failed', 'subject 一并返回（界面可辨认）', failedAlert && failedAlert.subject);
 
-  /* ---- T13 ⭐ 手动重试 + 下载原件 ---- */
+  /* ---- T13 ⭐ manual retry + download raw object ---- */
   section('T13 ⭐ retryInbound 重新入队 / proxyInboundRaw 取回原始件');
   const q13 = makeQueue();
   const ok13 = await repo.retryInbound({ DB: db, BUCKET: bucket, INBOUND_QUEUE: q13 }, 'al-failed');
@@ -478,12 +478,12 @@ function rawMime() {
   ok(rawResp && (rawResp.headers.get('content-disposition') || '').includes('attachment'), '原始件按附件下载（不内联）', rawResp && rawResp.headers.get('content-disposition'));
   ok((await repo.proxyInboundRaw({ DB: db, BUCKET: bucket }, 'no-such-id')) === null, '未知 id 的原始件返回 null');
 
-  /* ---- T14 ⭐ 正文超 D1 单行上限 → 标终态、移出队列、不再重放（不无谓 churn） ---- */
+  /* ---- T14 ⭐ body exceeds D1 single-row limit -> mark terminal, remove from queue, stop replaying (no pointless churn) ---- */
   section('T14 ⭐ 超 D1 行上限的邮件：标记 + 移出队列 + 停止重试');
-  const bigHtml = 'a'.repeat(2 * 1024 * 1024); // 2 MB 正文，超过 1.9MB 预算
+  const bigHtml = 'a'.repeat(2 * 1024 * 1024); // 2 MB body, exceeds the 1.9MB budget
   const bigRaw = [
     'From: big@ext.example',
-    'To: bingfeng@notionmanager.com',
+    'To: dana@example.com',
     'Subject: 超大正文',
     'Message-ID: <big@ext.example>',
     'MIME-Version: 1.0',
@@ -491,7 +491,7 @@ function rawMime() {
     '',
     `<p>${bigHtml}</p>`,
   ].join('\r\n');
-  const m14 = fakeMessage({ from: 'big@ext.example', to: 'bingfeng@notionmanager.com', headers: { 'Message-ID': '<big@ext.example>' }, rawBytes: new TextEncoder().encode(bigRaw) });
+  const m14 = fakeMessage({ from: 'big@ext.example', to: 'dana@example.com', headers: { 'Message-ID': '<big@ext.example>' }, rawBytes: new TextEncoder().encode(bigRaw) });
   await inbound.handleInboundEmail(env, m14.msg);
   const row14 = db.queryOne('SELECT * FROM inbound_raw WHERE message_id = ?', 'big@ext.example');
   const b14 = makeBatch([row14.id]);
@@ -507,7 +507,7 @@ function rawMime() {
   const alerts14 = await repo.listInboundAlerts({ DB: db, BUCKET: bucket });
   ok(alerts14.some((a) => a.id === row14.id), '该邮件出现在「入站异常」提示条（可下载原件）', '');
 
-  /* ---- T15 后端状态 API（CF 存储/入站 + Resend 额度，供前端一屏看清） ---- */
+  /* ---- T15 backend status API (CF storage/inbound + Resend quota, so the frontend sees it all on one screen) ---- */
   section('T15 后端状态 API（CF 存储/入站 + Resend 额度，估算）');
   const usage1 = await repo.getBackendStatus(env);
   ok(usage1.d1.usedBytes > 0, 'D1 估算到正字节数（各表文本列求和）', usage1.d1.usedBytes);
@@ -516,31 +516,31 @@ function rawMime() {
   ok(usage1.r2.objects > 0 && usage1.r2.usedBytes > 0, 'R2 统计到对象数与字节（列举求和）', `${usage1.r2.objects} 个 / ${usage1.r2.usedBytes} B`);
   ok(usage1.r2.limitBytes === 10 * 1024 * 1024 * 1024, 'R2 限额默认 10GB', usage1.r2.limitBytes);
   ok(usage1.approximate === true, '标注为估算值', usage1.approximate);
-  // CF 入站流水线状态
+  // CF inbound pipeline status
   ok(usage1.inbound && usage1.inbound.total > 0, '⚙ CF 入站：累计收信计数 > 0', JSON.stringify(usage1.inbound));
   ok(typeof usage1.inbound.pending === 'number' && typeof usage1.inbound.alerts === 'number',
     '⚙ CF 入站：待处理 / 异常 计数齐全', `pending=${usage1.inbound.pending} alerts=${usage1.inbound.alerts}`);
-  // Resend 额度（未配 key）
+  // Resend quota (no key configured)
   ok(usage1.resend && usage1.resend.configured === false, '未配 RESEND_API_KEY → configured=false', usage1.resend && usage1.resend.configured);
   ok(usage1.resend.day.limit === 100 && usage1.resend.month.limit === 3000,
     'Resend 额度默认 100/天 · 3000/月（免费档）', `${usage1.resend.day.limit}/${usage1.resend.month.limit}`);
-  // 缓存：短时间内再取一次不应重算（updatedAt 不变）
+  // cache: a second call within a short time should not recompute (updatedAt unchanged)
   const usage2 = await repo.getBackendStatus(env);
   ok(usage2.updatedAt === usage1.updatedAt, '存储缓存命中（updatedAt 不变，不重复全表扫描）', `${usage2.updatedAt}/${usage1.updatedAt}`);
-  // 配了 key + 今天发过一封 → 今日/本月各 1，额度百分比上升
+  // key configured + one email sent today -> day/month each 1, quota percentage rises
   const nowTs = Math.floor(Date.now() / 1000);
   await db.prepare(
-    "INSERT INTO messages (id, direction, mailbox, from_email, to_emails, received_at, status, resend_id, created_at, updated_at) VALUES (?, 'outbound', 'support@notionmanager.com', 'support@notionmanager.com', '[]', ?, 'sent', 're_test_1', ?, ?)"
+    "INSERT INTO messages (id, direction, mailbox, from_email, to_emails, received_at, status, resend_id, created_at, updated_at) VALUES (?, 'outbound', 'support@example.com', 'support@example.com', '[]', ?, 'sent', 're_test_1', ?, ?)"
   ).bind('out-usage-1', nowTs, nowTs, nowTs).run();
   const usageSend = await repo.getBackendStatus({ DB: db, BUCKET: bucket, RESEND_API_KEY: 're_x' });
   ok(usageSend.resend.configured === true, '配了 key → configured=true', usageSend.resend.configured);
   ok(usageSend.resend.day.used >= 1 && usageSend.resend.month.used >= 1, '今日 / 本月发信计数 ≥ 1', `${usageSend.resend.day.used}/${usageSend.resend.month.used}`);
   ok(usageSend.resend.day.percent > 0, '发信额度百分比随用量上升', usageSend.resend.day.percent);
-  // 自定义限额（付费档覆盖）
+  // custom limits (paid-tier override)
   const usagePaid = await repo.getBackendStatus({ DB: db, BUCKET: bucket, D1_LIMIT_BYTES: String(10 * 1024 * 1024 * 1024) }, { force: true });
   ok(usagePaid.d1.limitBytes === 10 * 1024 * 1024 * 1024 && usagePaid.d1.percent <= usage1.d1.percent, '可覆盖 D1 限额（付费档 → 分母变大，百分比不增）', usagePaid.d1.percent);
 
-  /* ---- 汇总 ---- */
+  /* ---- summary ---- */
   cleanup();
   console.log('\n================ 失败用例清单 ================');
   const failed = results.filter((r) => !r.ok);

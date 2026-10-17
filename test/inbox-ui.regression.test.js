@@ -1,28 +1,28 @@
 'use strict';
 
 /* =============================================================================
- * 收件箱 UI 三类缺陷的独立回归验证（真实 jsdom + 真实 DOM 事件 + 真实 app.js）
+ * Independent regression verification of three inbox UI defect classes (real jsdom + real DOM events + real app.js)
  *
- * 运行：
- *   NODE_PATH='C:\Users\Bingfeng\.workbuddy-ai\binaries\node\workspace\node_modules' \
+ * Run:
+ *   NODE_PATH='<NODE_PATH>' \
  *     node test/inbox-ui.regression.test.js
  *
- * 退出码：0 = 全部通过；1 = 存在失败；2 = 环境缺失（找不到 jsdom）。
- * 本文件只读 public/ 下源码，不做任何修改。
+ * Exit code: 0 = all passed; 1 = some failed; 2 = environment missing (jsdom not found).
+ * This file only reads source under public/ and makes no modifications.
  *
- * 覆盖缺陷：
- *   BUG-1  行选中高亮残留（同时出现多个 .list-item.active）
- *   BUG-1b 「全选本页」复选框状态残留
- *   BUG-2  读过之后列表行仍显示未读（0→1 跃迁未回写本地）
- *   BUG-3a 账号下拉被静默改写（state.mailbox 与 sel.value 脱钩）
- *   BUG-3c 读信后账号未读数陈旧（不重新请求 /api/mailboxes）
- *   BUG-3d 下拉项/列表标题口径未标注
- *   BUG-4  定时同步把列表清空（force 路径未归零 offset → 请求第 2 页 → 空页整体覆盖）
- *   BUG-5  localStorage 恢复路径下具体账号选择被静默重置（下拉/请求/列表全丢）
+ * Covers defects:
+ *   BUG-1  row selection highlight lingering (multiple .list-item.active at once)
+ *   BUG-1b "select all on this page" checkbox state lingering
+ *   BUG-2  a list row still shows unread after being read (the 0->1 transition not written back locally)
+ *   BUG-3a the account dropdown is silently rewritten (state.mailbox decoupled from sel.value)
+ *   BUG-3c the account unread count goes stale after reading (doesn't re-request /api/mailboxes)
+ *   BUG-3d dropdown items / list title number semantics unlabeled
+ *   BUG-4  periodic sync clears the list (the force path doesn't reset offset -> requests page 2 -> an empty page overwrites everything)
+ *   BUG-5  under the localStorage restore path the specific account selection is silently reset (dropdown/request/list all lost)
  *
- * 说明：断言全部基于「需求规格描述的正确行为」与 app.js 中真实存在的公开函数
- * （openFolder / openMessage / closeMessagePane / renderMailboxSelect / loadMailboxes /
- *  renderSelectBar），通过真实 DOM 事件驱动，不依赖臆造的私有函数名。
+ * Note: assertions are all based on "the correct behavior described by the requirement spec" and the public functions that actually
+ * exist in app.js (openFolder / openMessage / closeMessagePane / renderMailboxSelect / loadMailboxes /
+ *  renderSelectBar), driven by real DOM events, not relying on invented private function names.
  * ===========================================================================*/
 
 const fs = require('fs');
@@ -35,16 +35,16 @@ try {
   ({ JSDOM } = require('jsdom'));
 } catch (e) {
   console.error('无法加载 jsdom。请用 NODE_PATH 指向 jsdom 所在 node_modules（Windows 反斜杠写法）：');
-  console.error("  NODE_PATH='C:\\Users\\Bingfeng\\.workbuddy-ai\\binaries\\node\\workspace\\node_modules' node test/inbox-ui.regression.test.js");
+  console.error("  NODE_PATH='<NODE_PATH>' node test/inbox-ui.regression.test.js");
   console.error(String(e && e.message));
   process.exit(2);
 }
 
 const ROOT = path.join(__dirname, '..');
-// QA_APP_JS 仅用于「变异验证」：指向一份人工构造的缺陷版 app.js，确认本测试确实能抓到缺陷。
+// QA_APP_JS is only for "mutation verification": points to a hand-crafted defective app.js, to confirm this test really catches the defect.
 const APP_JS_PATH = process.env.QA_APP_JS || path.join(ROOT, 'public', 'app.js');
-// QA_INDEX_HTML 仅用于「变异验证」：指向一份人工构造的缺陷版 index.html（变体放仓库外）。
-// 缺了这个钩子，HTML 变体会「跑仓库原文件却以为跑的是变体」→ 变体恒不被抓（假阴性）。
+// QA_INDEX_HTML is only for "mutation verification": points to a hand-crafted defective index.html (the variant lives outside the repo).
+// Without this hook, the HTML variant would "run the repo's original file while thinking it ran the variant" -> the variant is never caught (false negative).
 const INDEX_PATH = process.env.QA_INDEX_HTML || path.join(ROOT, 'public', 'index.html');
 const APP_JS = fs.readFileSync(APP_JS_PATH, 'utf8');
 const INDEX_HTML = fs.readFileSync(INDEX_PATH, 'utf8');
@@ -56,17 +56,17 @@ const FINGERPRINT = {
 };
 
 /**
- * 本地快照的版本号**从 app.js 里现取**，不在这里另写一份。
+ * The local snapshot's version number is **read live from app.js**, not written again here.
  *
- * 写死 `v: 1` 的后果：CACHE_VERSION 一旦升版，readPersisted() 会把快照判为过期、
- * 静默走空路径 —— 而 T4b/T4c/T4d 验证的正是「恢复路径」，会变成「快照被拒 → 什么都没恢复」
- * 的失败（或更糟：断言恰好还成立 → 恢复路径根本没被测到）。取现成的值就不会失配。
- * 另在 T0 里断言它确实解析出来了，避免正则失配时静默变成 NaN。
+ * The consequence of hard-coding `v: 1`: once CACHE_VERSION is bumped, readPersisted() would deem the snapshot expired and
+ * silently take the empty path -- yet T4b/T4c/T4d verify exactly the "restore path", which would become "snapshot rejected -> nothing restored"
+ * (or worse: the assertion happens to still hold -> the restore path was never actually tested). Taking the live value avoids the mismatch.
+ * Also assert in T0 that it really parsed, to avoid silently becoming NaN when the regex fails.
  */
 const CACHE_VERSION_IN_APP = Number((/const CACHE_VERSION = (\d+);/.exec(APP_JS) || [])[1]);
 
 /* ---------------------------------------------------------------------------
- * fetch 打桩（jsdom 不实现 fetch；不打桩则 api() 会静默吞成「网络错误」）
+ * fetch stub (jsdom doesn't implement fetch; without a stub api() silently swallows it as a "network error")
  * -------------------------------------------------------------------------*/
 
 function makeStub(cfg = {}) {
@@ -78,13 +78,13 @@ function makeStub(cfg = {}) {
     messages: cfg.messages || {},
     counts: cfg.counts || { inbox_unread: 0, inbox_total: 0, sent_total: 0, starred_total: 0, trash_total: 0 },
   };
-  // honorPaging：真实后端语义，按 limit/offset 切片返回（BUG-4 必需，否则「第 2 页为空」无法复现）
+  // honorPaging: real backend semantics, slices by limit/offset (required for BUG-4, otherwise "page 2 is empty" can't be reproduced)
   const honorPaging = !!cfg.honorPaging;
-  // foldersByMailbox：按 mailbox 查询参数返回不同数据集（BUG-5 用；未命中且 mailbox 非空 → 空页）
+  // foldersByMailbox: return a different dataset per mailbox query param (used by BUG-5; missing hit with non-empty mailbox -> empty page)
   const foldersByMailbox = cfg.foldersByMailbox || null;
-  // holdDetail：把详情响应挂起，由测试用 releaseDetail() 显式放行（FIFO）。
-  // 用于观察「头部已渲染、正文仍在下载」这个中间态，以及验证过期响应不被采用。
-  // 可在运行中通过 setHoldDetail() 开关：boot 阶段通常先关掉，点击阶段再打开。
+  // holdDetail: hold the detail response; the test releases it explicitly via releaseDetail() (FIFO).
+  // Used to observe the intermediate state "header rendered, body still downloading", and to verify stale responses aren't adopted.
+  // Can be toggled at runtime via setHoldDetail(): usually off during boot, turned on during the click phase.
   let holdDetail = !!cfg.holdDetail;
   const heldDetails = [];
 
@@ -123,7 +123,7 @@ function makeStub(cfg = {}) {
         const mb = qs.get('mailbox') || '';
         d = Object.prototype.hasOwnProperty.call(foldersByMailbox, mb)
           ? foldersByMailbox[mb]
-          : { items: [], total: 0 }; // 未知账号 → 空页（真实后端语义）
+          : { items: [], total: 0 }; // unknown account -> empty page (real backend semantics)
       }
       if (honorPaging) {
         const limit = Number(qs.get('limit') || 50);
@@ -156,7 +156,7 @@ function makeStub(cfg = {}) {
 
   return {
     fetchImpl, calls, counters, store,
-    /** 放行被 holdDetail 挂起的详情响应。传 id 放行指定那封，不传则放行最早的一封。返回是否放行了。 */
+    /** Release a detail response held by holdDetail. Pass an id to release that one, or omit it to release the earliest. Returns whether it released one. */
     releaseDetail(id) {
       const idx = id === undefined ? 0 : heldDetails.findIndex((h) => h.id === id);
       if (idx < 0 || idx >= heldDetails.length) return false;
@@ -164,15 +164,15 @@ function makeStub(cfg = {}) {
       h.resolve();
       return true;
     },
-    /** 当前被挂起（尚未放行）的详情请求 id 列表，按到达顺序。 */
+    /** List of currently held (not yet released) detail request ids, in arrival order. */
     heldDetailIds: () => heldDetails.map((h) => h.id),
-    /** 运行中开关「挂起详情响应」。 */
+    /** Runtime toggle for "hold the detail response". */
     setHoldDetail(v) { holdDetail = !!v; },
   };
 }
 
 /* ---------------------------------------------------------------------------
- * 固定装置（每条用例各构造一份全新对象，避免跨用例互相污染）
+ * Fixtures (each case builds a fresh object to avoid cross-case pollution)
  * -------------------------------------------------------------------------*/
 
 function msg(id, read, extra = {}) {
@@ -194,8 +194,8 @@ function msg(id, read, extra = {}) {
 }
 
 /**
- * 详情响应：服务端在响应前已把 read 置 1（src/index.ts getMessageDetail 的真实行为）。
- * thread 可选：会话面板用例需要真实会话项，默认空数组（与原行为一致）。
+ * Detail response: the server has already set read to 1 before responding (the real behavior of src/index.ts getMessageDetail).
+ * thread optional: thread-panel cases need real thread items, defaulting to an empty array (same as the original behavior).
  */
 function detail(m, read, thread = []) {
   return {
@@ -215,8 +215,8 @@ function detail(m, read, thread = []) {
 }
 
 /**
- * 列表首项 C 是「已读」的占位邮件：init() 的 maybeAutoOpen() 会自动打开首项，
- * 用它挡住自动打开，A/B 的初始未读状态才不会被自动打开顺带改掉。
+ * The list's first item C is a "read" placeholder mail: init()'s maybeAutoOpen() auto-opens the first item.
+ * Use it to block auto-open, so A/B's initial unread state isn't incidentally changed by auto-open.
  */
 function inboxFixture() {
   const C = msg('C', 1);
@@ -245,34 +245,34 @@ function inboxFixture() {
 }
 
 /**
- * 会话面板固定装置：「会话行必须显示收发双方的实际信箱」的回归。
+ * Thread panel fixture: regression for "thread rows must show the actual mailboxes of both sender and recipient".
  *
- * ⚠️ 会话项的字段名必须与**真实接口**一致：收件人是 `to`（见 src/index.ts 的 thread.map），
- * 不是 `to_emails`。历史上前端只读 `t.to_emails` → 恒为 undefined → 会话行永远显示「我 → ?」。
- * 这里刻意只提供 `to`，字段名一旦写错用例必然失败（而不是"恰好蒙对"）。
+ * ⚠️ Thread item field names must match the **real interface**: the recipient is `to` (see thread.map in src/index.ts),
+ * not `to_emails`. Historically the frontend only read `t.to_emails` -> always undefined -> the thread row always showed "me → ?".
+ * Here only `to` is provided on purpose, so a wrong field name makes the case fail necessarily (rather than "coincidentally getting it right").
  *
- * ⚠️ 数组顺序必须与**真实接口一致 = 降序（最近在前）**：`repo.listThread()` 的
- * `ORDER BY received_at DESC` 才是排序真值，前端只负责原样渲染。
- * 所以这里的 `threadItems` 按 T3(…300) → T2(…200) → T1(…100) 排列。
- * （后端那侧的排序由 test/inbound-ingest.backend.test.js 的 T12a 守着，本套件守的是渲染顺序。）
+ * ⚠️ The array order must match the **real interface = descending (most recent first)**: repo.listThread()'s
+ * `ORDER BY received_at DESC` is the sorting truth; the frontend only renders it as-is.
+ * So `threadItems` here is ordered T3(…300) -> T2(…200) -> T1(…100).
+ * (Sorting on the backend side is guarded by T12a in test/inbound-ingest.backend.test.js; this suite guards the render order.)
  *
- * 列表首项 T3 是**已读**的：init() 的 maybeAutoOpen 会打开它，会话面板（length > 1）随之渲染。
+ * The list's first item T3 is **read**: init()'s maybeAutoOpen opens it, and the thread panel (length > 1) renders accordingly.
  */
 function threadFixture() {
   const threadItems = [
-    { // 对方再来信（无名字 → 回退邮箱地址），也是当前打开的一封；时间最新 → 排最前
+    { // the other party's latest reply (no name -> falls back to the email address), also the currently opened one; newest time -> first
       id: 'T3', direction: 'inbound', mailbox: 'alpha@x.com',
       from_name: null, from_email: 'bob@partner.com',
       to: ['alpha@x.com'], subject: 'Re: 报价确认',
       preview: '补充', received_at: 1700000300, read: true, deleted: false, current: true,
     },
-    { // 我的回信（出站，两个收件人）
+    { // my reply (outbound, two recipients)
       id: 'T2', direction: 'outbound', mailbox: 'support@x.com',
       from_name: 'support', from_email: 'support@x.com',
       to: ['alice@partner.com', 'bob@partner.com'], subject: 'Re: 报价确认',
       preview: '好的', received_at: 1700000200, read: true, deleted: false, current: false,
     },
-    { // 最早的来信（有名字）
+    { // the earliest inbound mail (has a name)
       id: 'T1', direction: 'inbound', mailbox: 'alpha@x.com',
       from_name: 'Alice', from_email: 'alice@partner.com',
       to: ['alpha@x.com'], subject: '报价确认',
@@ -280,7 +280,7 @@ function threadFixture() {
     },
   ];
 
-  // 列表项走 LIST_SELECT 口径（收件人是 to_emails），与真实列表接口一致。
+  // List items use the LIST_SELECT shape (recipient is to_emails), consistent with the real list interface.
   const T3 = msg('T3', 1, {
     from_name: null, from_email: 'bob@partner.com', subject: 'Re: 报价确认', mailbox: 'alpha@x.com',
   });
@@ -289,7 +289,7 @@ function threadFixture() {
     to_emails: ['alice@partner.com', 'bob@partner.com'], subject: 'Re: 报价确认',
     mailbox: 'support@x.com', status: 'sent',
   });
-  // T4 排在 T3 之后 → 不会被 maybeAutoOpen 打开，用来验证「详情未返回时的乐观渲染」。
+  // T4 sorts after T3 -> won't be opened by maybeAutoOpen, used to verify "optimistic rendering while the detail hasn't returned".
   const T4 = msg('T4', 1, {
     from_name: 'Carol', from_email: 'carol@partner.com', subject: '另一封信', mailbox: 'beta@x.com',
   });
@@ -316,33 +316,33 @@ function threadFixture() {
 }
 
 /**
- * 会话副本固定装置：模拟线上真实场景（2026-10-08 生产数据）——
- * 我用 bingfeng@ 发信并**抄送 zhanglili@**，同一封邮件被 Resend 投递回本账号的
- * zhanglili@，于是库里既有出站副本（T2）又有入站副本（T2c）。
- * 服务端 `listThread` 已把入站副本折叠掉：thread 里**没有 T2c**，只有 T2 带 `copy_ids:['T2c']`。
+ * Thread-copy fixture: simulates a real online scenario (2026-10-08 production data) --
+ * I sent from dana@ and **cc'd erin@**, the same mail was delivered by Resend back to this account's
+ * erin@, so the DB has both an outbound copy (T2) and an inbound copy (T2c).
+ * The server's `listThread` has already collapsed the inbound copy: the thread **has no T2c**, only T2 with `copy_ids:['T2c']`.
  *
- * 本用例把用户打开的邮件设成**被折叠的那份副本** T2c（放进 zhanglili@ 的收件箱并置于列表首位，
- * 让 maybeAutoOpen 打开它），验证会话面板仍把 T2 标成当前行 ——
- * 否则面板里一行都不高亮，看起来像「我打开的那封不见了」。
+ * This case sets the mail the user opened to the **collapsed copy** T2c (placed into erin@'s inbox at the top of the list,
+ * so maybeAutoOpen opens it), verifying the thread panel still marks T2 as the current row --
+ * otherwise no row in the panel is highlighted, looking like "the one I opened has disappeared".
  */
 function threadCopyFixture() {
-  // 时间降序：T3(…300) → T2(…200)；T2c 与 T2 只差 2 秒，是同一封物理邮件
+  // Descending time: T3(…300) -> T2(…200); T2c and T2 differ by only 2 seconds, same physical mail
   const T3 = msg('T3', 1, {
     from_name: null, from_email: 'bob@partner.com', subject: 'Re: 报价确认',
     mailbox: 'alpha@x.com', received_at: 1700000300,
   });
   const T2c = msg('T2c', 1, {
     from_name: 'support', from_email: 'support@x.com', subject: 'Re: 报价确认',
-    mailbox: 'zhanglili@x.com', received_at: 1700000203,
+    mailbox: 'erin@x.com', received_at: 1700000203,
   });
   const threadItems = [
-    { // 对方来信（最新 → 排最前，与接口的降序一致）
+    { // the other party's mail (newest -> first, consistent with the interface's descending order)
       id: 'T3', direction: 'inbound', mailbox: 'alpha@x.com',
       from_name: null, from_email: 'bob@partner.com',
       to: ['alpha@x.com'], subject: 'Re: 报价确认',
       preview: '补充', received_at: 1700000300, read: true, deleted: false, current: false,
     },
-    { // 出站副本（留存行）：同一封物理邮件在本账号内的「其它记录」挂在 copy_ids 上
+    { // outbound copy (retained row): the "other records" of the same physical mail within this account hang on copy_ids
       id: 'T2', direction: 'outbound', mailbox: 'support@x.com',
       from_name: 'support', from_email: 'support@x.com',
       to: ['alice@partner.com'], subject: 'Re: 报价确认',
@@ -354,11 +354,11 @@ function threadCopyFixture() {
   return {
     mailboxes: [
       { mailbox: 'alpha@x.com', inbox_unread: 0, inbox_total: 1, sent_total: 0 },
-      { mailbox: 'zhanglili@x.com', inbox_unread: 0, inbox_total: 1, sent_total: 0 },
+      { mailbox: 'erin@x.com', inbox_unread: 0, inbox_total: 1, sent_total: 0 },
       { mailbox: 'support@x.com', inbox_unread: 0, inbox_total: 0, sent_total: 1 },
     ],
     folders: {
-      // T2c 放首位 → maybeAutoOpen 打开的就是这份被折叠的副本
+      // T2c first -> what maybeAutoOpen opens is this collapsed copy
       inbox: { items: [T2c, T3], total: 2 },
       sent: { items: [], total: 0 },
       starred: { items: [], total: 0 },
@@ -372,7 +372,7 @@ function threadCopyFixture() {
   };
 }
 
-/** BUG-4 固定装置：50 行、total=50，桩按 limit/offset 真实切片 → 第 2 页必为空。 */
+/** BUG-4 fixture: 50 rows, total=50, the stub truly slices by limit/offset -> page 2 is necessarily empty. */
 function pagingFixture() {
   const items = [];
   for (let i = 0; i < 50; i++) items.push(msg('P' + String(i).padStart(2, '0'), i === 0 ? 0 : 1));
@@ -393,9 +393,9 @@ function pagingFixture() {
 }
 
 /**
- * 预取用例固定装置：收件箱与已发送**各 50 封、id 不重叠**。
- * 这样「切换视图后有没有抓错视图 / 重复抓」才观察得到 ——
- * 若新视图为空列表，预取的游标扫描会自然 break，会把「取消没生效」伪装成通过。
+ * Prefetch case fixture: inbox and sent **50 each, non-overlapping ids**.
+ * This way "did switching views grab the wrong view / grab twice" is observable --
+ * if the new view were an empty list, the prefetch's cursor scan would naturally break, disguising "cancel didn't take effect" as a pass.
  */
 function prefetchFixture() {
   const inboxItems = [];
@@ -424,7 +424,7 @@ function prefetchFixture() {
   };
 }
 
-/** BUG-5 固定装置：上次会话残留的 localStorage 快照，选中具体账号 beta。 */
+/** BUG-5 fixture: a localStorage snapshot left over from the last session, with the specific account beta selected. */
 function seededBetaFixture() {
   const items = [];
   for (let i = 0; i < 7; i++) items.push(msg('B' + i, i === 0 ? 0 : 1, { mailbox: 'beta@x.com' }));
@@ -450,7 +450,7 @@ function seededBetaFixture() {
       mailboxes,
       openId: null,
     },
-    // 「全部邮箱」视图刻意给不同的行数，便于区分「走错分支」
+    // The "all mailboxes" view intentionally has a different row count, to distinguish "took the wrong branch"
     foldersByMailbox: {
       'beta@x.com': { items, total: 7 },
       '': { items: items.slice(0, 3), total: 3 },
@@ -460,7 +460,7 @@ function seededBetaFixture() {
   };
 }
 
-/** BUG-5 负控制固定装置：快照里的账号已不存在（ghost）。 */function seededGhostFixture() {
+/** BUG-5 negative-control fixture: the account in the snapshot no longer exists (ghost). */function seededGhostFixture() {
   const items = [];
   for (let i = 0; i < 4; i++) items.push(msg('G' + i, 1, { mailbox: 'ghost@x.com' }));
   const messages = {};
@@ -487,7 +487,7 @@ function seededBetaFixture() {
     },
     foldersByMailbox: {
       'ghost@x.com': { items, total: 4 },
-      // 回退目标 alpha 必须有内容，否则列表会空、init 的就绪判据（列表有行）无法满足
+      // The fallback target alpha must have content, otherwise the list would be empty and init's readiness criterion (list has rows) can't be met
       'alpha@x.com': { items: items.slice(0, 2), total: 2 },
       'beta@x.com': { items: [], total: 0 },
     },
@@ -496,11 +496,11 @@ function seededBetaFixture() {
 }
 
 /**
- * T4d 固定装置：`/api/mailboxes` 返回**空数组**（服务端账号被清空）。
- * snapshotMailboxes 控制 localStorage 快照里的账号列表：
- *   - 子情形 B：快照含账号列表（下拉先被填充过 option）→ snapshotMailboxes = [beta]
- *   - 子情形 C：快照 mailboxes 为空（下拉从未被填充）  → snapshotMailboxes = []
- * 两种情形下 state.mailbox 都是 'beta@x.com'，列表请求都必须带 mailbox=beta。
+ * T4d fixture: `/api/mailboxes` returns an **empty array** (the server's accounts were cleared).
+ * snapshotMailboxes controls the account list in the localStorage snapshot:
+ *   - sub-case B: the snapshot contains an account list (the dropdown was populated with options before) -> snapshotMailboxes = [beta]
+ *   - sub-case C: the snapshot's mailboxes are empty (the dropdown was never populated)  -> snapshotMailboxes = []
+ * In both cases state.mailbox is 'beta@x.com', and the list request must carry mailbox=beta.
  */
 function emptyMailboxesFixture(snapshotMailboxes) {
   const items = [];
@@ -509,7 +509,7 @@ function emptyMailboxesFixture(snapshotMailboxes) {
   for (const it of items) messages[it.id] = detail(it, it.read);
   const counts = { inbox_unread: 1, inbox_total: 5, sent_total: 0, starred_total: 0, trash_total: 0 };
   return {
-    mailboxes: [], // ← 服务端账号列表为空
+    mailboxes: [], // <- the server's account list is empty
     counts,
     seedCache: {
       v: CACHE_VERSION_IN_APP,
@@ -523,60 +523,60 @@ function emptyMailboxesFixture(snapshotMailboxes) {
       mailboxes: snapshotMailboxes,
       openId: null,
     },
-    // 「全部邮箱」视图刻意也给出行（否则一旦实现把 mailbox 丢掉，列表会空、用例只会在 boot 超时，
-    // 报不出「请求缺 mailbox」这个真正的原因）
+    // The "all mailboxes" view intentionally also has rows (otherwise if an implementation drops mailbox, the list would be empty and the case would only time out during boot,
+    // failing to report the real cause "request missing mailbox")
     foldersByMailbox: { 'beta@x.com': { items, total: 5 }, '': { items: items.slice(0, 2), total: 2 } },
     messages,
   };
 }
 
 /* ---------------------------------------------------------------------------
- * 启动一个「已跑完 init()」的应用实例
+ * Boot an application instance that "has finished running init()"
  * -------------------------------------------------------------------------*/
 
 const tick = (win) => new Promise((r) => win.setTimeout(r, 0));
 async function ticks(win, n = 1) { for (let i = 0; i < n; i++) await tick(win); }
 const sleep = (ctx, ms) => new Promise((r) => ctx.win.setTimeout(r, ms));
 
-/** 轮询等待页面内某个表达式为真（默认 4s）。等待后台预取这类异步过程用它，别用固定 sleep 猜时长。 */
+/** Poll until some expression in the page becomes true (default 4s). Use it for async processes like background prefetch, not a fixed sleep to guess the duration. */
 async function waitUntil(ctx, expr, timeoutMs = 4000) {
   const t0 = Date.now();
   while (Date.now() - t0 < timeoutMs) {
     let v = false;
-    try { v = !!evalIn(ctx, expr); } catch { /* 脚本尚未就绪 */ }
+    try { v = !!evalIn(ctx, expr); } catch { /* script not ready yet */ }
     if (v) return true;
     await sleep(ctx, 40);
   }
   return false;
 }
 
-/** 显式启动一次正文预取。boot() 默认会把自动预取作废，只有需要验证预取的用例才用它。 */
+/** Explicitly start one body prefetch. boot() invalidates automatic prefetch by default; only cases that need to verify prefetch use this. */
 function startPrefetch(ctx) { evalIn(ctx, 'prefetchBodies()'); }
 
 async function boot(cfg = {}) {
   const dom = new JSDOM(INDEX_HTML, { runScripts: 'dangerously', url: 'http://localhost/' });
   const win = dom.window;
-  // jsdom 默认 document.hidden === true（visibilityState='prerender'），
-  // 会让 periodicSync() 在 `if (document.hidden) return;` 处直接返回、一个请求都不发。
-  // 真实浏览器里可见标签页是 visible，这里显式对齐，否则定时同步路径在 jsdom 中不可测。
+  // jsdom defaults document.hidden === true (visibilityState='prerender'),
+  // which makes periodicSync() return immediately at `if (document.hidden) return;` and send not a single request.
+  // In a real browser a visible tab is visible; align it explicitly here, otherwise the periodic sync path is untestable in jsdom.
   Object.defineProperty(win.document, 'visibilityState', { value: 'visible', configurable: true });
   Object.defineProperty(win.document, 'hidden', { value: false, configurable: true });
-  // seedCache：在注入 app.js **之前**写入 localStorage 快照（BUG-5 的「上次会话残留」场景）
+  // seedCache: write the localStorage snapshot **before** injecting app.js (BUG-5's "residual from the last session" scenario)
   if (cfg.seedCache !== undefined) {
     const raw = typeof cfg.seedCache === 'string' ? cfg.seedCache : JSON.stringify(cfg.seedCache);
     win.localStorage.setItem('inbox-cache-v1', raw);
   }
   const stub = makeStub(cfg);
-  win.fetch = stub.fetchImpl; // 必须在注入 app.js 之前
+  win.fetch = stub.fetchImpl; // must be before injecting app.js
 
   const script = win.document.createElement('script');
   script.textContent = APP_JS;
   win.document.body.appendChild(script);
 
-  // 就绪判据：renderNav 已渲染 4 个文件夹 + loadFolder 已渲染出列表行 + maybeAutoOpen 已打开首封。
-  // 这三件事都发生在 setupEvents() 之后，因此等价于「事件已接线、init 已跑完」。
-  // 另需等详情落定（detailPending 清空），否则会停在「头部已画、正文还在下载」的中间态。
-  // holdDetail 时详情被测试主动挂起，这一条自动豁免。
+  // Readiness criteria: renderNav has rendered 4 folders + loadFolder has rendered list rows + maybeAutoOpen has opened the first mail.
+  // All three happen after setupEvents(), so it's equivalent to "events wired, init finished".
+  // Also need the detail settled (detailPending cleared), otherwise it stops at the intermediate state "header drawn, body still downloading".
+  // Under holdDetail the detail is intentionally held by the test, so this one is exempted automatically.
   const wantDetailSettled = !cfg.holdDetail;
   let ready = false;
   for (let i = 0; i < 600; i++) {
@@ -587,7 +587,7 @@ async function boot(cfg = {}) {
     try {
       openId = win.eval('typeof state === "object" ? state.openId : null');
       detailSettled = !win.eval('detailPending');
-    } catch { /* 脚本未就绪 */ }
+    } catch { /* script not ready yet */ }
     const settledOk = !wantDetailSettled || detailSettled;
     if (nav && nav.children.length > 0 && list && list.children.length > 0 && openId && settledOk) {
       ready = true; break;
@@ -597,18 +597,18 @@ async function boot(cfg = {}) {
   if (!ready) throw new Error('init() 未在预期时间内完成（fetch 打桩或脚本注入失败）');
   await ticks(win, 10);
 
-  // 后台正文预取是**时间相关**的：它会在 paintList() 之后 500ms 开始顺序发详情请求，
-  // 让所有「请求次数」类断言变成 flaky（实测：T9 的缓存条数前置条件被多出来的一封打乱）。
-  // 默认在 boot 结束时作废它，测试就完全确定；要验证预取本身的用例显式调用
-  // startPrefetch()/waitUntil()。gen 与 active 都要清：只递增 gen 的话，
-  // 被取消那轮仍占着 prefetchActive，之后的 startPrefetch() 会被早退挡掉。
+  // Background body prefetch is **time-dependent**: it starts sequentially sending detail requests 500ms after paintList(),
+  // making all "request count" assertions flaky (measured: T9's cache-count precondition was disturbed by one extra mail).
+  // By default invalidate it at the end of boot, making the test fully deterministic; cases that verify prefetch itself call
+  // startPrefetch()/waitUntil() explicitly. Both gen and active must be cleared: only incrementing gen leaves the canceled
+  // round still holding prefetchActive, so a later startPrefetch() would be blocked by an early return.
   if (!cfg.keepPrefetch) win.eval('prefetchGen++; prefetchActive = null;');
 
   return { dom, win, doc: win.document, stub, close() { try { dom.window.close(); } catch { /* ignore */ } } };
 }
 
 /* ---------------------------------------------------------------------------
- * DOM / 事件辅助
+ * DOM / event helpers
  * -------------------------------------------------------------------------*/
 
 const evalIn = (ctx, expr) => ctx.win.eval(expr);
@@ -635,14 +635,14 @@ function setSearch(ctx, value) {
   n.value = value;
   n.dispatchEvent(new ctx.win.Event('input', { bubbles: true }));
 }
-/** 用真实用户动作把列表恢复成「无选中、无打开」的干净状态。 */
+/** Restore the list to a clean "no selection, nothing open" state using real user actions. */
 async function resetList(ctx) {
   evalIn(ctx, "openFolder('inbox')");
   await ticks(ctx.win, 6);
 }
 
 /* ---------------------------------------------------------------------------
- * 用例运行器
+ * Test case runner
  * -------------------------------------------------------------------------*/
 
 const results = [];
@@ -674,10 +674,10 @@ async function test(name, fn, cfg) {
 }
 
 /* ---------------------------------------------------------------------------
- * BUG-4 / BUG-5 专用辅助
+ * BUG-4 / BUG-5 dedicated helpers
  * -------------------------------------------------------------------------*/
 
-/** 从 fetch 记录的 URL 里取某个查询参数（用于断言请求真的带了 offset / mailbox）。 */
+/** Extract a query param from a URL recorded by fetch (used to assert the request really carried offset / mailbox). */
 function queryParam(url, key) {
   const qs = new URLSearchParams(String(url).split('?')[1] || '');
   return qs.get(key);
@@ -685,19 +685,19 @@ function queryParam(url, key) {
 const folderCalls = (ctx) => ctx.stub.calls.filter((c) => /^\/api\/folders\//.test(c.url));
 
 /**
- * 详情请求（GET /api/messages/:id），可指定起始下标。
+ * Detail requests (GET /api/messages/:id), can specify a starting index.
  *
- * ⚠️ **必须按 `c.url` 过滤**：`calls` 里存的是 `{ url, method, body }` **对象**。
- * 若写成 `filter((u) => /^\/api\/messages\//.test(u))`，正则会被隐式转成 `"[object Object]"`
- * → **永远不匹配** → `length === 0` 恒成立 → 断言**空转假绿**。
- * 这不是假设：T8「刷新后不再发起详情请求」最初就是这样"通过"的。
+ * ⚠️ **Must filter by `c.url`**: `calls` holds **objects** `{ url, method, body }`.
+ * If written as `filter((u) => /^\/api\/messages\//.test(u))`, the regex is implicitly coerced from `"[object Object]"`
+ * -> **never matches** -> `length === 0` always holds -> the assertion is a **no-op false green**.
+ * This isn't hypothetical: T8 "no more detail requests after refresh" initially "passed" this way.
  */
 const detailCalls = (ctx, from = 0) => ctx.stub.calls.slice(from).filter((c) => /^\/api\/messages\//.test(c.url));
 
 /**
- * 谓词自检：确认上面那个过滤器**真的能识别详情请求**，而不是恒为空。
- * 没有这一步，「期望 0 条」的断言无法区分「确实没发」与「过滤器坏了」。
- * 与 T10（同一过滤器，期望恰好 1 条）构成正负控制组。
+ * Predicate self-check: confirm the filter above **really identifies detail requests**, not always empty.
+ * Without this step, a "expect 0" assertion can't distinguish "indeed sent none" from "the filter is broken".
+ * Forms a positive/negative control pair with T10 (same filter, expects exactly 1).
  */
 function assertDetailCollectorWorks(ctx) {
   ok(ctx.stub.calls.every((c) => c && typeof c.url === 'string'),
@@ -710,14 +710,14 @@ function assertDetailCollectorWorks(ctx) {
 const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } };
 
 /* ===========================================================================
- * 用例
+ * Test cases
  * ===========================================================================*/
 
 (async function main() {
   console.log('收件箱 UI 三类缺陷 —— 独立 jsdom 回归验证');
   console.log(`被测版本: app.js md5=${FINGERPRINT.md5}  mtime=${FINGERPRINT.mtime}  bytes=${FINGERPRINT.bytes}`);
 
-  /* ---- T0 环境自检：保证断言不是「空转蒙对」 ---- */
+  /* ---- T0 environment self-check: ensure the assertions aren't "no-op lucky passes" ---- */
   await test('T0 测试环境自检（harness 可信度）', async (ctx) => {
     ok(typeof ctx.win.openMessage === 'function', 'app.js 已注入且 openMessage 为全局函数');
     ok(typeof ctx.win.openFolder === 'function', 'openFolder 为全局函数');
@@ -726,21 +726,21 @@ const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } 
     ok(ctx.stub.counters.account >= 1, '/api/account 被请求（fetch 打桩生效）', ctx.stub.counters.account);
     ok(ctx.stub.counters.folders >= 1, '/api/folders/* 被请求（列表数据来自打桩）', ctx.stub.counters.folders);
     ok(evalIn(ctx, 'state.items.length') === 3, '列表渲染出 3 行', evalIn(ctx, 'state.items.length'));
-    // 快照版本号是从 app.js 里正则取的；正则一旦失配会静默变成 NaN，后面恢复路径的用例
-    // 就会「快照永远被判过期」，必须在这里先证明它取到了真值。
+    // The snapshot version number is taken from app.js by regex; if the regex fails it silently becomes NaN, and the restore-path cases
+    // below would "always deem the snapshot expired", so prove here first that a real value was obtained.
     ok(Number.isInteger(CACHE_VERSION_IN_APP) && CACHE_VERSION_IN_APP > 0,
       'harness 自检：已从 app.js 解析出 CACHE_VERSION（否则恢复路径用例会静默空转）',
       `CACHE_VERSION_IN_APP=${CACHE_VERSION_IN_APP}`);
     ok(!!rowFor(ctx, 'A') && !!rowFor(ctx, 'B'), 'A / B 两行都存在于 DOM');
     ok(!!rowFor(ctx, 'A') && rowFor(ctx, 'A').classList.contains('unread'), 'A 行初始为未读（.unread 存在）');
     ok(!!rowFor(ctx, 'B') && !rowFor(ctx, 'B').classList.contains('unread'), 'B 行初始为已读（无 .unread）');
-    // 证明 #select-all 的 change 监听确实已接线（否则后续断言会空转）
+    // Prove #select-all's change listener is really wired (otherwise later assertions no-op)
     setCheckbox(ctx, '#select-all', true);
     ok(evalIn(ctx, 'state.selected.size') === 3, '勾选 #select-all 后 state.selected.size=3（事件已接线）', evalIn(ctx, 'state.selected.size'));
     ok(!hidden(ctx, '#list-bulk'), '勾选后批量操作条可见');
 
-    // CACHE_VERSION 升版（1→2）靠的就是「版本不符 → 整份拒绝」这条机制，这里直接验证它本身。
-    // 否则「升版」只是一句注释，没人守着 readPersisted() 真的会拒。
+    // CACHE_VERSION bumping (1->2) relies on "version mismatch -> reject the whole thing"; verify that mechanism directly here.
+    // Otherwise "bumping" is just a comment, with nobody guarding that readPersisted() really rejects.
     evalIn(ctx, `localStorage.setItem('inbox-cache-v1', JSON.stringify({ v: ${CACHE_VERSION_IN_APP - 1}, at: Date.now(), folder: { items: [{ id: 'STALE' }], total: 1 } }))`);
     ok(evalIn(ctx, 'readPersisted()') === null,
       '版本不符的快照被整份拒绝（CACHE_VERSION 升版据此让旧快照失效）');
@@ -749,7 +749,7 @@ const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } 
       '负控制：版本相符的快照会被接受（不是「readPersisted 一律返回 null」）');
   });
 
-  /* ---- BUG-1 行选中高亮残留 ---- */
+  /* ---- BUG-1 row selection highlight lingering ---- */
   await test('T1 BUG-1 连续打开两封邮件后只能有 1 个 active 行', async (ctx) => {
     await resetList(ctx);
     ok(activeRows(ctx).length === 0, '负控制基线：重置后没有任何 active 行', activeRows(ctx).length);
@@ -771,7 +771,7 @@ const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } 
     ok(activeRows(ctx).length === 0, 'closeMessagePane() 之后 active 数量为 0', activeRows(ctx).length);
   });
 
-  /* ---- BUG-1b 「全选本页」复选框状态残留 ---- */
+  /* ---- BUG-1b "select all on this page" checkbox state lingering ---- */
   await test('T1b-1 BUG-1b 切文件夹后 #select-all 必须复位', async (ctx) => {
     await resetList(ctx);
     setCheckbox(ctx, '#select-all', true);
@@ -796,7 +796,7 @@ const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } 
     ok(el(ctx, '#select-all').checked === true, '勾选后 #select-all.checked=true');
 
     setSearch(ctx, 'A');
-    await sleep(ctx, 700); // setupSearch 的 400ms 防抖
+    await sleep(ctx, 700); // setupSearch's 400ms debounce
     await ticks(ctx.win, 8);
     ok(evalIn(ctx, 'state.selected.size') === 0, '搜索后 state.selected 已清空', evalIn(ctx, 'state.selected.size'));
     ok(el(ctx, '#select-all').checked === false, '搜索后 #select-all.checked 复位为 false（BUG-1b）',
@@ -835,7 +835,7 @@ const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } 
     ok(hidden(ctx, '#list-bulk'), '切账号后批量条隐藏');
   });
 
-  /* ---- BUG-2 读过之后列表行仍显示未读 ---- */
+  /* ---- BUG-2 a list row still shows unread after being read ---- */
   await test('T2 BUG-2 打开未读邮件后行内 .unread 必须消失且本地状态回写', async (ctx) => {
     await resetList(ctx);
     ok(rowFor(ctx, 'A').classList.contains('unread'), '前置：A 行未读');
@@ -876,7 +876,7 @@ const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } 
     await ticks(ctx.win, 10);
     ok(evalIn(ctx, "state.cache.messages.has('A')") === true, '前置：A 已进入消息缓存');
 
-    // 制造「缓存已是已读、但列表行仍显示未读」的状态，逼 openMessage 走提前 return 分支
+    // Manufacture the state "cache already read, but the list row still shows unread" to force openMessage down the early-return branch
     evalIn(ctx, "state.items.find((x) => x.id === 'A').read = 0");
     rowFor(ctx, 'A').classList.add('unread');
     ok(rowFor(ctx, 'A').classList.contains('unread'), '前置：已把 A 行改回未读外观');
@@ -890,7 +890,7 @@ const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } 
       evalIn(ctx, "state.items.find((x) => x.id === 'A').read"));
   });
 
-  /* ---- BUG-3a 账号下拉被静默改写 ---- */
+  /* ---- BUG-3a account dropdown silently rewritten ---- */
   await test('T3 BUG-3a 「全部邮箱」不得被静默改写，state.mailbox 与 sel.value 恒一致', async (ctx) => {
     const sel = el(ctx, '#mailbox-select');
     ok(evalIn(ctx, 'state.mailbox') === sel.value, '初始：state.mailbox === sel.value',
@@ -915,10 +915,10 @@ const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } 
 
   await test('T3b BUG-3a 账号已不存在时回退，state.mailbox 与 sel.value 仍必须一致', async (ctx) => {
     const sel = el(ctx, '#mailbox-select');
-    // 场景一：用户选中 alpha@x.com（真实路径：change 监听会把 state.mailbox 同步成 alpha），
-    //         随后该账号从账号列表中消失 → 必须回退到仍然存在的账号。
-    //         注意：真值来源是 state.mailbox（app.js 已注明）；只改 sel.value 不改 state.mailbox
-    //         不构成「用户选了 alpha」，因此这里必须两者同时设置，否则测的是假场景。
+    // Scenario 1: the user selected alpha@x.com (real path: the change listener syncs state.mailbox to alpha),
+    //         then that account disappears from the account list -> must fall back to an account that still exists.
+    //         Note: the truth source is state.mailbox (app.js notes this); only changing sel.value without state.mailbox
+    //         doesn't constitute "the user picked alpha", so both must be set here, otherwise we'd be testing a fake scenario.
     sel.value = 'alpha@x.com';
     evalIn(ctx, "state.mailbox = 'alpha@x.com'");
     evalIn(ctx, "state.mailboxList = state.mailboxList.filter((m) => m.mailbox !== 'alpha@x.com')");
@@ -928,8 +928,8 @@ const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } 
     ok(v1 !== '' && v1 !== 'alpha@x.com', '场景一：回退到某个仍然存在的账号', JSON.stringify(v1));
     ok(m1 === v1, '场景一：回退后 state.mailbox === sel.value（不脱钩）', `${JSON.stringify(m1)} / ${JSON.stringify(v1)}`);
 
-    // 场景一附注：仅改 sel.value（不同步 state.mailbox）时，真值来源仍是 state.mailbox，
-    // 因此不会触发回退。这是当前实现的既定契约，显式记录以免将来误判为回归。
+    // Scenario 1 note: when only sel.value is changed (without syncing state.mailbox), the truth source is still state.mailbox,
+    // so no fallback is triggered. This is the established contract of the current implementation, recorded explicitly to avoid misjudging it as a regression later.
     evalIn(ctx, "state.mailbox = ''");
     sel.value = 'alpha@x.com';
     evalIn(ctx, 'renderMailboxSelect()');
@@ -937,7 +937,7 @@ const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } 
       '场景一附注：只改 sel.value 不构成用户选择，state.mailbox 仍是真值来源（不变量依然成立）',
       `${JSON.stringify(sel.value)} / ${JSON.stringify(evalIn(ctx, 'state.mailbox'))}`);
 
-    // 场景二：state.mailbox 指向已不存在的账号，下拉显示仍是有效账号
+    // Scenario 2: state.mailbox points to an account that no longer exists; the dropdown still shows a valid account
     evalIn(ctx, "state.mailbox = 'ghost@x.com'");
     evalIn(ctx, 'renderMailboxSelect()');
     const v2 = sel.value;
@@ -946,7 +946,7 @@ const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } 
     ok(v2 !== 'ghost@x.com', '场景二：下拉不会停留在不存在的账号上', JSON.stringify(v2));
   });
 
-  /* ---- BUG-3c 账号未读数陈旧 ---- */
+  /* ---- BUG-3c account unread count goes stale ---- */
   await test('T3c BUG-3c 读信发生 0→1 跃迁后必须重新请求 /api/mailboxes', async (ctx) => {
     await resetList(ctx);
     ctx.stub.counters.mailboxes = 0;
@@ -955,7 +955,7 @@ const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } 
     ok(ctx.stub.counters.mailboxes >= 1, '读信跃迁后 /api/mailboxes 被重新请求（BUG-3c）', ctx.stub.counters.mailboxes);
   });
 
-  /* ---- BUG-3d 口径未标注 ---- */
+  /* ---- BUG-3d number semantics unlabeled ---- */
   await test('T3d BUG-3d 下拉项与列表标题的数字口径必须自解释', async (ctx) => {
     const opts = Array.from(el(ctx, '#mailbox-select').options);
     info(`下拉项文案: ${opts.map((o) => `${JSON.stringify(o.value)}=>${JSON.stringify(o.textContent)}`).join(' , ')}`);
@@ -970,32 +970,32 @@ const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } 
   });
 
   /* ===========================================================================
-   * BUG-4 / BUG-5：本地缓存优先改造引入的两类回归
+   * BUG-4 / BUG-5: two regression classes introduced by the local-cache-first refactor
    * ===========================================================================*/
 
-  /* ---- BUG-4 定时同步把列表清空 ---- */
+  /* ---- BUG-4 periodic sync clears the list ---- */
   await test('T4a BUG-4 定时同步必须请求第 1 页、且不得把列表清空', async (ctx) => {
     const win = ctx.win;
     ok(el(ctx, '#list').children.length === 50, '前置：列表渲染 50 行', el(ctx, '#list').children.length);
     ok(evalIn(ctx, 'state.offset') === 50, '前置：state.offset=50（第 1 页已满）', evalIn(ctx, 'state.offset'));
 
-    // 负控制 1：断言工具本身可用（否则「不含 offset=50」可能只是解析失败）
+    // Negative control 1: the assertion helper itself works (otherwise "doesn't contain offset=50" might just be a parse failure)
     ok(queryParam('/api/folders/inbox?limit=50&offset=50', 'offset') === '50',
       '负控制：offset 解析工具可用（非空转）', queryParam('/api/folders/inbox?limit=50&offset=50', 'offset'));
 
-    // 负控制 2：total=50 时第 2 页确实为空 —— 旧实现请求 offset=50 拿到的就是空页
+    // Negative control 2: with total=50 page 2 is indeed empty -- the old implementation requested offset=50 and got an empty page
     const page2 = await evalIn(ctx, 'fetchFolderPage(50)');
     ok(page2.items.length === 0, '前提：total=50 时第 2 页为空（旧实现 offset=50 会拿到空页）', page2.items.length);
 
-    // 负控制 3：空页被整体覆盖进 state.items 时，列表确实会变成 0 行（证明下面断言能观察到缺陷）
+    // Negative control 3: when the empty page overwrites state.items entirely, the list really becomes 0 rows (proving the assertion below can observe the defect)
     evalIn(ctx, 'state.items = []; state.offset = 0; paintList();');
     ok(el(ctx, '#list').children.length === 0, '负控制：空页整体覆盖后列表确实变 0 行', el(ctx, '#list').children.length);
     evalIn(ctx, "openFolder('inbox')");
     await ticks(win, 12);
     ok(el(ctx, '#list').children.length === 50, '前置恢复：重新加载后回到 50 行', el(ctx, '#list').children.length);
 
-    // periodicSync 只在非阅读态刷新列表，且只在文件夹缓存超过 TTL.folder(45s) 时才刷新
-    // （60s 定时同步的真实场景：上次刷新早已过期）。把缓存时间戳做旧以触发刷新路径。
+    // periodicSync only refreshes the list when not reading, and only when the folder cache exceeds TTL.folder(45s)
+    // (the real 60s sync scenario: the last refresh long expired). Age the cache timestamp to trigger the refresh path.
     evalIn(ctx, 'closeMessagePane()');
     evalIn(ctx, 'state.cache.folders.forEach((c) => { c.at = Date.now() - 120000; })');
     await ticks(win, 3);
@@ -1016,7 +1016,7 @@ const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } 
     ok(evalIn(ctx, 'state.offset') === 50, 'state.offset 重新落在 50', evalIn(ctx, 'state.offset'));
   }, pagingFixture());
 
-  /* ---- BUG-5 恢复路径下具体账号选择被静默重置 ---- */
+  /* ---- BUG-5 specific account selection silently reset under the restore path ---- */
   await test('T4b BUG-5 恢复路径下具体账号选择不得被静默重置', async (ctx) => {
     const sel = el(ctx, '#mailbox-select');
     info(`恢复后 下拉值=${JSON.stringify(sel.value)}  state.mailbox=${JSON.stringify(evalIn(ctx, 'state.mailbox'))}  行数=${el(ctx, '#list').children.length}`);
@@ -1053,12 +1053,12 @@ const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } 
     ok(evalIn(ctx, 'state.mailbox') === 'alpha@x.com', '回退优先选「有未读的账号」', JSON.stringify(evalIn(ctx, 'state.mailbox')));
   }, seededGhostFixture());
 
-  /* ---- T4d 边界：账号列表为空（/api/mailboxes → []）时下拉隐藏，state.mailbox 仍是唯一权威 ----
-   * 机制（app.js:362-375）：`if (list.length < 1) { wrap.classList.add('hidden'); return; }` 提前返回，
-   * 而 `sel.innerHTML = ''` 在它**之后**。`.hidden` 只是 display:none !important（app.css:36），
-   * 不重置 value/selectedIndex ⇒ 空列表时旧 option 会残留。
-   * 因此**不得**断言 `sel.options.length === 0`（B 下是 2、C 下是 0，这不是契约），
-   * 也**不得**用 DOM 显示值断言权威性；权威性一律用「列表请求是否带 mailbox 参数」来断言。
+  /* ---- T4d edge: when the account list is empty (/api/mailboxes -> []), the dropdown hides, but state.mailbox remains the sole authority ----
+   * Mechanism (app.js:362-375): `if (list.length < 1) { wrap.classList.add('hidden'); return; }` returns early,
+   * and `sel.innerHTML = ''` comes **after** it. `.hidden` is just display:none !important (app.css:36),
+   * it doesn't reset value/selectedIndex => with an empty list old options linger.
+   * Therefore **must not** assert `sel.options.length === 0` (under B it's 2, under C it's 0, this isn't the contract),
+   * nor use the DOM-shown value to assert authority; always assert authority via "does the list request carry the mailbox param".
    */
   await test('T4d-B 账号列表被服务端清空后：下拉隐藏，但 state.mailbox 仍驱动请求', async (ctx) => {
     const wrap = el(ctx, '#mailbox-wrap');
@@ -1069,7 +1069,7 @@ const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } 
       JSON.stringify(evalIn(ctx, 'state.mailbox')));
     info(`记录（不作为契约）：sel.value=${JSON.stringify(sel.value)}  sel.options.length=${sel.options.length}  wrap.hidden=true`);
 
-    // 权威性：请求必须带 mailbox
+    // Authority: the request must carry mailbox
     const fcs = folderCalls(ctx);
     info(`列表请求: ${fcs.map((c) => c.url).join(' , ') || '（无）'}`);
     ok(fcs.length >= 1, '存在列表请求（否则后面的断言会空转）', fcs.length);
@@ -1077,7 +1077,7 @@ const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } 
       '所有列表请求都带 mailbox=beta@x.com（权威来源是 state.mailbox）',
       fcs.map((c) => c.url).join(' , '));
 
-    // 负控制：把 DOM 值清掉（模拟「顺手 sel.innerHTML = ''」的倒退改动）不得影响行为
+    // Negative control: clearing the DOM value (simulating a regressive change "carelessly doing sel.innerHTML = ''") must not affect behavior
     sel.value = '';
     const before = ctx.stub.calls.length;
     evalIn(ctx, "openFolder('inbox')");
@@ -1089,7 +1089,7 @@ const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } 
       '负控制：只改 sel.value 不改 state.mailbox ⇒ 请求仍带 mailbox=beta（DOM 不是真值来源）',
       reqs.map((c) => queryParam(c.url, 'mailbox')).join(','));
 
-    // 负控制：断言工具本身能观察到「缺参数」
+    // Negative control: the assertion helper itself can observe "missing param"
     ok(queryParam('/api/folders/inbox?limit=50&offset=0', 'mailbox') === null,
       '负控制：不带 mailbox 的 URL 解析为 null（断言确实能观察到缺失）');
   }, emptyMailboxesFixture([{ mailbox: 'beta@x.com', inbox_unread: 1, inbox_total: 5, sent_total: 0 }]));
@@ -1110,9 +1110,9 @@ const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } 
       '即使下拉隐藏，列表请求仍带 mailbox=beta@x.com',
       fcs.map((c) => c.url).join(' , '));
 
-    // 负控制：若真值来源错用 sel.value（此处为 ''），请求就会丢掉 mailbox —— 证明断言能区分两种真值来源
+    // Negative control: if the truth source wrongly used sel.value (here ''), the request would drop mailbox -- proving the assertion can distinguish the two truth sources
     const before = ctx.stub.calls.length;
-    evalIn(ctx, "state.mailbox = document.querySelector('#mailbox-select').value"); // 模拟「以 DOM 显示值为真值」的倒退实现
+    evalIn(ctx, "state.mailbox = document.querySelector('#mailbox-select').value"); // simulate a regressive implementation that "treats the DOM-shown value as truth"
     evalIn(ctx, "openFolder('inbox')");
     await ticks(ctx.win, 12);
     const reqs = ctx.stub.calls.slice(before).filter((c) => /^\/api\/folders\//.test(c.url));
@@ -1123,15 +1123,15 @@ const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } 
       reqs.map((c) => c.url).join(' , '));
   }, emptyMailboxesFixture([]));
 
-  /* ---- 详情：点击不被「正文尚未下载」阻塞 ---- */
+  /* ---- Detail: clicking isn't blocked by "body not yet downloaded" ---- */
 
   await test('T5 点开未缓存的邮件：头部同步渲染，正文位显示「下载中」，详情回来后原地替换', async (ctx) => {
-    // 前置：boot 正常完成（首封 C 已自动打开并完整渲染）
+    // Precondition: boot completed normally (the first mail C was auto-opened and fully rendered)
     ok(/正文 C/.test(el(ctx, '#read-message .mail-body').textContent), '前置条件：C 已完整渲染');
 
-    // 把详情接口设为「挂起」，以便观察点击后的中间态
+    // Set the detail interface to "held", so we can observe the intermediate state after clicking
     ctx.stub.setHoldDetail(true);
-    clickRow(ctx, 'A'); // A 未缓存 → 详情被挂起，停在「正文下载中」
+    clickRow(ctx, 'A'); // A not cached -> detail held, stops at "body downloading"
 
     ok(evalIn(ctx, 'state.openId') === 'A',
       '点击后 state.openId 立刻切到 A（同步，未等待请求）', JSON.stringify(evalIn(ctx, 'state.openId')));
@@ -1147,7 +1147,7 @@ const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } 
     ok(!!ph && /正在下载/.test(ph.textContent), '占位文案含「正在下载」', ph && ph.textContent);
     ok(!el(ctx, '#read-message .mail-body pre.text'), '真实正文尚未渲染（否则上面「下载中」的断言会空转）');
 
-    // 放行详情 → 正文原地替换
+    // Release the detail -> the body is replaced in place
     ok(ctx.stub.releaseDetail('A'), '确实放行了被挂起的详情响应（否则下面的断言会空转）');
     await ticks(ctx.win, 10);
     ok(!el(ctx, '#read-message .mail-body-pending'), '详情到达后占位被移除');
@@ -1155,8 +1155,8 @@ const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } 
       el(ctx, '#read-message .mail-body').textContent.slice(0, 30));
     ok(el(ctx, '#read-message .mail-subject h1').textContent === '主题 A', '主题保持不变');
 
-    // 负控制：缓存命中时必须同步渲染、不出现占位（证明占位由「缓存未命中」触发，而非无条件渲染）
-    // 这里刻意保持 holdDetail=true —— 即使详情接口是挂起的，缓存命中也不该有占位。
+    // Negative control: on a cache hit it must render synchronously with no placeholder (proving the placeholder is triggered by "cache miss", not rendered unconditionally)
+    // holdDetail is intentionally kept true here -- even if the detail interface is held, a cache hit should have no placeholder.
     clickRow(ctx, 'C');
     ok(evalIn(ctx, 'state.openId') === 'C', '切回 C');
     ok(!el(ctx, '#read-message .mail-body-pending'), '负控制：缓存命中 ⇒ 同步渲染，不出现「下载中」占位');
@@ -1173,7 +1173,7 @@ const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } 
       JSON.stringify(ctx.stub.heldDetailIds()));
     ok(el(ctx, '#read-message .mail-subject h1').textContent === '主题 B', '当前显示的是 B 的头部');
 
-    // 放行「先发」的 A：它已是过期响应，必须被丢弃
+    // Release the "earlier-sent" A: it's now a stale response and must be discarded
     ok(ctx.stub.releaseDetail('A'), '放行了 A 的（过期）详情响应');
     await ticks(ctx.win, 10);
     ok(el(ctx, '#read-message .mail-subject h1').textContent === '主题 B',
@@ -1181,7 +1181,7 @@ const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } 
     ok(evalIn(ctx, 'state.openId') === 'B', 'state.openId 仍为 B', JSON.stringify(evalIn(ctx, 'state.openId')));
     ok(!!el(ctx, '#read-message .mail-body-pending'), 'B 的正文仍显示「下载中」（A 的响应没有被误用）');
 
-    // 再放行 B：这次是当前请求，应当被采用
+    // Release B now: this is the current request and should be adopted
     ok(ctx.stub.releaseDetail('B'), '放行了 B 的详情响应');
     await ticks(ctx.win, 10);
     ok(!el(ctx, '#read-message .mail-body-pending'), 'B 的占位被移除');
@@ -1190,7 +1190,7 @@ const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } 
   });
 
   await test('T7 详情加载失败：保留头部，正文位给出错误态与重试', async (ctx) => {
-    // B 的详情缺失 → stub 返回 404，模拟详情接口失败
+    // B's detail is missing -> stub returns 404, simulating a detail interface failure
     clickRow(ctx, 'B');
     await ticks(ctx.win, 10);
     ok(el(ctx, '#read-message .mail-subject h1').textContent === '主题 B',
@@ -1201,10 +1201,10 @@ const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } 
     ok(!!err && /重试/.test(err.textContent), '错误态提供「重试」按钮');
   }, (() => { const c = inboxFixture(); delete c.messages.B; return c; })());
 
-  /* ---- 正文缓存跨刷新存活 ---- */
+  /* ---- Body cache survives across refreshes ---- */
 
   await test('T8 正文跨刷新持久化：刷新后点开读过的邮件不再重新下载', async (ctx) => {
-    // 第一次会话：读 A，等防抖写入落盘
+    // First session: read A, wait for the debounced write to hit disk
     evalIn(ctx, "openMessage('A')");
     await ticks(ctx.win, 8);
     await sleep(ctx, 450); // > PERSIST_DEBOUNCE_MS(300)
@@ -1215,23 +1215,23 @@ const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } 
     ok(Array.isArray(snap.messages) && snap.messages.some((p) => p[0] === 'A'),
       'A 的正文在落盘列表里', Array.isArray(snap.messages) ? snap.messages.map((p) => p[0]).join(',') : 'null');
 
-    // 第二次会话：用刚写下的快照冷启动，等价于「刷新页面」
+    // Second session: cold-start with the snapshot just written, equivalent to "refreshing the page"
     const ctx2 = await boot(Object.assign(inboxFixture(), { seedCache: raw }));
     try {
       const snapIds = snap.messages.map((p) => p[0]);
 
-      // ⚠️ 前置：init() 会在启动时「重开上次打开的邮件」。若 openId 没被恢复，boot 根本不会重开，
-      // 下面「boot 期间 0 次详情请求」就变成空转（什么都没测）。
+      // ⚠️ Precondition: init() re-opens the last opened mail at startup. If openId isn't restored, boot won't re-open it at all,
+      // and "0 detail requests during boot" below becomes a no-op (nothing tested).
       ok(evalIn(ctx2, 'state.openId') === 'A', '前置：上次打开的邮件已恢复为 A（否则 boot 不会重开）',
         evalIn(ctx2, 'state.openId'));
 
-      // ⭐ 核心断言：boot 阶段重开 A 时**一次详情请求都没有发**——正文完全来自本地快照。
-      // 用计数器（不依赖 URL 过滤器）度量，且与「是否重开」互相印证。
+      // ⭐ Core assertion: re-opening A during boot sends **not a single detail request** -- the body comes entirely from the local snapshot.
+      // Measured with a counter (not relying on the URL filter), cross-corroborated with "whether it re-opened".
       ok(ctx2.stub.counters.detail === 0,
         '刷新后重开上次打开的邮件**未发起任何详情请求**（正文来自本地快照，不再重新下载）',
         `boot 期间 detail 计数 = ${ctx2.stub.counters.detail}`);
 
-      // 快照里的每一封都必须回到内存缓存；尤其 C 在本次会话中从未被请求过，只能来自快照。
+      // Every mail in the snapshot must return to the in-memory cache; C in particular was never requested in this session, so it can only come from the snapshot.
       ok(snapIds.length >= 1, '前置：快照里至少有 1 封正文（否则下面的「全部恢复」会空转）',
         snapIds.join(','));
       const missing = snapIds.filter((id) => !evalIn(ctx2, `state.cache.messages.has(${JSON.stringify(id)})`));
@@ -1247,7 +1247,7 @@ const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } 
         el(ctx2, '#read-message .mail-body').textContent.slice(0, 20));
       ok(!el(ctx2, '#read-message .mail-body-pending'), '不出现「下载中」占位');
       await ticks(ctx2.win, 8);
-      // 两条独立口径交叉验证：计数器（不依赖过滤器）+ URL 过滤
+      // Two independent measures cross-validate: counter (no filter dependency) + URL filter
       ok(ctx2.stub.counters.detail === detailBefore,
         '刷新后点开读过的邮件**不再发起详情请求**（计数器口径）',
         `${detailBefore} → ${ctx2.stub.counters.detail}`);
@@ -1260,13 +1260,13 @@ const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } 
   });
 
   /**
-   * 在 Storage **原型**上装一个「按容量抛配额错误」的 setItem。
-   * ⚠️ jsdom 的 Storage 是 Proxy：`ls.setItem = fn` 与 `Object.defineProperty(ls, 'setItem', …)`
-   * **都会被 get 陷阱忽略**（已实测：包装函数调用次数恒为 0，数据照样写进去）。
-   * 唯一有效的做法是在原型上覆写。调用方必须在 finally 里还原。
-   * @param ctx 上下文
-   * @param limitOf 返回「当前能接受的最大正文条数」；超过就抛 QuotaExceededError
-   * @returns { tries, restore } tries 记录每次尝试时快照里带的正文条数
+   * Install a setItem on the Storage **prototype** that "throws a quota error by capacity".
+   * ⚠️ jsdom's Storage is a Proxy: `ls.setItem = fn` and `Object.defineProperty(ls, 'setItem', …)`
+   * **are both ignored by the get trap** (measured: the wrapper function's call count is always 0, and the data is written anyway).
+   * The only effective approach is to override on the prototype. The caller must restore it in finally.
+   * @param ctx context
+   * @param limitOf returns "the max number of bodies currently acceptable"; exceeding it throws QuotaExceededError
+   * @returns { tries, restore } tries records the number of bodies in the snapshot on each attempt
    */
   function installQuotaStub(ctx, limitOf) {
     const ls = ctx.win.localStorage;
@@ -1294,7 +1294,7 @@ const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } 
       '前置条件：内存里有 2 封正文可落盘（C 由自动打开带入、A 由本次点击带入）',
       evalIn(ctx, 'Array.from(state.cache.messages.keys()).join(",")'));
 
-    // 模拟 localStorage 满：只装得下 1 封正文
+    // Simulate a full localStorage: only room for 1 body
     const q = installQuotaStub(ctx, () => 1);
     try {
       evalIn(ctx, 'writePersisted()');
@@ -1302,7 +1302,7 @@ const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } 
       q.restore();
     }
 
-    // 空转防护：必须真的「先试 2 封、失败、砍到 1 封再试」
+    // No-op guard: it must really "try 2, fail, cut to 1 and retry"
     ok(q.tries.length === 2, '确实重试了一次（而不是一次性放弃）', q.tries.join(' → '));
     ok(q.tries[0] === 2 && q.tries[1] === 1,
       '第一次带 2 封被拒后，砍到 1 封再试', q.tries.join(' → '));
@@ -1324,7 +1324,7 @@ const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } 
     ok(evalIn(ctx, 'state.cache.messages.size') === 2, '前置条件：内存里有 2 封正文可落盘',
       evalIn(ctx, 'state.cache.messages.size'));
 
-    // 模拟极端配额：任何带正文的写入都失败
+    // Simulate an extreme quota: any write with a body fails
     const q = installQuotaStub(ctx, () => 0);
     try {
       evalIn(ctx, 'writePersisted()');
@@ -1346,7 +1346,7 @@ const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } 
     await ticks(ctx.win, 8);
     ok(evalIn(ctx, "state.cache.messages.has('A')"), '前置条件：A 已进入正文缓存');
 
-    // 把缓存时间推到 24 小时前（模拟隔天再打开同一封）
+    // Push the cache time to 24 hours ago (simulating opening the same mail again the next day)
     evalIn(ctx, "state.cache.messages.get('A').at = Date.now() - 24*3600*1000");
     const before = ctx.stub.calls.length;
     const detailBefore = ctx.stub.counters.detail;
@@ -1357,7 +1357,7 @@ const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } 
     ok(!el(ctx, '#read-message .mail-body-pending'), '不出现「下载中」占位');
 
     await ticks(ctx.win, 8);
-    // 这条同时是 T8 的正控制组：同一过滤器必须能抓到 1 条，否则 T8 的 0 条无意义
+    // This is also T8's positive control: the same filter must catch 1, otherwise T8's 0 is meaningless
     const reqs = detailCalls(ctx, before);
     ok(reqs.length === 1, '同时后台发起了一次校验请求（保证已读态最终一致）',
       reqs.map((c) => c.url).join(' , ') || '（无）');
@@ -1365,10 +1365,10 @@ const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } 
       `${detailBefore} → ${ctx.stub.counters.detail}`);
   });
 
-  /* ---- 后台预下载正文 ---- */
+  /* ---- Background prefetch of bodies ---- */
 
   await test('T11 后台预取：不点击也把列表里未缓存的正文抓回来，且不改动用户视图', async (ctx) => {
-    // boot 会自动打开首项 C → C 已缓存；A、B 尚未缓存
+    // boot auto-opens the first item C -> C is cached; A, B not yet cached
     ok(evalIn(ctx, "state.cache.messages.has('C')"), '前置：C 已因自动打开进入缓存');
     ok(!evalIn(ctx, "state.cache.messages.has('A')") && !evalIn(ctx, "state.cache.messages.has('B')"),
       '前置：A/B 尚未缓存（否则本用例会空转）',
@@ -1387,7 +1387,7 @@ const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } 
     ok(fetched.includes('/api/messages/A') && fetched.includes('/api/messages/B'),
       '确实是靠后台详情请求拿到的，而不是凭空出现', fetched.join(' , ') || '（无）');
 
-    // 预取是纯后台行为：不得触碰用户视图
+    // Prefetch is a pure background behavior: must not touch the user's view
     ok(evalIn(ctx, 'state.openId') === openIdBefore, '打开中的邮件没有被改变',
       `${openIdBefore} → ${evalIn(ctx, 'state.openId')}`);
     ok(evalIn(ctx, 'detailPending') === null, '预取不得留下「下载中」占位状态',
@@ -1402,12 +1402,12 @@ const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } 
     Object.defineProperty(ctx.win.document, 'visibilityState', { value: 'hidden', configurable: true });
     const before = ctx.stub.calls.length;
     startPrefetch(ctx);
-    await sleep(ctx, 1200); // 远超 PREFETCH_START_DELAY_MS(500) + 一个间隔
+    await sleep(ctx, 1200); // far beyond PREFETCH_START_DELAY_MS(500) + one interval
     ok(detailCalls(ctx, before).length === 0, '页面隐藏时一个详情请求都不发',
       detailCalls(ctx, before).map((c) => c.url).join(' , ') || '（无）');
     ok(!evalIn(ctx, "state.cache.messages.has('A')"), '隐藏期间也没有预取到正文');
 
-    // 恢复可见：同一套设置下必须真的开始预取，否则上面的 0 可能是「功能压根没生效」而非「被门控」
+    // Restore visibility: under the same settings it must really start prefetching, otherwise the 0 above might be "the feature never worked" rather than "gated"
     Object.defineProperty(ctx.win.document, 'hidden', { value: false, configurable: true });
     Object.defineProperty(ctx.win.document, 'visibilityState', { value: 'visible', configurable: true });
     startPrefetch(ctx);
@@ -1425,19 +1425,19 @@ const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } 
     Object.defineProperty(ctx.win.document, 'hidden', { value: true, configurable: true });
     await ticks(ctx.win, 2);
     const before = ctx.stub.calls.length;
-    await sleep(ctx, 900); // 远超一个间隔（100ms）
+    await sleep(ctx, 900); // far beyond one interval (100ms)
     ok(detailCalls(ctx, before).length === 0, '转为不可见后不再继续发请求',
       detailCalls(ctx, before).map((c) => c.url).join(' , ') || '（无）');
   });
 
   await test('T11c 视图切换：预取中途作废 —— 不抓旧视图，也不产生重复请求', async (ctx) => {
     startPrefetch(ctx);
-    await sleep(ctx, 800); // 500ms 启动延迟 + 约 3 封
+    await sleep(ctx, 800); // 500ms start delay + about 3 mails
     const started = detailCalls(ctx, 0).map((c) => c.url);
     ok(started.length >= 1, '前置：预取确实已经开始（否则「取消」无从观察）', started.join(' , ') || '（无）');
 
     const beforeSwitch = ctx.stub.calls.length;
-    evalIn(ctx, "openFolder('sent')"); // folderKey 立刻变化 → 作废本轮预取
+    evalIn(ctx, "openFolder('sent')"); // folderKey changes immediately -> invalidates this prefetch round
     await ticks(ctx.win, 6);
     await sleep(ctx, 1400);
 
@@ -1445,9 +1445,9 @@ const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } 
     const stale = after.filter((u) => /\/api\/messages\/P\d\d$/.test(u));
     ok(stale.length === 0, '切换后不再抓旧视图（收件箱 P##）的正文', stale.join(' , ') || '（无）');
 
-    // ⭐ 关键：若取消没生效，旧那轮会**带着游标**继续跑（从第 4 封往后），
-    // 于是切换后第一个请求会是 S04 而不是 S00。只断言「没抓旧视图」抓不到它：
-    // 旧轮重新快照 state.items 后抓的是新视图，看起来也"正常"。
+    // ⭐ Key: if cancel didn't take effect, the old round would continue **with its cursor** (from the 4th mail onward),
+    // so the first request after switching would be S04 instead of S00. Asserting only "didn't grab the old view" wouldn't catch it:
+    // after re-snapshotting state.items, the old round grabs the new view, which also looks "normal".
     const firstNew = after.find((u) => /\/api\/messages\/S\d\d$/.test(u));
     ok(firstNew === '/api/messages/S00',
       '切换后从新视图的**第一封**重新开始预取（说明是干净的新一轮，而不是旧轮带着游标继续跑）',
@@ -1463,8 +1463,8 @@ const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } 
   }, prefetchFixture());
 
   await test('T11d 预取是自动的：列表渲染后无需任何调用/点击，正文自己回来', async (ctx) => {
-    // 本用例**不**调用 startPrefetch：验证的是 paintList → prefetchBodies 这条接线本身。
-    // boot({keepPrefetch:true}) 表示不作废自动预取。
+    // This case does **not** call startPrefetch: it verifies the paintList -> prefetchBodies wiring itself.
+    // boot({keepPrefetch:true}) means don't invalidate automatic prefetch.
     const before = ctx.stub.calls.length;
     const done = await waitUntil(ctx, "state.cache.messages.has('A') && state.cache.messages.has('B')", 8000);
     ok(done, '自动预取生效（全程没有任何点击，也没有手动触发）',
@@ -1475,9 +1475,9 @@ const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } 
       '确实发了后台详情请求', fetched.join(' , ') || '（无）');
   }, Object.assign(inboxFixture(), { keepPrefetch: true }));
 
-  /* ---- T12 会话行 / 信封卡必须显示「实际收发信箱」---- */
+  /* ---- T12 thread rows / envelope card must show the "actual sender/recipient mailboxes" ---- */
   await test('T12 会话行显示收发双方的实际信箱 + 按时间降序（最近在前）', async (ctx) => {
-    // 负控制：会话面板必须真的渲染出来了，否则下面全部空转
+    // Negative control: the thread panel must really be rendered, otherwise everything below no-ops
     ok(!!el(ctx, '.rm-thread'), '会话面板已渲染（currentThread.length > 1）');
     const rows = Array.from(ctx.doc.querySelectorAll('.rm-thread .t-item'));
     ok(rows.length === 3, '会话面板渲染出 3 行', rows.length);
@@ -1485,25 +1485,25 @@ const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } 
       '面板行数与 currentThread 一致（不是上一轮的渲染残留）', evalIn(ctx, 'currentThread.length'));
 
     const texts = rows.map((r) => r.querySelector('.t-sender').textContent);
-    // ⭐ 顺序：服务端 listThread 已改为 received_at DESC，面板必须原样呈现
-    //   固定装置三封的时间是 T3(…300) > T2(…200) > T1(…100)。
+    // ⭐ Order: the server's listThread was changed to received_at DESC, so the panel must present it as-is.
+    //   The fixture's three mails have times T3(…300) > T2(…200) > T1(…100).
     ok(texts.join(' || ') === [
-      'bob@partner.com → alpha@x.com',                        // T3 最新（无名字 → 回退邮箱）
-      'support@x.com → alice@partner.com, bob@partner.com',    // T2 我的回信（完整收件人清单）
-      'Alice → alpha@x.com',                                   // T1 最早
+      'bob@partner.com → alpha@x.com',                        // T3 newest (no name -> fall back to email)
+      'support@x.com → alice@partner.com, bob@partner.com',    // T2 my reply (full recipient list)
+      'Alice → alpha@x.com',                                   // T1 earliest
     ].join(' || '),
       '⭐ 会话行按时间降序（最近 → 最早）：T3 → T2 → T1', texts.join(' | '));
     ok(texts[0] !== 'Alice → alpha@x.com',
       '负控制：首行不是最早那封（即「仍是升序」会立刻失败）', texts[0]);
 
-    // 时间列也必须是降序（与 sender 序列互相印证，避免「只是数组被倒过来」）
+    // The time column must also be descending (cross-corroborating with the sender sequence, to avoid "the array was just reversed")
     const times = rows.map((r) => r.querySelector('.t-time').textContent);
     ok(times.every((t) => /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/.test(t)),
       '时间列格式为 YYYY-MM-DD HH:MM（否则下面的降序比较无意义）', times.join(' | '));
     ok(times.join('|') === [...times].sort().reverse().join('|'),
       '时间列逐行递减（最近在前）', times.join(' | '));
 
-    // 旧实现的症状：字段名读错（t.to_emails）→ 恒为「我 → ?」。下面两条直接锁死该症状。
+    // Symptom of the old implementation: wrong field name read (t.to_emails) -> always "me → ?". The two assertions below lock that symptom down.
     ok(!texts.some((t) => t.includes('?')), '任何会话行都不得出现「?」占位', texts.join(' | '));
     ok(!texts.some((t) => /^我\s*→/.test(t)), '出站行不得用字面量「我」顶替实际发件信箱', texts.join(' | '));
 
@@ -1522,7 +1522,7 @@ const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } 
       '来信副行必须能一眼看到「我方收到的信箱」',
       el(ctx, '#read-message .env-who .who-email').textContent);
 
-    // 切到「已发送」，打开我的回信
+    // Switch to "sent", open my reply
     evalIn(ctx, "openFolder('sent')");
     await ticks(ctx.win, 10);
     ok(!!rowFor(ctx, 'T2'), '已切到「已发送」且 T2 在列表里（否则下面的点击会空转）');
@@ -1550,9 +1550,9 @@ const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } 
     await ticks(ctx.win, 10);
   }, threadFixture());
 
-  /* ---- T12d 折叠掉的那份副本被打开时，留存行必须仍标成「当前」---- */
+  /* ---- T12d when the collapsed copy is opened, the retained row must still be marked "current" ---- */
   await test('T12d 打开的是被折叠的回环副本时，会话面板仍高亮留存行', async (ctx) => {
-    // 负控制：确实打开的是副本 T2c，而不是留存行 T2（否则本用例什么都没验证）
+    // Negative control: what's actually opened is the copy T2c, not the retained row T2 (otherwise this case verifies nothing)
     ok(evalIn(ctx, 'state.openId') === 'T2c', '前置：自动打开的是被折叠的副本 T2c',
       evalIn(ctx, 'state.openId'));
     const threadIds = evalIn(ctx, 'currentThread.map((t) => t.id).join(",")');
@@ -1573,9 +1573,9 @@ const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } 
       '当前行是第 2 行（不是「碰巧第一行」）—— 证明不是靠索引蒙对',
       currents.length ? String(rows.indexOf(currents[0])) : 'n/a');
 
-    // 点自己这行不得重复打开（否则会被当成「换了一封」而重新拉详情）。
-    // ⚠️ 先判空再解引用：若上面「恰好一行 current」已失败，这里直接引用 currents[0] 会抛异常
-    //    把整个用例打崩、丢掉后面的断言（历史踩过）。判空时显式记 FAIL，绝不用「跳过」冒充通过。
+    // Clicking one's own row must not re-open it (otherwise it would be treated as "switched to another mail" and re-fetch the detail).
+    // ⚠️ Check for null before dereferencing: if the "exactly one current" assertion above already failed, dereferencing currents[0] here would throw
+    //    and crash the whole case, losing later assertions (hit before). When checking for null, explicitly record FAIL -- never pass off a "skip" as a pass.
     const cur = currents.length === 1 ? currents[0] : null;
     if (!cur) {
       ok(false, `无法验证「点当前行不重复打开」：当前行不唯一（${currents.length} 个），上一组断言已失败`);
@@ -1591,7 +1591,7 @@ const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } 
     }
   }, threadCopyFixture());
 
-  /* ---- 汇总 ---- */
+  /* ---- summary ---- */
   console.log('\n================ 失败用例清单 ================');
   const failed = results.filter((r) => !r.ok);
   if (!failed.length) console.log('（无）');
@@ -1601,7 +1601,7 @@ const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } 
   console.log(`===== 结果: ${pass} passed, ${fail} failed =====`);
 
   const exitCode = fail ? 1 : 0;
-  // 把退出码写进文件，便于独立复核（不只依赖 shell 的 $?）
+  // Write the exit code into a file for independent review (not relying only on the shell's $?)
   const exitFile = path.join(os.tmpdir(), 'qa-inbox-ui.regression.exit');
   try {
     fs.writeFileSync(exitFile, String(exitCode), 'utf8');

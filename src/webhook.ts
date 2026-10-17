@@ -6,13 +6,13 @@ import type { InboundInput } from './repo';
 import { fetchReceivedEmail, listReceivedAttachmentDownloads, downloadSignedUrl } from './receiving';
 import type { ReceivedEmail, AttachmentDownloadItem } from './receiving';
 
-// ============ Resend 标准 Webhook 签名校验 ============
-// 使用 Resend 官方 SDK 的 resend.webhooks.verify（内部基于 Svix 的 standardwebhooks 库做 HMAC-SHA256 校验）。
-// 参考: https://resend.com/docs/webhooks/verify-webhooks-requests
-// verify 只做本地计算、不发网络请求；构造 Resend 仅需要一个占位 key。
+// ============ Resend standard Webhook signature verification ============
+// Uses the official Resend SDK's resend.webhooks.verify (internally an HMAC-SHA256 check based on Svix's standardwebhooks library).
+// Ref: https://resend.com/docs/webhooks/verify-webhooks-requests
+// verify only does local computation and makes no network request; constructing Resend only needs a placeholder key.
 const resendClient = new Resend('re_00000000000000000000000000000000');
 
-/** 基于原始 body 文本校验 Svix 签名。非法/缺失返回 false。 */
+/** Verify the Svix signature against the raw body text. Returns false if invalid/missing. */
 export function verifySignature(secret: string, rawBody: string, headers: Headers): boolean {
   const id = headers.get('svix-id') ?? headers.get('webhook-id');
   const timestamp = headers.get('svix-timestamp') ?? headers.get('webhook-timestamp');
@@ -41,7 +41,7 @@ async function readJson<T>(request: Request): Promise<{ text: string; payload: T
   }
 }
 
-// ============ 入站收信 (email.received) ============
+// ============ Inbound receive (email.received) ============
 
 interface SvixEnvelope {
   id?: string;
@@ -70,7 +70,7 @@ async function uploadToBucket(
 }
 
 function eventIdFrom(request: Request, payload?: SvixEnvelope | null): string | null {
-  // Svix 事件 ID 在请求头里（svix-id / webhook-id），payload 里通常没有顶层 id
+  // The Svix event ID is in the request headers (svix-id / webhook-id); the payload usually has no top-level id
   return (
     request.headers.get('svix-id') ??
     request.headers.get('webhook-id') ??
@@ -79,15 +79,15 @@ function eventIdFrom(request: Request, payload?: SvixEnvelope | null): string | 
   );
 }
 
-/** 判断这封入站邮件属于哪个本地收件地址（mailbox）。 */
+/** Determine which local receiving address (mailbox) this inbound mail belongs to. */
 /**
- * 归一化收件人列表。
+ * Normalize the recipient list.
  *
- * ⚠️ webhook payload 的 `data.to` 与 Received Emails API 的 `email.to` **都可能是字符串**，
- * 不一定是我们以为的数组。`parseAddressList()` 两种都吃（util.ts 里对 string 有专门分支），
- * 但历史上这里各处手写 `Array.isArray(...)` 判断，口径与它不一致 —— 实测造成 11 封
- * 实际发给 support@notionmanager.com 的邮件 `mailbox` 落成空串，在侧边栏显示为「(未识别)」。
- * 统一走这个函数，不要再手写类型判断。
+ * ⚠️ The webhook payload's `data.to` and the Received Emails API's `email.to` **may both be strings**,
+ * not necessarily the array we assume. `parseAddressList()` handles both (util.ts has a dedicated branch for strings),
+ * but historically this hand-wrote `Array.isArray(...)` checks everywhere, inconsistent with it — measured to cause 11 messages
+ * actually sent to support@example.com to have `mailbox` stored as an empty string, shown in the sidebar as "(unknown)".
+ * Go through this function uniformly; do not hand-write type checks again.
  */
 function recipientList(email: ReceivedEmail, data: Record<string, unknown>): ReturnType<typeof parseAddressList> {
   const fromApi = parseAddressList(email.to);
@@ -96,37 +96,37 @@ function recipientList(email: ReceivedEmail, data: Record<string, unknown>): Ret
 }
 
 /**
- * 真实 `To:` 头。
+ * The real `To:` header.
  *
- * ⚠️ **不要用 `email.to` 当收件人**（踩过）：Resend 收信接口的 `to` 返回的是
- * **投递地址（信封收件人）**，不是 `To:` 头。生产数据实测 —— 发件人
- * zhanglili@notionmanager.com 发往 `To: lara@realmarketlabs.com`、`Cc: bingfeng@notionmanager.com`，
- * 这封信在 bingfeng 的收件箱里落成 `email.to = ["bingfeng@notionmanager.com"]`、
- * `email.cc = ["bingfeng@notionmanager.com"]`；真实 To 头只保留在 `headers.to` 里。
- * 直接拿 `email.to` 当收件人 → 详情页「收件人」显示成用户自己。
+ * ⚠️ **Do not use `email.to` as the recipient** (learned the hard way): the `to` returned by the Resend receiving API is the
+ * **delivery address (envelope recipient)**, not the `To:` header. Production data measured — sender
+ * erin@example.com sends to `To: frank@example.net`, `Cc: dana@example.com`,
+ * and this message in dana's inbox stores as `email.to = ["dana@example.com"]`,
+ * `email.cc = ["dana@example.com"]`; the real To header is kept only in `headers.to`.
+ * Taking `email.to` directly as the recipient → the detail page's "recipient" shows the user themselves.
  *
- * Resend 官方文档也印证了这个分工：收信事件的 `from` 只有裸地址，
- * 显示名保存在 `headers.from` —— 即 `headers` 就是原始头表。
- * 取不到 `headers.to` 时回退投递地址（行为不倒退）。
+ * Resend's official docs confirm this division of labor: the receiving event's `from` is only the bare address,
+ * and the display name is kept in `headers.from` — i.e. `headers` is the raw header table.
+ * When `headers.to` is unavailable, fall back to the delivery address (behavior does not regress).
  */
 function headerRecipientList(email: ReceivedEmail): ReturnType<typeof parseAddressList> {
   return parseAddressList(headerValueMap(email.headers, 'to'));
 }
 
 function pickMailbox(email: ReceivedEmail, data: Record<string, unknown>): string {
-  // 1) Resend 官方推荐：received_for 是本封邮件的实际投递地址
+  // 1) Resend's official recommendation: received_for is the actual delivery address of this message
   const receivedFor = data['received_for'];
   if (Array.isArray(receivedFor) && receivedFor.length && typeof receivedFor[0] === 'string') {
     const m = receivedFor[0].trim();
     if (m) return m.toLowerCase();
   }
-  // 2) 退回 to（字符串/数组都要能处理，见 recipientList 的说明）
+  // 2) Fall back to to (both string/array must be handled, see the notes on recipientList)
   const tos = recipientList(email, data);
   if (tos.length) return tos[0].email;
   return '';
 }
 
-/** 取头部里第一个 Message-ID（已去尖括号）。头值可能是 JSON 数组文本，见 util.parseReferences。 */
+/** Take the first Message-ID in the header (angle brackets already stripped). The header value may be JSON array text, see util.parseReferences. */
 function firstRef(raw: string | null): string | null {
   const first = parseReferences(raw)[0];
   return first ? stripAngle(first) : null;
@@ -146,7 +146,7 @@ export async function handleInbound(request: Request, env: Env): Promise<Respons
 
   const eventId = eventIdFrom(request, payload);
   const data = payload?.data;
-  // 官方 email.received payload 顶层只有 type/created_at/data，无 id
+  // The official email.received payload has only type/created_at/data at the top level, no id
   if (!eventId || !payload || payload.type !== 'email.received' || !data) {
     return json({ error: 'unexpected payload' }, 400);
   }
@@ -155,13 +155,13 @@ export async function handleInbound(request: Request, env: Env): Promise<Respons
     return json({ error: 'unexpected payload: missing email_id' }, 400);
   }
 
-  // 幂等：同一事件已处理过直接 200
+  // Idempotency: the same event already processed → 200 directly
   const dup = await env.DB.prepare('SELECT id FROM webhook_deliveries WHERE id = ?')
     .bind(eventId)
     .first();
   if (dup) return new Response('OK', { status: 200 });
 
-  // 同一封邮件已入库（重复投递），仅记录本次事件
+  // The same email already stored (duplicate delivery); only record this event
   const existingId = await findInboundByResendId(env, emailId);
   if (existingId) {
     await env.DB.prepare('INSERT OR IGNORE INTO webhook_deliveries (id, processed_at) VALUES (?, ?)')
@@ -170,7 +170,7 @@ export async function handleInbound(request: Request, env: Env): Promise<Respons
     return new Response('OK', { status: 200 });
   }
 
-  // webhook 只含元数据，正文/头需通过 Received Emails API 拉取（html_format=cid 保留内联图引用）
+  // The webhook only has metadata; the body/headers must be fetched via the Received Emails API (html_format=cid keeps inline image references)
   let email: ReceivedEmail;
   try {
     email = await fetchReceivedEmail(env, emailId);
@@ -197,11 +197,11 @@ export async function handleInbound(request: Request, env: Env): Promise<Respons
   const rawMessageId =
     email.message_id ?? (typeof data['message_id'] === 'string' ? data['message_id'] : null);
 
-  // 会话归组：取 References/In-Reply-To 里的根 Message-ID
+  // Thread grouping: take the root Message-ID from References/In-Reply-To
   const refsRaw = headerValueMap(email.headers, 'References');
   const inReplyRaw = headerValueMap(email.headers, 'In-Reply-To');
   const mailbox = pickMailbox(email, data);
-  // 投递地址（信封收件人）—— Resend 的 `to`；真实 To 头走 headers.to（见 headerRecipientList 的说明）
+  // Delivery address (envelope recipient) — Resend's `to`; the real To header goes via headers.to (see the notes on headerRecipientList)
   const deliveredTo = recipientList(email, data).map((a) => a.email);
   const headerTo = headerRecipientList(email).map((a) => a.email);
 
@@ -209,8 +209,8 @@ export async function handleInbound(request: Request, env: Env): Promise<Respons
     rowId,
     resendId: emailId,
     messageId: stripAngle(rawMessageId),
-    // In-Reply-To 同样是「JSON 数组文本」形态（见 util.parseReferences），
-    // 直接 stripAngle 只会去掉外层尖括号、留下 `["...` 残留。
+    // In-Reply-To is likewise in "JSON array text" form (see util.parseReferences);
+    // a direct stripAngle only removes the outer angle brackets and leaves a `["...` remnant.
     inReplyTo: firstRef(inReplyRaw),
     references: refsRaw ?? null,
     threadId: rootThreadId({
@@ -234,7 +234,7 @@ export async function handleInbound(request: Request, env: Env): Promise<Respons
     attachments: [],
   };
 
-  // 下载附件到 R2：通过附件 API 拿 signed download_url
+  // Download attachments to R2: get a signed download_url via the attachments API
   const metas = Array.isArray(email.attachments) ? email.attachments : [];
   if (metas.length) {
     let downloads: Map<string, AttachmentDownloadItem>;
@@ -285,7 +285,7 @@ export async function handleInbound(request: Request, env: Env): Promise<Respons
   try {
     await saveInbound(env, input, eventId);
   } catch (err) {
-    // 冲突/瞬时错误：返回 500，让 Resend 稍后重试（幂等表保证不重复）
+    // Conflict/transient error: return 500 so Resend retries later (the idempotency table guarantees no duplication)
     console.error('saveInbound failed:', err);
     return json({ error: `storage failed: ${err}` }, 500);
   }
@@ -293,7 +293,7 @@ export async function handleInbound(request: Request, env: Env): Promise<Respons
   return new Response('OK', { status: 200 });
 }
 
-// ============ 出站回执 (email.sent / delivered / ...) ============
+// ============ Outbound receipts (email.sent / delivered / ...) ============
 const STATUS_MAP: Record<string, string> = {
   'email.sent': 'sent',
   'email.delivered': 'delivered',

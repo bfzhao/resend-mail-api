@@ -1,30 +1,30 @@
--- Resend 收件箱数据模型（Gmail 简化版）
--- 消息表：入站(收件)与出站(发送/回复)统一存放，direction 区分，文件夹=查询视图
+-- Resend inbox data model (simplified Gmail).
+-- messages table: inbound (received) and outbound (sent/replied) are stored together, distinguished by direction; folders = query views.
 
 CREATE TABLE IF NOT EXISTS messages (
-    id            TEXT PRIMARY KEY,                 -- 内部主键 (uuid)
+    id            TEXT PRIMARY KEY,                 -- internal primary key (uuid)
     direction     TEXT NOT NULL CHECK (direction IN ('inbound','outbound')),
     message_id    TEXT,                             -- RFC5322 Message-ID
-    in_reply_to   TEXT,                             -- 原信 Message-ID (回信时填充)
-    "references"  TEXT,                             -- 原始 References (线程归组用)
-    thread_id     TEXT,                             -- 会话根 id（References 最根 token）
-    mailbox       TEXT NOT NULL DEFAULT '',         -- 所属收件地址（如 support@example.com）
+    in_reply_to   TEXT,                             -- original message Message-ID (populated when replying)
+    "references"  TEXT,                             -- original References (used for thread grouping)
+    thread_id     TEXT,                             -- conversation root id (root-most References token)
+    mailbox       TEXT NOT NULL DEFAULT '',         -- owning recipient address (e.g. support@example.com)
     from_name     TEXT,
     from_email    TEXT,
-    to_emails     TEXT NOT NULL DEFAULT '[]',       -- JSON 数组；**入站=真实 To: 头**（修复前是投递地址，见 delivered_to）
-    delivered_to  TEXT,                             -- JSON 数组；入站邮件的**投递地址（信封收件人）**，来自 Resend 的 to/received_for
-    cc            TEXT,                             -- JSON 数组
-    bcc           TEXT,                             -- JSON 数组
-    reply_to      TEXT,                             -- JSON 数组
+    to_emails     TEXT NOT NULL DEFAULT '[]',       -- JSON array; **inbound = real To: header** (was the delivery address before the fix, see delivered_to)
+    delivered_to  TEXT,                             -- JSON array; **delivery address (envelope recipient)** of an inbound message, from Resend's to/received_for
+    cc            TEXT,                             -- JSON array
+    bcc           TEXT,                             -- JSON array
+    reply_to      TEXT,                             -- JSON array
     subject       TEXT,
     body_html     TEXT,
     body_text     TEXT,
-    received_at   INTEGER NOT NULL,                 -- 秒级 unix 时间戳 (排序键)
+    received_at   INTEGER NOT NULL,                 -- second-level unix timestamp (sort key)
     status        TEXT NOT NULL DEFAULT 'received', -- inbound: received; outbound: queued/sent/delivered/bounced/failed
-    resend_id     TEXT,                             -- outbound 由 Resend 返回的邮件 id (回执匹配)
+    resend_id     TEXT,                             -- for outbound, the message id returned by Resend (receipt matching)
     read          INTEGER NOT NULL DEFAULT 0,
     starred       INTEGER NOT NULL DEFAULT 0,
-    deleted       INTEGER NOT NULL DEFAULT 0,       -- 软删除 -> 已删除文件夹
+    deleted       INTEGER NOT NULL DEFAULT 0,       -- soft delete -> Deleted folder
     created_at    INTEGER NOT NULL,
     updated_at    INTEGER NOT NULL
 );
@@ -37,22 +37,22 @@ CREATE INDEX IF NOT EXISTS idx_messages_resend ON messages(resend_id) WHERE rese
 CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_id, received_at);
 CREATE INDEX IF NOT EXISTS idx_messages_mailbox ON messages(mailbox, received_at DESC);
 
--- 性能：让 /api/counts 与 /api/mailboxes 变成**纯索引扫描**，不再全表扫描并读取每行正文大字段
--- （实测 20000 行：计数 88ms → 4.6ms；账号分组 100ms → 4.0ms）
+-- Performance: makes /api/counts and /api/mailboxes **pure index scans**, no longer full-table scanning and reading each row's large body fields
+-- (measured on 20000 rows: counts 88ms → 4.6ms; account grouping 100ms → 4.0ms)
 CREATE INDEX IF NOT EXISTS idx_messages_counts ON messages(mailbox, direction, deleted, read, starred);
--- 性能：「全部邮箱」视图没有 mailbox 条件，现有 idx_messages_inbox/sent 的前导列用不上，
--- 只能走临时 B 树排序；这两个索引让无 mailbox 条件时也能按 received_at DESC 有序取数
--- （实测 20000 行深翻页 5000：128ms → 0.5ms）
+-- Performance: the "All mailboxes" view has no mailbox condition, so the leading column of the existing idx_messages_inbox/sent cannot be used
+-- and it can only fall back to a temporary B-tree sort; these two indexes let it fetch in received_at DESC order even without a mailbox condition
+-- (measured on 20000 rows with deep pagination to 5000: 128ms → 0.5ms)
 CREATE INDEX IF NOT EXISTS idx_messages_inbox_all ON messages(deleted, received_at DESC) WHERE direction='inbound';
 CREATE INDEX IF NOT EXISTS idx_messages_sent_all  ON messages(deleted, received_at DESC) WHERE direction='outbound';
 
--- 同一封 Resend 收信(email_id)只入一条（并发/重复投递兜底）
+-- A given Resend inbound email (email_id) is inserted only once (safeguard against concurrency/duplicate delivery)
 CREATE UNIQUE INDEX IF NOT EXISTS uq_messages_inbound_resend ON messages(resend_id) WHERE direction='inbound' AND resend_id IS NOT NULL;
 
--- 出站发信额度统计（/api/usage）：按 received_at 统计「经本服务发出」的封数，走这个偏索引避免全表扫描。见 migrations/009_outbound_sent_index.sql。
+-- Outbound send quota statistics (/api/usage): counts messages "sent through this service" by received_at; this partial index avoids a full-table scan. See migrations/009_outbound_sent_index.sql.
 CREATE INDEX IF NOT EXISTS idx_messages_outbound_sent ON messages(received_at) WHERE direction='outbound' AND resend_id IS NOT NULL;
 
--- 附件元数据表（二进制内容在 R2）
+-- Attachment metadata table (binary content lives in R2)
 CREATE TABLE IF NOT EXISTS attachments (
     id           TEXT PRIMARY KEY,                  -- uuid
     message_id   TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
@@ -60,52 +60,52 @@ CREATE TABLE IF NOT EXISTS attachments (
     filename     TEXT NOT NULL,
     content_type TEXT NOT NULL DEFAULT 'application/octet-stream',
     size         INTEGER NOT NULL DEFAULT 0,
-    inline       INTEGER NOT NULL DEFAULT 0,        -- 是否内联图片 (cid)
-    content_id   TEXT,                              -- 规范化后的 cid (无尖括号)
+    inline       INTEGER NOT NULL DEFAULT 0,        -- whether it is an inline image (cid)
+    content_id   TEXT,                              -- normalized cid (no angle brackets)
     created_at   INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments(message_id);
 
--- 出站投递事件回执 (email.sent/delivered/bounced/failed, 可选)
+-- Outbound delivery event receipts (email.sent/delivered/bounced/failed, optional)
 CREATE TABLE IF NOT EXISTS delivery_events (
-    id         TEXT PRIMARY KEY,                    -- svix 事件 id
-    message_id TEXT NOT NULL,                       -- 关联 messages.id
+    id         TEXT PRIMARY KEY,                    -- svix event id
+    message_id TEXT NOT NULL,                       -- references messages.id
     event_type TEXT NOT NULL,
     created_at INTEGER NOT NULL,
-    data       TEXT NOT NULL                        -- 原始 payload
+    data       TEXT NOT NULL                        -- raw payload
 );
 CREATE INDEX IF NOT EXISTS idx_delivery_events_message ON delivery_events(message_id);
 
--- Webhook 幂等日志（Resend 会重试失败投递）
+-- Webhook idempotency log (Resend retries failed deliveries)
 CREATE TABLE IF NOT EXISTS webhook_deliveries (
-    id           TEXT PRIMARY KEY,                  -- svix 事件 id
+    id           TEXT PRIMARY KEY,                  -- svix event id
     processed_at INTEGER NOT NULL
 );
 
--- Cloudflare 入向「绝不丢」索引（见 migrations/006_inbound_cf.sql）。
--- CF Email Routing 是路由器、**不存信**（对比 Resend 存 30 天可重拉），所以收到信的第一件事
--- 是把原始 .eml 流式落 R2 并在此登记，再入队异步解析 —— 任何时刻原始邮件都有持久副本。
+-- Cloudflare inbound "never lose" index (see migrations/006_inbound_cf.sql).
+-- CF Email Routing is a router, **not a mailbox** (unlike Resend, which stores mail for 30 days and can re-fetch it), so the first thing done on
+-- receiving a message is to stream the raw .eml to R2 and register it here, then enqueue for async parsing — the raw message always has a durable copy.
 CREATE TABLE IF NOT EXISTS inbound_raw (
-    id           TEXT PRIMARY KEY,                  -- uuid；同时作为 Queue 指针与 webhook_deliveries 幂等 id
-    r2_key       TEXT NOT NULL,                     -- 原始 .eml 的 R2 key
-    from_email   TEXT,                              -- 信封发件人（SMTP MAIL FROM）
-    to_email     TEXT,                              -- 信封收件人（投递地址）
-    size         INTEGER NOT NULL DEFAULT 0,        -- 原始字节数（message.rawSize）
-    message_id   TEXT,                              -- 头里的 Message-ID（去尖括号），仅用于诊断
-    subject      TEXT,                              -- Subject 头（解析前就记下，供「入站异常」提示）
+    id           TEXT PRIMARY KEY,                  -- uuid; also used as the Queue pointer and the webhook_deliveries idempotency id
+    r2_key       TEXT NOT NULL,                     -- R2 key of the raw .eml
+    from_email   TEXT,                              -- envelope sender (SMTP MAIL FROM)
+    to_email     TEXT,                              -- envelope recipient (delivery address)
+    size         INTEGER NOT NULL DEFAULT 0,        -- raw byte count (message.rawSize)
+    message_id   TEXT,                              -- Message-ID in the headers (angle brackets stripped), for diagnostics only
+    subject      TEXT,                              -- Subject header (recorded before parsing, for the "inbound errors" notice)
     received_at  INTEGER NOT NULL,
-    parsed_at    INTEGER,                           -- 解析完成时间；NULL = 待解析
-    message_row  TEXT,                              -- 解析后写入的 messages.id（幂等：非空=已入库）
-    error        TEXT,                              -- 永久解析失败原因（原始件仍保留在 R2）
-    attempts     INTEGER NOT NULL DEFAULT 0         -- 重试次数（瞬时失败）；超阈值后不再重试
+    parsed_at    INTEGER,                           -- parse completion time; NULL = pending parse
+    message_row  TEXT,                              -- messages.id written after parsing (idempotent: non-null = already stored)
+    error        TEXT,                              -- permanent parse failure reason (raw message is still kept in R2)
+    attempts     INTEGER NOT NULL DEFAULT 0         -- retry count (transient failures); no more retries after the threshold
 );
 CREATE INDEX IF NOT EXISTS idx_inbound_raw_pending ON inbound_raw(parsed_at, received_at) WHERE parsed_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_inbound_raw_message_id ON inbound_raw(message_id) WHERE message_id IS NOT NULL;
 
--- 草稿箱（写了一半的邮件）。独立成表的原因见 migrations/005_drafts.sql。
--- 该表的列改动必须**同时**更新 005 迁移，保持「全量建库」与「增量升级」两条路径一致。
+-- Drafts (half-written messages). See migrations/005_drafts.sql for why this is a separate table.
+-- Any column change to this table must **also** update migration 005, keeping the "full database creation" and "incremental upgrade" paths consistent.
 CREATE TABLE IF NOT EXISTS drafts (
-    id          TEXT PRIMARY KEY,               -- uuid（前端生成，便于自动保存直接 upsert）
+    id          TEXT PRIMARY KEY,               -- uuid (generated by the frontend so autosave can upsert directly)
     mailbox     TEXT NOT NULL DEFAULT '',
     mode        TEXT NOT NULL DEFAULT 'new',    -- new | reply | forward
     source_id   TEXT,
@@ -122,11 +122,31 @@ CREATE TABLE IF NOT EXISTS drafts (
 CREATE INDEX IF NOT EXISTS idx_drafts_updated ON drafts(updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_drafts_mailbox ON drafts(mailbox, updated_at DESC);
 
--- 用量统计缓存（前端显示 D1 / R2 占用百分比，提前知道何时该升级）。
--- 值是**估算**：D1 = 各表文本/二进制列的 UTF-8 字节和；R2 = 列举对象求和。见 src/repo.ts 的 getStorageUsage。
--- 直接实时算很贵（D1 全表扫描 / R2 列举按 Class A 计费），故按 TTL 缓存在这里。见 migrations/008_app_stats.sql。
+-- Usage statistics cache (frontend shows D1 / R2 usage percentage so you know ahead of time when to upgrade).
+-- Values are **estimates**: D1 = sum of UTF-8 bytes of text/binary columns across tables; R2 = sum of listed objects. See getStorageUsage in src/repo.ts.
+-- Computing it live is expensive (D1 full-table scan / R2 listing billed as Class A), so it is cached here with a TTL. See migrations/008_app_stats.sql.
 CREATE TABLE IF NOT EXISTS app_stats (
-    key        TEXT PRIMARY KEY,                    -- 如 'd1_bytes' / 'r2_bytes' / 'r2_objects'
+    key        TEXT PRIMARY KEY,                    -- e.g. 'd1_bytes' / 'r2_bytes' / 'r2_objects'
     value      INTEGER NOT NULL DEFAULT 0,
     updated_at INTEGER NOT NULL
+);
+
+-- Application config (key/value written by the setup wizard). Keys such as: domain / zone_id / from_address / from_name /
+-- resend_api_key / session_secret / routing_enabled / setup_complete.
+-- Stored in the **user's own** D1 (BYO: secrets never leave the user's account). See migrations/010_setup_auth.sql.
+CREATE TABLE IF NOT EXISTS app_config (
+    key        TEXT PRIMARY KEY,
+    value      TEXT,
+    updated_at INTEGER NOT NULL
+);
+
+-- Admin account (password login set within the wizard). password_hash is PBKDF2-SHA256 (format `pbkdf2$iterations$salt$hash`, all base64).
+-- Either this or the env API_USERNAME/API_PASSWORD: if env is set, Basic Auth is used; otherwise session login via this table.
+-- See migration/010_setup_auth.sql and src/auth.ts / src/session.ts.
+CREATE TABLE IF NOT EXISTS users (
+    id            TEXT PRIMARY KEY,                 -- uuid
+    username      TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    created_at    INTEGER NOT NULL,
+    updated_at    INTEGER NOT NULL
 );

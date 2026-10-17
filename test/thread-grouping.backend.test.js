@@ -1,32 +1,32 @@
 'use strict';
 
 /* =============================================================================
- * 会话（thread）归组回归验证 —— 真实 SQLite 当 D1 + 真实 src/ 编译产物 + 真实 Worker 路由
+ * Conversation (thread) grouping regression -- real SQLite as D1 + real compiled src/ artifacts + real Worker routing
  *
- * 运行（本沙箱需 tsc 垫片，见文件末尾说明）：
- *   NODE_OPTIONS="--require <临时目录>/mm-tsc-shim.js" node test/thread-grouping.backend.test.js
- * 正常环境：
+ * Run (this sandbox needs the tsc shim, see notes at end of file):
+ *   NODE_OPTIONS="--require <temp dir>/mm-tsc-shim.js" node test/thread-grouping.backend.test.js
+ * Normal environment:
  *   node test/thread-grouping.backend.test.js
  *
- * 退出码：0 = 全部通过；1 = 存在失败；2 = 环境缺失（node:sqlite 不可用 / tsc 不可用）。
+ * Exit codes: 0 = all pass; 1 = failures; 2 = missing environment (node:sqlite unavailable / tsc unavailable).
  *
  * ---------------------------------------------------------------------------
- * 覆盖的线上缺陷（用户报障：「来回好几次了，会话面板里只有两封」）
+ * Production defects covered (user report: "after several back-and-forths, the conversation panel shows only two emails")
  *
- * 根因（2026-10-15 用生产 D1 的 132 行真实数据实证）：
- *   Resend 收信接口返回的 `headers.references` **不是** RFC 5322 的空格分隔列表，
- *   而是 **JSON 数组文本** —— `["<a@b>","<c@d>"]`。
- *   旧 `rootThreadId()` 用 `refs.split(/\s+/)[0]` 取「第一条」，拿到的是整个 JSON 文本；
- *   `stripAngle()` 只认首尾尖括号、去不掉方括号 → `thread_id` 落成
- *   `["<a@b>","<c@d>"]` 这种畸形值。
- *   更糟的是 `reply()` 把这串 JSON 文本原样拼进新 References 发回 Resend，
- *   对方再回信时转义层级又深一层（实测已出现 `["<\",\"<\\\",\\\"<\\\\\\\"...` 四层嵌套），
- *   于是**同一物理线程每往返一轮就换一个 thread_id**。
+ * Root cause (verified 2026-10-15 with 132 rows of real production D1 data):
+ *   The `headers.references` returned by Resend's receiving API is **not** the RFC 5322 space-separated list,
+ *   but **JSON array text** -- `["<a@b>","<c@d>"]`.
+ *   The old `rootThreadId()` used `refs.split(/\s+/)[0]` to take the "first item", which grabbed the whole JSON text;
+ *   `stripAngle()` only recognized leading/trailing angle brackets and could not strip square brackets -> `thread_id` ended up
+ *   as a malformed value like `["<a@b>","<c@d>"]`.
+ *   Worse, `reply()` pasted this JSON text verbatim into the new References and sent it back to Resend,
+ *   so when the other side replied again the escaping grew one level deeper (production has already shown `["<\",\"<\\\",\\\"<\\\\\\\"...` four levels of nesting),
+ *   so **the same physical thread got a new thread_id on every round trip**.
  *
- * 为什么用「真实 Worker 路由 + 真实 SQLite」而不是单元断言：
- *   这个缺陷的形态是「入库的值不对」，只在参数层面断言（第 N 个绑定参数是什么）
- *   会把测试锁死在列顺序上。这里让真实的 handleInbound / reply 跑完，
- *   再把 `thread_id` SELECT 回来比对，断言的是**最终数据**。
+ * Why "real Worker routing + real SQLite" instead of unit assertions:
+ *   This defect takes the form of "the value written to the DB is wrong"; asserting only at the parameter level
+ *   (what the Nth bound parameter is) locks the test to column order. Here the real handleInbound / reply run to completion,
+ *   then `thread_id` is SELECTed back and compared, so what is asserted is the **final data**.
  * ===========================================================================*/
 
 const fs = require('fs');
@@ -44,8 +44,8 @@ try {
 }
 
 const ROOT = path.join(__dirname, '..');
-// QA_UTIL_TS / QA_INDEX_TS 仅用于「变异验证」：指向人工构造的缺陷版源码（放仓库外），
-// 确认本测试确实能抓到缺陷。缺了钩子，变异脚本会「跑仓库原文件却以为跑的是变体」→ 假绿。
+// QA_UTIL_TS / QA_INDEX_TS are only for "mutation verification": point them at a hand-crafted defective version of the source (outside the repo),
+// to confirm this test really catches the defect. Without the hook, the mutation script would "run the repo's original file while thinking it is the variant" -> false green.
 const UTIL_TS = process.env.QA_UTIL_TS || path.join(ROOT, 'src', 'util.ts');
 const INDEX_TS = process.env.QA_INDEX_TS || path.join(ROOT, 'src', 'index.ts');
 const WORK_DIR = path.join(os.tmpdir(), `thread-qa-build-${process.pid}`);
@@ -53,21 +53,22 @@ const SRC_COPY = path.join(WORK_DIR, 'src');
 const BUILD_DIR = path.join(WORK_DIR, 'out');
 const md5 = (p) => crypto.createHash('md5').update(fs.readFileSync(p)).digest('hex');
 const SECRET = 'whsec_' + Buffer.from('a-test-signing-key-for-thread-grouping').toString('base64');
-const MAILBOX = 'support@notionmanager.com';
+const MAILBOX = 'support@example.com';
 const PEER = 'peer@upvote.network';
 
 /* ---------------------------------------------------------------------------
- * 1) 把整份 src/ 复制到仓库外（变体覆盖 util.ts / index.ts）后编译
+ * 1) Copy the whole src/ outside the repo (variants override util.ts / index.ts) then compile
  *
- * 为什么要复制 src/：QA_UTIL_TS / QA_INDEX_TS 的变体在仓库外，而 tsc 需要一份完整的
- * src/ 才能编译。复制一份再覆盖同名文件，就能在**完全不改动仓库**的前提下编译任意变体。
+ * Why copy src/: the QA_UTIL_TS / QA_INDEX_TS variants live outside the repo, and tsc needs a complete
+ * src/ to compile. Copying once and then overwriting same-named files lets any variant be compiled
+ * **without modifying the repo at all**.
  *
- * ⚠️ 两个必须的配套（少了任何一个都会编译失败，且报错看起来与变体无关）：
- *   a) 临时目录在 os.tmpdir() 下，类型解析与产物的裸模块解析都要靠 node_modules ——
- *      必须在**编译之前**把 WORK_DIR/node_modules 链接到仓库 node_modules，
- *      否则报 TS2688 Cannot find type definition file for '@cloudflare/workers-types'；
- *   b) module 改成 commonjs 后**不要**顺手改 moduleResolution：本机 tsc 是
- *      TypeScript 7，`node10` 已被移除（TS5108），仓库的 'bundler' 与 commonjs 的组合是被接受的。
+ * ⚠️ Two required companions (missing either one makes compilation fail, and the error looks unrelated to the variant):
+ *   a) The temp dir is under os.tmpdir(), so both type resolution and bare-module resolution of the build
+ *      output depend on node_modules -- WORK_DIR/node_modules must be linked to the repo's node_modules
+ *      **before compiling**, otherwise it reports TS2688 Cannot find type definition file for '@cloudflare/workers-types';
+ *   b) After switching module to commonjs, do **not** casually change moduleResolution: tsc here is
+ *      TypeScript 7, `node10` has been removed (TS5108), and the repo's combination of 'bundler' with commonjs is accepted.
  * -------------------------------------------------------------------------*/
 function build() {
   const tsc = path.join(ROOT, 'node_modules', 'typescript', 'bin', 'tsc');
@@ -84,7 +85,7 @@ function build() {
   for (const f of fs.readdirSync(path.join(ROOT, 'src'))) {
     if (f.endsWith('.ts')) fs.copyFileSync(path.join(ROOT, 'src', f), path.join(SRC_COPY, f));
   }
-  // 变体覆盖（同目录同名 → 直接替换掉复制过来的那份）
+  // variant override (same dir, same name -> directly replaces the copied one)
   fs.copyFileSync(UTIL_TS, path.join(SRC_COPY, 'util.ts'));
   fs.copyFileSync(INDEX_TS, path.join(SRC_COPY, 'index.ts'));
 
@@ -110,7 +111,7 @@ function build() {
   return BUILD_DIR;
 }
 
-/** 清理临时编译目录（先卸载 junction 再删，避免删到仓库依赖）。 */
+/** Clean up the temp compile dir (unmount the junction first, then delete, to avoid deleting repo deps). */
 function cleanup() {
   const link = path.join(WORK_DIR, 'node_modules');
   try {
@@ -120,7 +121,7 @@ function cleanup() {
 }
 
 /* ---------------------------------------------------------------------------
- * 2) 真实 SQLite 冒充 D1（schema.sql 的真实 DDL 建表）
+ * 2) Real SQLite impersonating D1 (tables created with schema.sql's real DDL)
  * -------------------------------------------------------------------------*/
 function makeD1() {
   const schema = fs.readFileSync(path.join(ROOT, 'schema.sql'), 'utf8');
@@ -161,7 +162,7 @@ function makeD1() {
 }
 
 /* ---------------------------------------------------------------------------
- * 3) Svix 签名（与线上同口径：v1,base64(HMAC-SHA256(secret, id.ts.payload))）
+ * 3) Svix signature (same convention as production: v1,base64(HMAC-SHA256(secret, id.ts.payload)))
  * -------------------------------------------------------------------------*/
 function svixHeaders(id, ts, body) {
   const key = Buffer.from(SECRET.replace(/^whsec_/, ''), 'base64');
@@ -170,7 +171,7 @@ function svixHeaders(id, ts, body) {
 }
 
 /* ---------------------------------------------------------------------------
- * 4) 迷你断言器
+ * 4) Mini asserter
  * -------------------------------------------------------------------------*/
 let pass = 0;
 const results = [];
@@ -181,7 +182,7 @@ function ok(cond, msg, detail) {
 function section(t) { console.log(`\n=== ${t} ===`); }
 function info(t) { console.log(`  INFO  ${t}`); }
 
-/** 旧实现（缺陷版）的根推导，仅用于「负控制组」——证明新实现不是空转。 */
+/** Old implementation's (defective) root derivation, used only for the "negative control group" -- proving the new implementation is not a no-op. */
 function legacyRoot(references, inReplyTo, messageId) {
   const strip = (s) => {
     if (!s) return null;
@@ -200,11 +201,11 @@ function legacyRoot(references, inReplyTo, messageId) {
   return strip(messageId) || '';
 }
 
-/** 干净的 References：只允许 `<id>` 以空格分隔；不得含方括号 / 引号 / 反斜杠（转义污染的特征）。 */
+/** Clean References: only `<id>` separated by spaces allowed; must not contain square brackets / quotes / backslashes (signs of escaping pollution). */
 const REFS_OK = /^(?:<[^<>\s]+>\s*)+$/;
 
 /* ===========================================================================
- * 用例
+ * Test cases
  * ===========================================================================*/
 (async function main() {
   console.log('会话（thread）归组 —— 真实 SQLite + 真实编译产物 + 真实 Worker 路由');
@@ -225,7 +226,7 @@ const REFS_OK = /^(?:<[^<>\s]+>\s*)+$/;
   console.log(`被测版本: src/util.ts md5=${md5(UTIL_TS)}${process.env.QA_UTIL_TS ? '  ← QA_UTIL_TS 变异体' : ''}`);
   console.log(`          src/index.ts md5=${md5(INDEX_TS)}${process.env.QA_INDEX_TS ? '  ← QA_INDEX_TS 变异体' : ''}`);
 
-  /* ---- T0 环境自检：证明 D1 桩与 Worker 入口是真在跑，不是空转 ---- */
+  /* ---- T0 environment self-check: prove the D1 stub and Worker entry really run, not a no-op ---- */
   section('T0 环境自检');
   await db.prepare('INSERT INTO messages (id, direction, to_emails, received_at, created_at, updated_at) VALUES (?,?,?,?,?,?)')
     .bind('self-check', 'inbound', '["x@y.com"]', 1, 1, 1).run();
@@ -236,7 +237,7 @@ const REFS_OK = /^(?:<[^<>\s]+>\s*)+$/;
   ok(typeof util.rootThreadId === 'function' && typeof util.isSaneThreadId === 'function',
     '被测函数 rootThreadId / isSaneThreadId 存在（否则下面的断言会静默跳过）');
 
-  /* ---- T1 单元：生产实测的各种 References 形态都必须取到同一个正确根 ---- */
+  /* ---- T1 unit: every References shape observed in production must resolve to the same correct root ---- */
   section('T1 rootThreadId 对生产实测形态的解析');
   const ROOT_ID = 'DM6PR02MB1234.abc@outlook.com';
   const shapes = [
@@ -258,7 +259,7 @@ const REFS_OK = /^(?:<[^<>\s]+>\s*)+$/;
   ok(util.rootThreadId({ references: '   ', inReplyTo: null, messageId: null, fallback: 'fb' }) === 'fb',
     '全空 -> 落到 fallback');
 
-  /* ---- T1b 负控制组：旧算法在同一输入上必须产出畸形值 ---- */
+  /* ---- T1b negative control group: the old algorithm must produce malformed values on the same input ---- */
   section('T1b 负控制组：旧算法（split(/\s+/)[0] + stripAngle）确实会产出畸形值');
   const jsonRefs = `["<${ROOT_ID}>","<m2@x>"]`;
   const legacy = legacyRoot(jsonRefs, null, null);
@@ -267,7 +268,7 @@ const REFS_OK = /^(?:<[^<>\s]+>\s*)+$/;
   ok(util.rootThreadId({ references: jsonRefs, inReplyTo: null, messageId: null, fallback: 'fb' }) === ROOT_ID,
     '⭐ 同一输入下新实现取到正确根（对照成立 -> 下面 T2 的断言不是空转）');
 
-  /* ---- T1c isSaneThreadId：畸形判定 ---- */
+  /* ---- T1c isSaneThreadId: malformed detection ---- */
   section('T1c isSaneThreadId 判定');
   const saneCases = [
     ['正常 message-id 形态', 'DM6PR02MB1234.abc@outlook.com', true],
@@ -284,7 +285,7 @@ const REFS_OK = /^(?:<[^<>\s]+>\s*)+$/;
   }
 
   /* ---------------------------------------------------------------------------
-   * T2 全链路：3 轮往返后，所有邮件必须共享同一个 thread_id
+   * T2 full chain: after 3 round trips, all emails must share the same thread_id
    * -------------------------------------------------------------------------*/
   const env = {
     DB: db,
@@ -294,7 +295,7 @@ const REFS_OK = /^(?:<[^<>\s]+>\s*)+$/;
     SEND_FROM_NAME: 'Support',
   };
 
-  // 桩掉 Resend 的出站发送与收信内容拉取（都走全局 fetch）
+  // stub Resend's outbound sending and received-content fetch (both go through global fetch)
   let lastReceived = null;
   const sentBodies = [];
   globalThis.fetch = async (url, init) => {
@@ -321,7 +322,7 @@ const REFS_OK = /^(?:<[^<>\s]+>\s*)+$/;
     return worker.default.fetch(req, env);
   }
 
-  /** 造一封收到的邮件；extra 覆盖任意字段（headers / message_id / …）。 */
+  /** Build a received email; extra overrides any field (headers / message_id / ...). */
   function receivedEmail(emailId, extra) {
     return Object.assign({
       id: emailId,
@@ -351,7 +352,7 @@ const REFS_OK = /^(?:<[^<>\s]+>\s*)+$/;
   const threadIds = [];
   const rowIds = [];
 
-  // ---- 第 1 封来信：没有任何 References / In-Reply-To ----
+  // ---- 1st incoming email: no References / In-Reply-To at all ----
   lastReceived = receivedEmail('m1');
   let res = await postInbound({ type: 'email.received', data: { email_id: 'm1' } });
   ok(res.status === 200, '入站 #1 处理成功', res.status);
@@ -361,11 +362,11 @@ const REFS_OK = /^(?:<[^<>\s]+>\s*)+$/;
   threadIds.push(in1.thread_id);
   rowIds.push(in1.id);
 
-  // ---- 我们回复第 1 封 ----
+  // ---- we reply to the 1st email ----
   let r = await replyViaApi(in1.id, '第一封回复');
   ok(r.status === 200 && r.json && r.json.ok === true, '回复 #1 发送成功', JSON.stringify(r.json));
-  // 出站行 id 一律取接口返回的 id：三封出站的 received_at 会落在同一秒，
-  // 用 `ORDER BY received_at DESC LIMIT 1` 取「最新一行」在并列时是不确定的。
+  // always take the outbound row id from the API response: the three outbound received_at values fall in the same second,
+  // and using `ORDER BY received_at DESC LIMIT 1` to get the "latest row" is nondeterministic on ties.
   const out1 = db.queryOne('SELECT id, thread_id, "references" AS refs, in_reply_to FROM messages WHERE id = ?', r.json.id);
   ok(!!out1, '出站 #1 已入库', r.json.id);
   ok(out1 && out1.thread_id === 'm1@upvote.network',
@@ -373,9 +374,9 @@ const REFS_OK = /^(?:<[^<>\s]+>\s*)+$/;
   threadIds.push(out1.thread_id);
   rowIds.push(out1.id);
 
-  // ---- 第 2 封来信：Resend 真实形态的 References（JSON 数组文本） ----
-  // 对方客户端引用的「我们那封」用的是 Resend 生成的 RFC Message-ID（我们没有留存），
-  // 这里用一个等价的占位值，形态与线上一致。
+  // ---- 2nd incoming email: Resend's real References shape (JSON array text) ----
+  // the peer's client references "our email" using the RFC Message-ID Resend generated (which we did not retain),
+  // so an equivalent placeholder is used here, shaped the same as production.
   const RESEND_MID_1 = 'a1b2c3d4-1111-2222-3333-444455556666@smtp.resend.com';
   lastReceived = receivedEmail('m2', {
     headers: { References: `["<m1@upvote.network>"]`, 'In-Reply-To': `["<${RESEND_MID_1}>"]` },
@@ -388,7 +389,7 @@ const REFS_OK = /^(?:<[^<>\s]+>\s*)+$/;
   threadIds.push(in2.thread_id);
   rowIds.push(in2.id);
 
-  // 负控制：旧算法算出来的 thread_id 与真实会话不一致 —— 这就是「碎片化」的证据
+  // negative control: the thread_id computed by the old algorithm differs from the real conversation -- this is the evidence of "fragmentation"
   const legacyIn2 = legacyRoot(`["<m1@upvote.network>"]`, `["<${RESEND_MID_1}>"]`, '<m2@upvote.network>');
   ok(legacyIn2 !== 'm1@upvote.network',
     '⭐ 负控制：旧算法把入站 #2 归到了另一个会话（用户看到的「会话里只有两封」）', JSON.stringify(legacyIn2));
@@ -396,7 +397,7 @@ const REFS_OK = /^(?:<[^<>\s]+>\s*)+$/;
   ok(in2 && in2.in_reply_to === RESEND_MID_1,
     '入站 #2 的 in_reply_to 是干净的 Message-ID（旧实现会残留 `["` 前缀）', in2 && JSON.stringify(in2.in_reply_to));
 
-  // ---- 我们回复第 2 封 ----
+  // ---- we reply to the 2nd email ----
   r = await replyViaApi(in2.id, '第二封回复');
   ok(r.status === 200 && r.json && r.json.ok === true, '回复 #2 发送成功', JSON.stringify(r.json));
   const out2 = db.queryOne('SELECT id, thread_id, "references" AS refs FROM messages WHERE id = ?', r.json.id);
@@ -404,7 +405,7 @@ const REFS_OK = /^(?:<[^<>\s]+>\s*)+$/;
   threadIds.push(out2.thread_id);
   rowIds.push(out2.id);
 
-  // ---- 第 3 封来信：References 链已变长 ----
+  // ---- 3rd incoming email: the References chain has grown longer ----
   const RESEND_MID_2 = 'b2c3d4e5-2222-3333-4444-555566667777@smtp.resend.com';
   lastReceived = receivedEmail('m3', {
     headers: {
@@ -429,13 +430,13 @@ const REFS_OK = /^(?:<[^<>\s]+>\s*)+$/;
   ok(uniq.length === 1, `⭐⭐⭐ 6 封邮件（3 来 3 回）只落 1 个 thread_id（实际 ${uniq.length} 个）`, uniq.join(' | '));
   ok(uniq[0] === 'm1@upvote.network', '会话 id 就是整条链的根 Message-ID', uniq[0]);
 
-  // ---- 会话面板：一次往返都不能少 ----
+  // ---- conversation panel: not a single round trip may be missing ----
   const threadRows = await repo.listThread(env, uniq[0]);
   ok(threadRows.length === 6, `⭐ 会话面板能看到全部 6 封（修复前只有 2 封）`, String(threadRows.length));
   const threadRowIds = threadRows.map((x) => x.id).sort();
   ok(threadRowIds.join(',') === rowIds.slice().sort().join(','), '会话里的每一行都对应到上面那 6 封邮件');
 
-  /* ---- T3 回复写出的 References 不得再含方括号 / 引号 / 反斜杠（防嵌套转义复发） ---- */
+  /* ---- T3 the References written on replies must no longer contain square brackets / quotes / backslashes (prevent nested-escaping recurrence) ---- */
   section('T3 出站 References 必须是规范的空格分隔列表');
   const outRows = db.query('SELECT "references" AS refs, thread_id FROM messages WHERE direction = ?', 'outbound');
   ok(outRows.length === 3, '出站共 3 行（前置条件）', String(outRows.length));
@@ -447,9 +448,9 @@ const REFS_OK = /^(?:<[^<>\s]+>\s*)+$/;
   const refsOfOut3 = outRows[outRows.length - 1].refs;
   info(`出站 #3 的 References = ${JSON.stringify(refsOfOut3)}`);
 
-  // 精确锁住链条语义：出站 References = 原邮件 References 链 + 原邮件 Message-ID（去重）。
-  // 这一条同时是「嵌套转义」的回归闸门：旧实现会把整段 JSON 文本再拼一遍，
-  // 长度逐轮暴涨（生产实测 178 → 334 → 500 → 686），下面的相等断言会立刻挂。
+  // precisely lock down the chain semantics: outbound References = original email's References chain + original email's Message-ID (deduped).
+  // This is also the regression gate for "nested escaping": the old implementation pasted the whole JSON text again,
+  // so the length exploded each round (production measured 178 -> 334 -> 500 -> 686), and the equality assertions below fail immediately.
   const sortedOut = outRows.slice().sort((a, b) => (a.refs || '').length - (b.refs || '').length);
   ok(sortedOut[0].refs === '<m1@upvote.network>',
     '出站 #1 的 References = `<m1@upvote.network>`（只有根）', JSON.stringify(sortedOut[0].refs));
@@ -458,7 +459,7 @@ const REFS_OK = /^(?:<[^<>\s]+>\s*)+$/;
   ok(sortedOut[2].refs === `<m1@upvote.network> <m2@upvote.network> <${RESEND_MID_2}> <m3@upvote.network>`,
     '出站 #3 的 References = 完整链（长度线性增长，不是逐轮翻倍转义）', JSON.stringify(sortedOut[2].refs));
 
-  /* ---- T4 历史畸形数据：原 thread_id 不干净时必须回退推导，不能把畸形值传下去 ---- */
+  /* ---- T4 historical malformed data: when the original thread_id is unclean it must fall back to derivation, not propagate the malformed value ---- */
   section('T4 历史畸形 thread_id 的兜底（回退按 References 重新推导）');
   const malformed = `["<m1@upvote.network>","<m2@upvote.network>"]`;
   await db.prepare('UPDATE messages SET thread_id = ? WHERE resend_id = ?').bind(malformed, 'm3').run();
@@ -476,7 +477,7 @@ const REFS_OK = /^(?:<[^<>\s]+>\s*)+$/;
     '⭐ 回复时不会把畸形 thread_id 传下去（回退推导出干净值）', out4 && out4.thread_id);
   ok(out4 && util.isSaneThreadId(out4.thread_id) === true, '新出站行的 thread_id 通过 isSaneThreadId 检查', out4 && out4.thread_id);
 
-  /* ---- 汇总 ---- */
+  /* ---- summary ---- */
   console.log('\n================ 失败用例清单 ================');
   const failed = results.filter((r2) => !r2.ok);
   if (!failed.length) console.log('（无）');

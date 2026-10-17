@@ -1,9 +1,9 @@
 import type { Env } from './types';
 
 /**
- * Resend Received Emails API。
- * 文档: email.received webhook 只含元数据，正文/头/附件必须通过
- * https://resend.com/docs/api-reference/emails/retrieve-received-email 等接口拉取。
+ * Resend Received Emails API.
+ * Docs: the email.received webhook only contains metadata; the body/headers/attachments must be
+ * fetched via https://resend.com/docs/api-reference/emails/retrieve-received-email and similar endpoints.
  */
 
 const RESEND_API = 'https://api.resend.com';
@@ -56,7 +56,7 @@ export interface AttachmentDownloadItem extends ReceivedAttachmentMeta {
   expires_at?: string | null;
 }
 
-/** 拉取一封收到的邮件正文与头；html_format=cid 保留内联图 cid 引用，便于和附件表对应。 */
+/** Fetch a received email's body and headers; html_format=cid keeps inline image cid references, making it easy to map to the attachment table. */
 export async function fetchReceivedEmail(env: Env, emailId: string): Promise<ReceivedEmail> {
   return resendGet<ReceivedEmail>(
     env,
@@ -64,7 +64,7 @@ export async function fetchReceivedEmail(env: Env, emailId: string): Promise<Rec
   );
 }
 
-/** 拉取一封邮件的附件下载地址（单次调用返回全部）。 */
+/** Fetch the attachment download URLs for an email (a single call returns them all). */
 export async function listReceivedAttachmentDownloads(env: Env, emailId: string): Promise<Map<string, AttachmentDownloadItem>> {
   const data = await resendGet<{ data: AttachmentDownloadItem[] }>(
     env,
@@ -77,7 +77,7 @@ export async function listReceivedAttachmentDownloads(env: Env, emailId: string)
   return map;
 }
 
-/** 下载 signed URL（Resend CDN 直接返回字节）。 */
+/** Download a signed URL (the Resend CDN returns the bytes directly). */
 export async function downloadSignedUrl(url: string): Promise<{ bytes: Uint8Array; contentType: string | null }> {
   const resp = await fetch(url);
   if (!resp.ok) throw new Error(`attachment download failed: ${resp.status}`);

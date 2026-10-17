@@ -1,17 +1,22 @@
+# Template config for the "Deploy to Cloudflare button".
+# On deploy, Cloudflare **auto-creates** the D1 / R2 / Queue using the resource names below and backfills the generated ids into the repository you cloned.
+# For your own production deployment use wrangler.local.toml (see the README "self-hosting" section); do not put your real ids in this file.
 name = "resend-mail-api"
 main = "src/index.ts"
 compatibility_date = "2024-12-01"
 
+# D1: database_id is a placeholder, auto-created and backfilled on deploy.
+# The schema for a brand-new empty database is created automatically on the Worker's first request (no need to run migrations manually).
 [[d1_databases]]
 binding = "DB"
 database_name = "resend-webhooks-db"
-database_id = "cc445fd1-20b6-44c5-872f-5acf78834313"
+database_id = "<DATABASE_ID>"
 
 [[r2_buckets]]
 binding = "BUCKET"
 bucket_name = "resend-mail-attachments"
 
-# SPA 静态目录：所有请求先到 Worker（做 Basic Auth），未命中 /api、/webhook、/health 时回退到静态资源
+# SPA static directory: all requests hit the Worker first (for auth) and fall back to static assets when they don't match /api, /webhook, or /health
 [assets]
 directory = "./public"
 binding = "ASSETS"
@@ -19,27 +24,26 @@ run_worker_first = true
 not_found_handling = "none"
 
 [vars]
-SEND_FROM_ADDRESS = "support@notionmanager.com"
-SEND_FROM_NAME = "support"
-# 合并发送「逐人循环」可用的子请求预算。免费版单次请求上限 50，故留 5 余量取 45。
-# 付费版单次 10000 子请求，可改为 9000 等更大值。
+# The values below are template defaults; the setup wizard overrides them with the domain / sender you enter (stored in your own D1, secrets never leave your account).
+SEND_FROM_ADDRESS = "inbox@example.com"
+SEND_FROM_NAME = "Inbox"
+# The setup wizard points the inbound catch-all rule at this Worker script name; the frontend auto-corrects it based on the actual domain visited.
+WORKER_NAME = "resend-mail-api"
+# Subrequest budget available for merged-send "per-recipient loop". The free plan caps a single request at 50, so we keep a margin of 5 and use 45.
 MERGE_SUBREQ_BUDGET = "45"
 
-# CF 入向异步解析队列（never-lose 流水线第二段，见 src/inbound-email.ts）。
-# ⚠️ 部署前需先建队列，否则 `wrangler deploy` 会报找不到队列：
-#     wrangler queues create resend-mail-inbound
+# CF inbound async parse queue (the second stage of the never-lose pipeline, see src/inbound-email.ts). Auto-created on deploy.
 [[queues.producers]]
 binding = "INBOUND_QUEUE"
 queue = "resend-mail-inbound"
 
 [[queues.consumers]]
 queue = "resend-mail-inbound"
-# ⚠️ 每条一次调用：一封大附件邮件（base64 + 解析）很吃 CPU/内存，批量会让多封共用同一预算，
-# 免费档 10ms CPU 下更容易整批超限。个人邮箱量小，逐条处理更稳。
+# One invocation per message: a large-attachment email (base64 + parsing) is CPU/memory intensive, and batching would make several messages share the same budget, so processing one at a time is more stable.
 max_batch_size = 1
 max_retries = 5
 
-# 恢复 cron：定期把「已落 R2 但没解析完」的入向邮件重新入队（never-lose 自愈，见 src/inbound-email.ts）。
+# Recovery cron: periodically re-enqueues inbound messages that were stored in R2 but not fully parsed (never-lose self-healing, see src/inbound-email.ts).
 [triggers]
 crons = ["*/15 * * * *"]
 

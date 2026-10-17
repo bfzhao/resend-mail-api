@@ -1129,3 +1129,56 @@ html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
   .ia-item { flex-direction: column; align-items: stretch; }
   .ia-actions { justify-content: flex-end; }
 }
+
+/* ---------------- 安装向导 / 登录门（#gate） ---------------- */
+
+#gate {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background: var(--bg);
+}
+#gate.hidden { display: none; }
+#gate .gate-card {
+  width: 100%;
+  max-width: 380px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 10px 40px rgba(20, 30, 50, 0.14);
+  padding: 24px 22px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+#gate .gate-title { font-size: 20px; font-weight: 700; color: var(--text); }
+#gate .gate-sub { font-size: 13px; color: var(--text-dim); margin-top: -4px; }
+#gate .gate-field { display: flex; flex-direction: column; gap: 5px; font-size: 13px; color: var(--text-dim); }
+#gate .gate-field input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 9px 11px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 14px;
+  color: var(--text);
+  background: var(--panel-2);
+}
+#gate .gate-field input:focus { outline: 2px solid var(--accent-weak); border-color: var(--accent); }
+#gate .gate-actions { display: flex; justify-content: flex-end; margin-top: 4px; }
+#gate .gate-actions .btn { min-width: 96px; }
+#gate .gate-error { color: var(--danger); font-size: 12.5px; min-height: 16px; }
+#gate .gate-note { font-size: 12px; color: var(--text-dim); border-top: 1px solid var(--border); padding-top: 10px; }
+
+#gate .gate-card.gate-wide { max-width: 460px; }
+#gate .gate-steps { display: flex; flex-direction: column; gap: 6px; }
+#gate .gate-step { display: flex; gap: 8px; align-items: baseline; font-size: 12.5px; line-height: 1.5; }
+#gate .gate-step-mark { flex: none; font-weight: 700; }
+#gate .gate-step.ok .gate-step-mark { color: var(--ok); }
+#gate .gate-step.bad .gate-step-mark { color: var(--danger); }
+#gate .gate-step-name { flex: none; font-weight: 600; color: var(--text); }
+#gate .gate-step-detail { color: var(--text-dim); word-break: break-word; }

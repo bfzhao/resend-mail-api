@@ -1,28 +1,29 @@
 'use strict';
 
 /* =============================================================================
- * BUG-3b 后端聚合口径回归验证（真实 SQLite + 从 src/repo.ts 抽取的真实 SQL）
+ * BUG-3b backend aggregation convention regression (real SQLite + real SQL extracted from src/repo.ts)
  *
- * 运行：
+ * Run:
  *   node test/inbox-counts.backend.test.js
  *
- * 退出码：0 = 全部通过；1 = 存在失败；2 = 环境缺失（node:sqlite 不可用 / 源码抽取失败）。
+ * Exit codes: 0 = all pass; 1 = failures; 2 = missing environment (node:sqlite unavailable / source extraction failed).
  *
- * 为什么不用 tsc 编译 src/repo.ts：
- *   本机（受限沙箱）禁止 Node 派生任何子进程（spawnSync 直接 EBUSY），
- *   而 TS7 的 tsc 是原生可执行文件，必须由子进程启动，因此「编译后再 require」这条路
- *   在本环境跑不通。改为**从源码文本中抽取真实的 SQL 语句**（含 ${groupExpr} 的取值），
- *   用 Node 内置 node:sqlite 建真表、插真数据后原样执行。
- *   因此被测的是**真实 SQL 文本与真实 SQL 引擎语义**，只有「WHERE 片段如何拼装」
- *   这一层是按源码里出现的字面量重建的（下方每条都有抽取守卫，抽不到会明确失败）。
+ * Why not compile src/repo.ts with tsc:
+ *   This machine (restricted sandbox) forbids Node from spawning any child process (spawnSync returns EBUSY immediately),
+ *   and TS7's tsc is a native executable that must be launched as a child process, so "compile then require" does not
+ *   work in this environment. Instead the **real SQL statements are extracted from the source text** (including the value
+ *   of ${groupExpr}), and executed as-is after building real tables and inserting real data with Node's built-in node:sqlite.
+ *   So what is under test is the **real SQL text and real SQL engine semantics**; only the layer of "how the WHERE fragments
+ *   are assembled" is rebuilt from the literals appearing in the source (each item below has an extraction guard; failure is explicit if extraction fails).
  *
- * 核心断言（需求规格）：
- *   给定一组构造数据（含一条 mailbox = '' 的邮件），
- *   「全部邮箱」的 inbox_total / inbox_unread / sent_total 必须等于各账号分组之和；
- *   并且每个分组的数字必须与该账号单独过滤时的计数一致。
+ * Core assertion (requirement spec):
+ *   Given a set of constructed data (including one email with mailbox = ''),
+ *   "all mailboxes" inbox_total / inbox_unread / sent_total must equal the sum of the per-account groups;
+ *   and each group's numbers must match the counts when filtering by that account alone.
  *
- * 注：「全部邮箱」被要求包含全部行（含 mailbox 为空/未知的行），
- *     否则这些邮件在 UI 上将不可达；这一点以独立于 SQL 的 JS 期望值显式断言。
+ * Note: "all mailboxes" is required to include all rows (including rows with empty/unknown mailbox),
+ *     otherwise those emails would be unreachable in the UI; this is asserted explicitly with JS expected
+ *     values independent of the SQL.
  * ===========================================================================*/
 
 const fs = require('fs');
@@ -39,14 +40,14 @@ try {
 }
 
 const ROOT = path.join(__dirname, '..');
-// QA_REPO_TS 仅用于「变异验证」：指向一份人工构造的旧版/变体源码，确认本测试确实能抓到缺陷。
+// QA_REPO_TS is only for "mutation verification": point it at a hand-crafted older/variant source, to confirm this test really catches the defect.
 const REPO_TS = process.env.QA_REPO_TS || path.join(ROOT, 'src', 'repo.ts');
 const SRC = fs.readFileSync(REPO_TS, 'utf8');
-// 抽取用：统一换行符，避免 CRLF 影响按片段定位的逻辑
+// for extraction: normalize line endings so CRLF does not affect fragment-based positioning
 const SRC_LF = SRC.replace(/\r\n/g, '\n');
 const REPO_MD5 = crypto.createHash('md5').update(SRC).digest('hex');
 
-// A3：用 schema.sql 里 messages 表的**真实 DDL**建表，判定 mailboxes() 的 NULL 合并分支是否可达
+// A3: build the table with the **real DDL** of messages from schema.sql, to determine whether mailboxes()'s NULL-merge branch is reachable
 const SCHEMA_SRC = fs.readFileSync(path.join(ROOT, 'schema.sql'), 'utf8');
 const MESSAGES_DDL = (() => {
   const m = /CREATE TABLE IF NOT EXISTS messages \(([\s\S]*?)\n\);/.exec(SCHEMA_SRC);
@@ -55,7 +56,7 @@ const MESSAGES_DDL = (() => {
 })();
 
 /* ---------------------------------------------------------------------------
- * 从源码抽取真实 SQL 与相关字面量（抽不到就明确失败，绝不静默降级）
+ * Extract the real SQL and related literals from the source (explicit failure if extraction fails, never a silent downgrade)
  * -------------------------------------------------------------------------*/
 
 function must(re, label) {
@@ -65,16 +66,16 @@ function must(re, label) {
 }
 
 /**
- * 截取某个顶层函数/常量的源码片段，避免跨函数误匹配。
+ * Slice out the source fragment of a top-level function/constant to avoid cross-function false matches.
  *
- * 加固说明（第二轮）：
- *   旧实现用 `SRC_LF.indexOf('\n}\n', s)` 找函数结束位置 —— 只要有人把结束花括号写成
- *   `} `、或函数体里出现行首 `}`（模板字面量内），定位就会静默截错。
- *   现在改为两步：
- *     1) 起始位置 = anchor（函数体里第一条语句的唯一片段）之前最近的 `{`，从而跳过
- *        TS 返回类型里的对象类型字面量（例如 `Promise<Array<{ mailbox: string ... }>>`）；
- *     2) 结束位置 = 从该 `{` 起做**花括号配平扫描**，扫描时跳过字符串 / 模板 / 注释。
- *   不再依赖任何行号、缩进或 `\n}\n` 形态；anchor 抽不到会明确失败而不是静默降级。
+ * Hardening notes (second round):
+ *   The old implementation used `SRC_LF.indexOf('\n}\n', s)` to find the function's end -- if anyone wrote the closing
+ *   brace as `} `, or a line-leading `}` appeared inside the body (within a template literal), the position would be silently wrong.
+ *   Now it is two steps:
+ *     1) Start position = the nearest `{` before the anchor (a unique fragment of the function body's first statement), thus skipping
+ *        object type literals in the TS return type (e.g. `Promise<Array<{ mailbox: string ... }>>`);
+ *     2) End position = a **brace-balancing scan** starting from that `{`, skipping strings / templates / comments while scanning.
+ *   It no longer depends on any line numbers, indentation, or the `\n}\n` shape; failure to find the anchor is an explicit failure rather than a silent downgrade.
  */
 function sliceTopLevel(marker, anchor) {
   const s = SRC_LF.indexOf(marker);
@@ -105,7 +106,7 @@ function sliceTopLevel(marker, anchor) {
       if (ch === (mode === 'sq' ? "'" : '"')) mode = 'code';
       continue;
     }
-    // tpl：模板字面量整体跳过（本文件的模板里只有 ${ident}，不含裸花括号）
+    // tpl: skip the whole template literal (this file's templates contain only ${ident}, no bare braces)
     if (ch === '\\') { i++; continue; }
     if (ch === '`') mode = 'code';
   }
@@ -123,18 +124,18 @@ function extractSql() {
   const scBody = sliceTopLevel('export async function sidebarCounts(', 'const conds: string[] = []');
   const mcBody = sliceTopLevel('function mailboxCond(', 'if (mailbox === UNKNOWN_MAILBOX)');
 
-  // 1) mailboxes() 的 GROUP BY 语句（含 ${groupExpr}）
+  // 1) mailboxes()'s GROUP BY statement (includes ${groupExpr})
   const groupsTemplate = mustIn(mbBody, /`([^`]*GROUP BY[^`]*)`/, 'mailboxes() 的 GROUP BY 模板')[1].replace(/\s+/g, ' ').trim();
-  // 2) sidebarCounts() 的聚合语句（含 ${whereSql}）
+  // 2) sidebarCounts()'s aggregation statement (includes ${whereSql})
   const countsTemplate = mustIn(scBody, /`([^`]*AS trash_total[^`]*)`/, 'sidebarCounts() 的聚合模板')[1].replace(/\s+/g, ' ').trim();
-  // 3) groupExpr 的取值
+  // 3) the value of groupExpr
   const groupExpr = mustIn(mbBody, /const\s+groupExpr\s*=\s*"([^"]*)"\s*;/, 'groupExpr 字面量')[1];
-  // 4) 未知邮箱哨兵值（前后端共用）
+  // 4) unknown-mailbox sentinel value (shared by front and back end)
   const unknownSentinel = must(/export\s+const\s+UNKNOWN_MAILBOX\s*=\s*'([^']*)'/, 'UNKNOWN_MAILBOX 字面量')[1];
-  // 5) mailboxCond() 的两个 WHERE 字面量
+  // 5) mailboxCond()'s two WHERE literals
   const sentinelWhere = mustIn(mcBody, /mailbox\s*===\s*UNKNOWN_MAILBOX\s*\)\s*return\s*\{\s*sql:\s*"([^"]*)"/, 'mailboxCond() 哨兵 WHERE')[1];
   const exactWhere = mustIn(mcBody, /return\s*\{\s*sql:\s*'([^']*)'\s*,\s*params:\s*\[\s*mailbox\s*\]\s*\}/, 'mailboxCond() 精确 WHERE')[1];
-  // 6) mailboxes() 的 .bind(...) 实参（用于还原占位符参数）
+  // 6) mailboxes()'s .bind(...) arguments (used to reconstruct the placeholder params)
   const bindArgsSrc = mustIn(mbBody, /\.bind\(([^)]*)\)/, 'mailboxes() 的 .bind 实参')[1];
 
   return { groupsTemplate, countsTemplate, groupExpr, unknownSentinel, sentinelWhere, exactWhere, bindArgsSrc };
@@ -166,7 +167,7 @@ function substitute(sql, map) {
 }
 
 /* ---------------------------------------------------------------------------
- * SQLite + 假 D1（只把 SQL 原样转发给 SQLite，不实现任何业务聚合逻辑）
+ * SQLite + fake D1 (just forwards SQL as-is to SQLite, implements no business aggregation logic)
  * -------------------------------------------------------------------------*/
 
 function makeFakeD1(db) {
@@ -191,7 +192,7 @@ function makeFakeD1(db) {
 }
 
 /* ---------------------------------------------------------------------------
- * 固定装置：必须包含一条 mailbox = '' 的邮件
+ * Fixture: must include one email with mailbox = ''
  * -------------------------------------------------------------------------*/
 
 const ROWS = [
@@ -200,9 +201,9 @@ const ROWS = [
   { id: 'm3', direction: 'outbound', mailbox: 'a@x.com', read: 1, starred: 0, deleted: 0 },
   { id: 'm4', direction: 'inbound', mailbox: 'b@x.com', read: 0, starred: 1, deleted: 0 },
   { id: 'm5', direction: 'outbound', mailbox: 'b@x.com', read: 1, starred: 0, deleted: 0 },
-  { id: 'm6', direction: 'inbound', mailbox: '', read: 0, starred: 0, deleted: 0 }, // 关键：无 mailbox
-  { id: 'm7', direction: 'outbound', mailbox: '', read: 1, starred: 0, deleted: 0 }, // 关键：无 mailbox
-  { id: 'm8', direction: 'inbound', mailbox: 'a@x.com', read: 0, starred: 0, deleted: 1 }, // 已删除
+  { id: 'm6', direction: 'inbound', mailbox: '', read: 0, starred: 0, deleted: 0 }, // key: no mailbox
+  { id: 'm7', direction: 'outbound', mailbox: '', read: 1, starred: 0, deleted: 0 }, // key: no mailbox
+  { id: 'm8', direction: 'inbound', mailbox: 'a@x.com', read: 0, starred: 0, deleted: 1 }, // deleted
 ];
 
 function makeDb(rows) {
@@ -232,7 +233,7 @@ function makeDb(rows) {
 }
 
 /* ---------------------------------------------------------------------------
- * 独立于 SQL 的 JS 期望值（真值来源：固定装置本身）
+ * JS expected values independent of the SQL (source of truth: the fixture itself)
  * -------------------------------------------------------------------------*/
 
 const isInbox = (r) => r.direction === 'inbound' && r.deleted === 0;
@@ -264,7 +265,7 @@ const EXPECTED_NON_EMPTY_SUM = EXPECTED_GROUPS
   .reduce((s, g) => s + g.inbox_total, 0);
 
 /* ---------------------------------------------------------------------------
- * 用例运行器
+ * Test runner
  * -------------------------------------------------------------------------*/
 
 const results = [];
@@ -289,7 +290,7 @@ async function test(name, fn) {
 const triples = (arr) => arr.map((x) => [x.inbox_unread, x.inbox_total, x.sent_total].join('/')).sort();
 
 /* ===========================================================================
- * 用例
+ * Test cases
  * ===========================================================================*/
 
 (async function main() {
@@ -307,7 +308,7 @@ const triples = (arr) => arr.map((x) => [x.inbox_unread, x.inbox_total, x.sent_t
     process.exit(2);
   }
 
-  // 组装三条待测 SQL（参数按源码中的字面量还原）
+  // assemble the three SQL statements under test (params restored from the literals in the source)
   const groupsParams = evalBindArgs(sql.bindArgsSrc, sql.unknownSentinel);
   const SQL_GROUPS = substitute(sql.groupsTemplate, { groupExpr: sql.groupExpr });
   const SQL_ALL = substitute(sql.countsTemplate, { whereSql: '' });
@@ -330,7 +331,7 @@ const triples = (arr) => arr.map((x) => [x.inbox_unread, x.inbox_total, x.sent_t
   const db = makeDb(ROWS);
   const env = { DB: makeFakeD1(db) };
 
-  // SUM 在零行时返回 NULL，src/repo.ts 用 `?? 0` 归一化（该归一化的存在性由 T6 源码级断言守住）。
+  // SUM returns NULL with zero rows; src/repo.ts normalizes it with `?? 0` (the existence of that normalization is guarded by a source-level assertion in T6).
   const norm = (v) => (v === null || v === undefined ? 0 : v);
   const readCounts = (q, params = []) => {
     const row = db.prepare(q).get(...params) || {};
@@ -350,7 +351,7 @@ const triples = (arr) => arr.map((x) => [x.inbox_unread, x.inbox_total, x.sent_t
       sent_total: norm(r.sent_total),
     }));
 
-  /* ---- T0 环境自检 ---- */
+  /* ---- T0 environment self-check ---- */
   await test('T0 测试环境自检（harness 可信度）', async () => {
     ok(SQL_GROUPS.includes('GROUP BY'), '抽取到的分组 SQL 含 GROUP BY');
     ok(/SUM\s*\(\s*CASE WHEN/i.test(SQL_GROUPS), '抽取到的分组 SQL 含 SUM(CASE WHEN ...) 聚合');
@@ -370,7 +371,7 @@ const triples = (arr) => arr.map((x) => [x.inbox_unread, x.inbox_total, x.sent_t
     ok(row && row.inbox_total > 0, 'SQL 确实在真实 SQLite 上执行并返回非零结果（非空转）', row && row.inbox_total);
   });
 
-  /* ---- T1 sidebarCounts(全部邮箱) 与独立 JS 期望值一致 ---- */
+  /* ---- T1 sidebarCounts(all mailboxes) matches the independent JS expected values ---- */
   await test('T1 全部邮箱聚合：覆盖全部行（含空 mailbox）', async () => {
     const all = readCounts(SQL_ALL);
     info(`实际 = ${JSON.stringify(all)}`);
@@ -382,7 +383,7 @@ const triples = (arr) => arr.map((x) => [x.inbox_unread, x.inbox_total, x.sent_t
     ok(all.trash_total === EXPECTED_ALL.trash_total, 'trash_total 与独立期望一致', `${all.trash_total} vs ${EXPECTED_ALL.trash_total}`);
   });
 
-  /* ---- T2 mailboxes() 分组必须覆盖空 mailbox ---- */
+  /* ---- T2 mailboxes() grouping must cover empty mailbox ---- */
   await test('T2 分组聚合：分组口径必须覆盖全部行', async () => {
     const list = readGroups();
     info(`实际分组 = ${JSON.stringify(list)}`);
@@ -393,7 +394,7 @@ const triples = (arr) => arr.map((x) => [x.inbox_unread, x.inbox_total, x.sent_t
       `实际=${JSON.stringify(triples(list))} 期望=${JSON.stringify(triples(EXPECTED_GROUPS))}`);
   });
 
-  /* ---- T3 核心不变量：各账号之和 === 全部邮箱 ---- */
+  /* ---- T3 core invariant: sum of all accounts === all mailboxes ---- */
   await test('T3 「全部邮箱」必须等于各账号分组之和（BUG-3b 核心）', async () => {
     const all = readCounts(SQL_ALL);
     const list = readGroups();
@@ -412,7 +413,7 @@ const triples = (arr) => arr.map((x) => [x.inbox_unread, x.inbox_total, x.sent_t
     ok(all.sent_total === sum.sent_total, 'sent_total：全部邮箱 === 各账号之和', `${all.sent_total} vs ${sum.sent_total}`);
   });
 
-  /* ---- T4 下拉里每个账号的数字必须等于「按该账号过滤」的计数 ---- */
+  /* ---- T4 each account's number in the dropdown must equal the count when filtering by that account ---- */
   await test('T4 每个分组的数字必须与该账号单独过滤的计数一致', async () => {
     const list = readGroups();
     for (const m of list) {
@@ -424,7 +425,7 @@ const triples = (arr) => arr.map((x) => [x.inbox_unread, x.inbox_total, x.sent_t
     }
   });
 
-  /* ---- T5 单个账号过滤（回归：不要为了凑等式把过滤改坏） ---- */
+  /* ---- T5 single-account filter (regression: do not break the filter to make the equation work) ---- */
   await test('T5 单个账号过滤仍然正确', async () => {
     for (const g of EXPECTED_GROUPS.filter((x) => x.key !== '')) {
       const q = SQL_PER(g.key);
@@ -439,7 +440,7 @@ const triples = (arr) => arr.map((x) => [x.inbox_unread, x.inbox_total, x.sent_t
       '不存在的账号过滤结果全为 0', JSON.stringify(ghost));
   });
 
-  /* ---- T6 空库：SUM 返回 NULL，源码必须归一化为 0 ---- */
+  /* ---- T6 empty DB: SUM returns NULL, the function layer must normalize to 0 ---- */
   await test('T6 空库边界：SUM 返回 NULL，函数层需归一化为 0', async () => {
     const empty = makeDb([]);
     const raw = empty.prepare(SQL_ALL).get();
@@ -452,7 +453,7 @@ const triples = (arr) => arr.map((x) => [x.inbox_unread, x.inbox_total, x.sent_t
     try { empty.close(); } catch { /* ignore */ }
   });
 
-  /* ---- T7 mailboxes() 对 mailbox='' 的真实返回：'' / null / 哨兵？ ---- */
+  /* ---- T7 mailboxes()'s real return for mailbox='': '' / null / sentinel? ---- */
   await test("T7 mailboxes() 对 mailbox='' 的真实返回（判定合并分支是否可达）", async () => {
     const db7 = makeDb(ROWS);
     const raw = db7.prepare(SQL_GROUPS).all(...groupsParams);
@@ -468,14 +469,14 @@ const triples = (arr) => arr.map((x) => [x.inbox_unread, x.inbox_total, x.sent_t
     try { db7.close(); } catch { /* ignore */ }
   });
 
-  /* ---- T8 schema 的 NOT NULL 是否使 :212-232 的 NULL 合并分支成为死代码 ---- */
+  /* ---- T8 does schema's NOT NULL make the NULL-merge branch at :212-232 dead code ---- */
   await test('T8 NULL 分支可达性：schema 的 mailbox NOT NULL 是否让合并逻辑成为死代码', async () => {
     ok(/mailbox\s+TEXT\s+NOT NULL\s+DEFAULT\s+''/i.test(MESSAGES_DDL),
       "前提：schema.sql 里 mailbox 定义为 TEXT NOT NULL DEFAULT ''");
     const DDL_NULLABLE = MESSAGES_DDL.replace(/mailbox\s+TEXT\s+NOT NULL\s+DEFAULT\s+''/i, 'mailbox TEXT');
     ok(DDL_NULLABLE !== MESSAGES_DDL, '成功构造出 mailbox 可空的对照表（替换命中）');
 
-    // 8.1 真实 schema：NULL 必须被约束拒绝
+    // 8.1 real schema: NULL must be rejected by the constraint
     const dbReal = new DatabaseSync(':memory:');
     dbReal.exec(MESSAGES_DDL);
     let threw = null;
@@ -488,12 +489,12 @@ const triples = (arr) => arr.map((x) => [x.inbox_unread, x.inbox_total, x.sent_t
       threw ? String(threw.message) : '居然插入成功了');
     try { dbReal.close(); } catch { /* ignore */ }
 
-    // 8.2 可空对照表：'' 与 NULL 会各产生一行哨兵 —— 这正是 JS 合并逻辑存在的意义
+    // 8.2 nullable control table: '' and NULL each produce one sentinel row -- this is exactly why the JS merge logic exists
     const dbNull = new DatabaseSync(':memory:');
     dbNull.exec(DDL_NULLABLE);
     const ins = dbNull.prepare('INSERT INTO messages (id, direction, mailbox, received_at, created_at, updated_at) VALUES (?,?,?,?,?,?)');
-    ins.run('e1', 'inbound', '', 1, 1, 1);     // 空串
-    ins.run('e2', 'inbound', null, 2, 1, 1);   // NULL（可空表才允许）
+    ins.run('e1', 'inbound', '', 1, 1, 1);     // empty string
+    ins.run('e2', 'inbound', null, 2, 1, 1);   // NULL (only allowed in a nullable table)
     const rows = dbNull.prepare(SQL_GROUPS).all(...groupsParams);
     info(`可空表下 SQL_GROUPS 返回 = ${JSON.stringify(rows.map((r) => r.mailbox))}`);
     const sentinelRows = rows.filter((r) => r.mailbox === sql.unknownSentinel);
@@ -508,7 +509,7 @@ const triples = (arr) => arr.map((x) => [x.inbox_unread, x.inbox_total, x.sent_t
     info('      => 在当前 schema + 当前 SQL 下，该合并逻辑是**防御性死代码**（无害，不建议删除）。');
   });
 
-  /* ---- 汇总 ---- */
+  /* ---- summary ---- */
   console.log('\n================ 失败用例清单 ================');
   const failed = results.filter((r) => !r.ok);
   if (!failed.length) console.log('（无）');

@@ -1,58 +1,60 @@
-# Resend 邮件收件箱（Cloudflare Worker + D1 + R2）
+# Resend Mail Inbox (Cloudflare Worker + D1 + R2)
 
-接收发往你自己域名的邮件（Resend Inbound `email.received`），在 Worker 上解析入库：
-D1 存邮件正文与元数据，R2 存附件；网页端是简化 Gmail 风格的收件箱，支持 阅读 / 标记已读 / 星标 / 删除（回收站）/ 写信 / 回复（通过 Resend 发送）。
+Collect mail for your own domain into a **self-hosted** web inbox:
 
-## 架构
+- **Inbound**: Cloudflare Email Routing receives mail → the Worker stores the raw `.eml` in R2 + records it in D1 (body/metadata), parses it asynchronously, and **never loses mail**.
+- **Outbound**: send / reply through [Resend](https://resend.com) (HTML + attachments supported).
+- **Web UI**: a simplified Gmail-style interface with read / unread / star / delete (trash) / compose / reply / multi-address switching / search.
 
-```
-Resend Inbound ──► POST /webhook/inbound ──┐
-Resend 域名回执 ─► POST /webhook/events ────┤  Svix 签名校验 + 幂等
-                                            │  （inbound 再经 Resend API 拉正文/附件）
-                                            ▼
-                                       Worker (src/index.ts)
-                         ├─ D1: messages / attachments / delivery_events / webhook_deliveries
-                         ├─ R2: attachments/{messageId}/{uuid}-{filename}
-                         └─ Resend API: 拉收信正文/附件 + 写信 / 回复（发件）
-                                            ▲
-                       浏览器 SPA (public/, 经 ASSETS 提供)
-                       文件夹：收件箱 / 已加星标 / 已发送 / 已删除
-```
+All data lives in **your own** Cloudflare account (D1 / R2 / Queue), and the Resend key is stored only in your own D1 — no secrets leave your account.
 
-- 收件与发件混存在一张 `messages` 表，用 `direction`（inbound / outbound）区分，文件夹只是查询视图。
-- 已删除 = 软删除（`deleted=1`），回收站里可「还原」或「彻底删除」（删除 R2 附件）。
-- `thread_id` 用 References 链的根 Message-ID 归组，列表保持平铺、阅读视图内展示会话上下文。
-- `mailbox` 记录邮件所属收件地址，支持多收件地址切换（各自独立的文件夹/未读/搜索）。
-- 写信/回复支持富文本（HTML）与附件；发件人默认跟随所选收件地址。
+---
 
-## 目录
+## One-click deploy
 
-```
-public/            SPA（无构建）：index.html / app.css / app.js
-src/
-  index.ts         路由：/webhook/*、/api/*、静态资源回退
-  types.ts         Env 与数据行类型
-  auth.ts          Basic Auth
-  webhook.ts       验签、入站收信（拉正文/附件）、出站回执
-  repo.ts          D1/R2 存取、文件夹查询、会话、批量操作、附件代理
-  receiving.ts     Resend Received Emails API（正文/附件下载）
-  send.ts          通过 Resend 发送（含附件、按 mailbox 发件人）
-  util.ts          地址解析 / 时间 / base64 / 编码 / 会话根 等
-schema.sql         表结构（新装）
-migrations/        老库增量迁移（001_thread_mailbox）
-wrangler.toml      绑定与配置
-```
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/bfzhao/resend-mail-api)
 
-## 本地开发
+> On click, Cloudflare clones this repo **into your GitHub account**, provisions D1 / R2 / Queue from `wrangler.toml`, and deploys it to your Cloudflare account.
+
+### Prerequisites
+
+- **Cloudflare account** (Free plan is fine)
+- **A domain** whose DNS is hosted on Cloudflare (nameservers pointed at Cloudflare)
+- **Resend account** (Free plan is fine; used for outbound and domain verification)
+- **GitHub account** (the Deploy Button clones the repo into your account)
+
+### After deploy: follow the in-app wizard
+
+1. Open the URL Cloudflare gives you: `https://<your-worker>.<subdomain>.workers.dev`
+2. The first visit opens the setup wizard:
+   - **Step 1 · Set up admin**: choose a username and password (used to sign in afterwards; you can also use the `API_USERNAME` / `API_PASSWORD` env vars for Basic Auth).
+   - **Step 2 · Connect your domain**: enter the domain + Cloudflare API Token + Resend API Key + from-address.
+     Clicking "Start setup" then automatically: finds the zone → enables Email Routing and points catch-all at this Worker → creates the sending domain in Resend → writes DKIM/SPF/DMARC into your DNS → triggers Resend verification.
+3. Done — you can now receive, compose, and reply.
+
+**Cloudflare API Token permissions** (zone-level):
+
+| Category | Permission |
+|---|---|
+| Zone | Zone → Read |
+| Zone | DNS → Edit |
+| Zone | Email Routing → Edit |
+
+> The token is **used once during setup and never stored**; the Resend key is saved in your own D1 (`app_config`) for long-term sending.
+> DNS changes can take a few minutes to propagate; you can re-run the "self-check" in the wizard later (it verifies MX/DKIM/SPF/DMARC via public DNS and needs no token).
+
+---
+
+## Self-hosting / local development
 
 ```bash
 npm install
 npm run typecheck
 
-# 本地初始化数据库（sqlite，位于 .wrangler/state）
+# Local database (sqlite at .wrangler/state)
 npm run db:migrate:local
 
-# 本地敏感配置写入 .dev.vars（不提交）
+# Put local secrets in .dev.vars (not committed)
 # RESEND_API_KEY=re_xxx
 # API_USERNAME=admin
 # API_PASSWORD=change-me
@@ -60,91 +62,108 @@ npm run db:migrate:local
 npm run dev            # http://localhost:8787
 ```
 
-本地联调入站 webhook：用 [Svix CLI](https://github.com/svix/svix-cli) 或自行计算 `svix-signature`：
-
-```text
-待签名串 = {svix-id}.{svix-timestamp}.{原始body}
-HMAC-SHA256(key = Resend 显示的那个 signing secret 中 whsec_ 前缀之后 base64 解码出的字节, 待签名串) → base64
-请求头：svix-id / svix-timestamp / svix-signature: v1,{base64}
-```
-
-注意：Svix 约定签名密钥形如 `whsec_<base64>`，**HMAC 密钥是 `<base64>` 解码后的字节，不是整个字符串**。把 Resend 页面显示的 signing secret 原样填入 `RESEND_WEBHOOK_SECRET` 即可，本项目的验签会自动按该规则处理（带 `whsec_` 前缀且后缀为合法 base64 时解码为密钥，否则兼容本地明文测试密钥）。
-
-## 部署
-
-前置：已注册 [Resend](https://resend.com)，验证了发送域名（回信/写信用），并开通 Inbound Email（接收域名指向 Resend 的 MX/路由）。
+To self-host on your own Cloudflare account, use the **local config file** (gitignored, never made public):
 
 ```bash
-# 1. 创建资源并回填 id
-wrangler d1 create resend-webhooks-db            # 输出 database_id，填入 wrangler.toml
-wrangler r2 bucket create resend-mail-attachments
-
-# 2. 初始化数据库
-npm run db:migrate
-
-# 3. 敏感配置（覆盖 wrangler.toml 里的占位值）
-wrangler secret put API_USERNAME
-wrangler secret put API_PASSWORD
-wrangler secret put RESEND_API_KEY               # 写信/回复 + 拉取收信正文/附件都要用
-wrangler secret put RESEND_WEBHOOK_SECRET        # Resend Inbound 签名密钥
-# RESEND_EVENTS_SECRET 可选；不设则回执复用 RESEND_WEBHOOK_SECRET
-
-# 4. 发送域名与发件人（按需改成 vars 或 secret）
-wrangler secret put SEND_FROM_ADDRESS            # 例 you@your-domain.com
-wrangler secret put SEND_FROM_NAME               # 例 My Inbox
-
-# 5. 上线
-npm run deploy
+# fill in your own database_id etc. in wrangler.local.toml
+wrangler deploy -c wrangler.local.toml
 ```
 
-### Resend 控制台配置
+> `wrangler.toml` is a **template** for the Deploy Button: its D1 `database_id` is the placeholder `<DATABASE_ID>`, which is created and filled in automatically on cloud deploy. Keep your own production ids in `wrangler.local.toml`.
 
-1. **Inbound**：在 Resend 的 Inbound Routes 里给接收域名添加路由，把收到的邮件转发到
-   `https://<你的worker>.<子域>.workers.dev/webhook/inbound`。
-   - 事件类型勾选「Email Received」。签名字段在 Resend 页面可查看，把签名密钥填入 `RESEND_WEBHOOK_SECRET`。
-   - `email.received` webhook 只带元数据（不含正文/附件），Worker 会用 `RESEND_API_KEY` 调
-     [Received emails API](https://resend.com/docs/api-reference/emails/retrieve-received-email)
-     拉取正文（`html_format=cid`），再下载附件存 R2。
-2. **发送域名**（可选，用于回执更新已发送状态）：域名 Domain Events Webhook 指向
-   `https://<worker>/webhook/events`，并勾选 `sent / delivered / bounced / failed / complained`。
-   - 收信转发只送 `email.received`；回执更新 `已发送` 里的送达状态。
-3. Basic Auth：`API_USERNAME / API_PASSWORD` 都设置后，页面与 `/api/*` 均需登录。更稳妥可用 Cloudflare Access 挡在 Worker 前面。
+### Schema (auto-created on a fresh DB)
 
-## API 一览
+After deploying to a brand-new empty D1, **the Worker creates the tables automatically on first request** (idempotent) — no manual migration needed. The source of truth is [`schema.sql`](./schema.sql); `src/schema-sql.ts` is its inlined form (used at runtime). After editing `schema.sql`, run:
 
-| 方法 | 路径 | 说明 |
+```bash
+npm run schema:sync
+```
+
+(`test/schema-sql-sync.test.js` checks that the two stay in sync.)
+
+---
+
+## Architecture
+
+```
+Cloudflare Email Routing ──(email)──┐
+   (MX = mx.cloudflare.net)         │  ① stream the raw .eml to R2 + register inbound_raw
+                                    ▼
+                              Worker (src/index.ts)
+                 ├─ R2: raw messages + attachments
+                 ├─ D1: messages / attachments / inbound_raw / delivery_events / drafts / app_config / users …
+                 ├─ Queue: async parsing (never-lose stage 2)
+                 └─ Resend API: send / reply (outbound)
+                                    ▲
+                   Browser SPA (public/, served via ASSETS)
+                   Folders: Inbox / Starred / Sent / Trash
+```
+
+- Inbound and outbound share one `messages` table, distinguished by `direction` (inbound / outbound); folders are just query views.
+- Deleted = soft delete (`deleted=1`); the trash can either restore or permanently delete (which also removes the R2 attachments).
+- `thread_id` groups by the root Message-ID of the References chain; `mailbox` records the receiving address, enabling multi-address switching.
+- Cloudflare Email Routing is a router and **does not store mail**, so the first thing we do on receive is persist to R2 + register, then enqueue for async parsing; a `*/15` cron re-enqueues anything left unparsed to self-heal.
+
+## Layout
+
+```
+public/            SPA (no build step): index.html / app.css / app.js
+src/
+  index.ts         routing: /webhook/*, /api/*, /api/setup/*, static asset fallback
+  auth.ts          auth (env Basic / D1 session)
+  session.ts       PBKDF2 password hashing + session cookie
+  setup.ts         setup wizard: domain + automatic DNS + send/receive auth + self-check
+  cloudflare.ts    Cloudflare API (DNS / Email Routing)
+  resend-domains.ts Resend domain API
+  schema.ts        ensureSchema: idempotent table creation on first request for a fresh DB
+  schema-sql.ts    inlined form of schema.sql (generated by npm run schema:sync)
+  webhook.ts       Resend webhook signature verification, inbound receipt, outbound receipts
+  inbound-email.ts CF Email Routing inbound (persist to R2 + enqueue + async parse + self-heal)
+  repo.ts          D1/R2 access, folder queries, sessions, batch operations
+  receiving.ts     Resend Received Emails API
+  send.ts          send via Resend (with attachments)
+  util.ts          address parsing / time / base64 / encoding, etc.
+schema.sql         table schema (single source of truth)
+scripts/sync-schema.js  generates src/schema-sql.ts from schema.sql
+migrations/        incremental migrations for existing DBs (001 … 010)
+wrangler.toml      Deploy Button template config
+wrangler.local.toml self-host config (gitignored)
+```
+
+## API
+
+| Method | Path | Description |
 |---|---|---|
-| POST | `/webhook/inbound` | Resend Inbound 收信（签名校验 + 幂等） |
-| POST | `/webhook/events` | Resend 发送回执（可选，更新已发送状态） |
-| GET | `/health` | 健康检查 |
-| GET | `/api/folders/:folder` | 列表，folder ∈ `inbox/sent/starred/trash`；参数 `q`（搜索）、`unread=1`、`mailbox`、`limit/offset` |
-| GET | `/api/counts` | 侧边栏未读/总数（可按 `mailbox`） |
-| GET | `/api/mailboxes` | 收件地址列表及各自未读数（多邮箱切换） |
-| GET | `/api/account` | 发送能力与发件人信息 |
-| GET | `/api/messages/:id` | 详情 + 附件 + `thread`（会话上下文）；收件未读会自动标为已读 |
+| GET | `/health` | Health check |
+| GET/POST | `/api/setup/status` `/api/setup/admin` `/api/setup/domain` `/api/setup/check` | Setup wizard / self-check |
+| POST | `/api/login` `/api/logout` | Session sign-in / sign-out |
+| POST | `/webhook/inbound` | Resend Inbound receipt (optional; signature verification + idempotency) |
+| POST | `/webhook/events` | Resend delivery events (optional; updates sent status) |
+| GET | `/api/folders/:folder` | List; folder ∈ `inbox/sent/starred/trash`; params `q`, `unread=1`, `mailbox`, `limit/offset` |
+| GET | `/api/counts` | Sidebar unread / total counts (optionally per `mailbox`) |
+| GET | `/api/mailboxes` | List of receiving addresses with their unread counts |
+| GET | `/api/account` | Sending capability and sender info |
+| GET | `/api/messages/:id` | Detail + attachments + `thread` (conversation context) |
 | PATCH | `/api/messages/:id` | `{read?, starred?, deleted?}` |
-| POST | `/api/messages/batch` | `{ids, action}`，action ∈ `read/unread/star/unstar/trash/restore/delete` |
-| POST | `/api/messages` | 写信 `{to, cc?, subject, body?, html?, mailbox?, attachments?}` |
-| POST | `/api/messages/:id/reply` | 回复（自动 `Re:` + 引用头，同上字段，发件人默认跟随原信 mailbox） |
-| GET | `/api/attachments/:id` | 附件代理：图片 inline，其余强制下载（`nosniff`） |
+| POST | `/api/messages/batch` | `{ids, action}`, action ∈ `read/unread/star/unstar/trash/restore/delete` |
+| POST | `/api/messages` | Compose `{to, cc?, subject, body?, html?, mailbox?, attachments?}` |
+| POST | `/api/messages/:id/reply` | Reply |
+| GET | `/api/attachments/:id` | Attachment proxy: images inline, everything else forced download |
 
-## 安全说明
+## Security
 
-- 入站 HTML 正文在前端白名单清洗后才渲染（剥离 script/事件属性/非法协议），内联图片 `cid:` 改写为本地附件代理地址。
-- 附件代理对非图片一律 `Content-Disposition: attachment` + `X-Content-Type-Options: nosniff`，不会把上传内容当 HTML 打开。
-- Webhook 校验带 5 分钟时间戳窗口，事件表 `webhook_deliveries` 做幂等。
-- 生产请务必用 `wrangler secret put`，不要用 `wrangler.toml` 里的明文占位值。
+- Inbound HTML bodies are sanitized with a front-end allowlist before rendering; the attachment proxy sends non-images with `Content-Disposition: attachment` + `X-Content-Type-Options: nosniff`.
+- The admin password is hashed with PBKDF2-SHA256 (100k iterations) and stored in D1; sessions are HMAC-signed cookies.
+- Webhooks verify a 5-minute timestamp window; `webhook_deliveries` provides idempotency.
+- In production, configure via env vars / the wizard; never put secrets in `wrangler.toml`.
 
-## 已知限制 / 后续可做
+## Known limitations
 
-- 富文本/正文与附件通过 Resend 发送；回复时不支持「引用原文后编辑图片/内嵌图片」，仅普通文本引用。
-- 列表仍为单封平铺（会话聚合展示在详情内）；如需收件箱按会话折叠可扩展。
-- 超大正文仍存 D1；若邮件正文超大可扩展为按体积阈值落 R2。
+- Cloudflare Email Routing enforces a 25 MiB inbound limit (larger mail is rejected), so practical attachment size is ~18–19 MB.
+- The list is flat per message (thread aggregation lives inside the detail view).
+- Replies don't quote inline images, only plain-text quoting.
+- Single admin account only.
 
-## 升级老库（新增 thread_id / mailbox 后）
+## License
 
-```bash
-npm run db:migrate:up        # 一次性：为已存在的库加列、重建索引、回填 thread_id
-npm run db:migrate:up:local  # 本地开发同款
-```
-新装库直接 `npm run db:migrate` 即可，无需 up。
+MIT

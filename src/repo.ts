@@ -12,7 +12,7 @@ export interface PreparedAttachment {
 
 export interface InboundInput {
   rowId: string;
-  resendId: string;                          // Resend 的 email_id（入站幂等/去重）
+  resendId: string;                          // Resend's email_id (inbound idempotency/dedup)
   messageId: string | null;
   inReplyTo: string | null;
   references: string | null;
@@ -21,7 +21,7 @@ export interface InboundInput {
   fromName: string | null;
   fromEmail: string | null;
   to: string[];
-  /** 入站邮件的**投递地址（信封收件人）**；出站为 null。见 migrations/004_delivered_to.sql。 */
+  /** The **delivery address (envelope recipient)** of an inbound mail; null for outbound. See migrations/004_delivered_to.sql. */
   deliveredTo?: string[] | null;
   cc: string[];
   bcc: string[];
@@ -43,7 +43,7 @@ export interface OutboundInput {
   fromEmail: string | null;
   to: string[];
   cc: string[];
-  /** 密送。可选：老的调用方（及测试）不传时按空数组处理。 */
+  /** BCC. Optional: treated as an empty array when older callers (and tests) do not pass it. */
   bcc?: string[];
   subject: string | null;
   html: string | null;
@@ -56,9 +56,9 @@ const LIST_LIMIT = 50;
 const LIST_MAX = 200;
 
 /**
- * mailbox 为空串或 NULL 的行在「收件地址」维度归入这个显式分组。
- * 它与前端 public/app.js 的 UNKNOWN_MAILBOX 必须保持一致。
- * 这样 mailboxes() 覆盖全部行，保证「全部邮箱」计数 = 各分组计数之和。
+ * Rows with an empty-string or NULL mailbox fall into this explicit group on the "receiving address" dimension.
+ * It must stay consistent with UNKNOWN_MAILBOX in the frontend public/app.js.
+ * This way mailboxes() covers all rows, guaranteeing "all mailboxes" count = the sum of each group's count.
  */
 export const UNKNOWN_MAILBOX = '(未识别)';
 
@@ -74,7 +74,7 @@ export interface ListOpts {
 export interface FolderRow {
   id: string;
   direction: string;
-  /** 该行所属的收件信箱；乐观渲染信封卡时前端靠它显示「收至 …」，故必须随列表一起返回。 */
+  /** The receiving mailbox this row belongs to; the frontend relies on it to show "received to …" when optimistically rendering the envelope card, so it must be returned with the list. */
   mailbox: string | null;
   from_name: string | null;
   from_email: string | null;
@@ -86,19 +86,19 @@ export interface FolderRow {
   starred: number;
   status: string;
   attachments_count: number;
-  /** 同一会话（thread）内的邮件数量；为 1 时表示独立邮件。 */
+  /** Number of messages in the same thread; 1 means a standalone message. */
   thread_count: number;
-  /** 同一会话内未读邮件数量；> 0 时列表行应标为未读。 */
+  /** Number of unread messages in the same thread; the list row should be marked unread when > 0. */
   thread_unread: number;
 }
 
-/** mailbox 过滤条件：空/NULL 分组用哨兵值匹配，其余按精确匹配（与 mailboxes() 口径一致）。 */
+/** mailbox filter condition: empty/NULL groups match via a sentinel value, the rest match exactly (consistent with mailboxes()). */
 function mailboxCond(mailbox: string): { sql: string; params: unknown[] } {
   if (mailbox === UNKNOWN_MAILBOX) return { sql: "(mailbox IS NULL OR mailbox = '')", params: [] };
   return { sql: 'mailbox = ?', params: [mailbox] };
 }
 
-/** 已存附件上传到 R2 后组装出的 DB 行参数已含于 attachments[]。 */
+/** The DB row params assembled after uploading stored attachments to R2 are already included in attachments[]. */
 function whereForFolder(
   folder: Folder,
   q: string | null | undefined,
@@ -143,15 +143,15 @@ const LIST_SELECT = `SELECT
   FROM messages m`;
 
 /**
- * 校正列表行的 `thread_count`，使其与阅读视图的会话面板口径一致。
+ * Correct a list row's `thread_count` so it matches the thread panel convention in the reading view.
  *
- * 列表的 `thread_count` 是 SQL 窗口 `COUNT(*)`（**原始行数**），而会话面板
- * （listThread → foldLoopbackCopies）会把「同一封物理邮件的回环副本」折叠掉。
- * 不校正就会出现用户报障的「左侧徽标 3 封、点开只有 2 封」。
+ * The list's `thread_count` is the SQL window `COUNT(*)` (**raw row count**), whereas the thread panel
+ * (listThread → foldLoopbackCopies) folds away "loopback copies of the same physical message".
+ * Without correction you get the user-reported bug "badge shows 3 on the left, but only 2 open".
  *
- * 单封会话（thread_count = 1）不可能含回环副本，跳过；只对页内多封会话补一次查询，
- * 拉齐每个会话的全部行后，用与面板**同一个** foldLoopbackCopies 折叠并回填封数。
- * （回环副本的判定与面板保持单一真源，不在 SQL 里另写一套平行逻辑。）
+ * A single-message thread (thread_count = 1) cannot contain a loopback copy, so skip it; only run an extra query for multi-message
+ * threads on the page, fetching all rows of each thread, then folding with the **same** foldLoopbackCopies and backfilling the message count.
+ * (Loopback copy determination keeps a single source of truth with the panel, not another parallel logic written in SQL.)
  */
 async function applyFoldedThreadCounts(env: Env, items: FolderRow[]): Promise<void> {
   const ids = items.filter((it) => (it.thread_count || 1) > 1).map((it) => it.id);
@@ -172,7 +172,7 @@ async function applyFoldedThreadCounts(env: Env, items: FolderRow[]): Promise<vo
       .all<ThreadRow & { pk: string }>()
   ).results;
 
-  // 行 id → 会话主键；会话主键 → 该会话全部行（折叠只按行属性判定，不依赖顺序）。
+  // Row id → thread primary key; thread primary key → all rows of that thread (folding is decided only on row attributes, not order).
   const pkOf = new Map<string, string>();
   const byPk = new Map<string, ThreadRow[]>();
   for (const r of rows) {
@@ -190,8 +190,8 @@ async function applyFoldedThreadCounts(env: Env, items: FolderRow[]): Promise<vo
 }
 
 export async function listFolder(env: Env, opts: ListOpts): Promise<{ items: FolderRow[]; total: number }> {
-  // unread 不在 whereForFolder 里处理，而是靠外部窗口函数算出的 thread_unread 过滤，
-  // 这样「只看未读」时能看到「包含未读邮件的整个 thread 的最新一封」，而不是仅那封未读本身。
+  // unread is not handled in whereForFolder, but filtered by the thread_unread computed by an outer window function,
+  // so "unread only" shows "the latest message of the whole thread containing unread mail", not just that unread message itself.
   const w = whereForFolder(opts.folder, opts.q, false, opts.mailbox);
   const whereSql = w.sql ? `WHERE ${w.sql}` : '';
   const unreadCond = opts.unread === true ? 'AND thread_unread > 0' : '';
@@ -249,19 +249,19 @@ export async function listFolder(env: Env, opts: ListOpts): Promise<{ items: Fol
     await env.DB.prepare(totalSql).bind(...w.params).first<{ n: number }>()
   )?.n ?? 0;
 
-  // 徽标封数与会话面板对齐（折叠回环副本）。见 applyFoldedThreadCounts。
+  // The badge count is aligned with the thread panel (fold loopback copies). See applyFoldedThreadCounts.
   await applyFoldedThreadCounts(env, items);
 
   return { items, total: totalRow };
 }
 
-/* ---------------- 草稿箱 ----------------
- * 草稿存在独立的 drafts 表（理由见 schema.sql 的建表注释）：
- * 没有投递语义（无 message_id / thread_id / status / resend_id），
- * 混进 messages 会让每个文件夹查询都不得不多带一个「排除草稿」条件。
+/* ---------------- Drafts ----------------
+ * Drafts live in a separate drafts table (reason in the table creation comment in schema.sql):
+ * they have no delivery semantics (no message_id / thread_id / status / resend_id),
+ * and mixing them into messages would force every folder query to carry an extra "exclude drafts" condition.
  */
 
-/** drafts 表的一行。 */
+/** A row of the drafts table. */
 export interface DraftRow {
   id: string;
   mailbox: string;
@@ -293,11 +293,11 @@ export interface DraftInput {
 }
 
 /**
- * 草稿列表。
+ * Draft list.
  *
- * 返回形状**刻意与 listFolder 一致**（伪装成一封 `direction='draft'` 的邮件）：
- * 前端的列表渲染、缓存指纹、分页、搜索都能原样复用，只有「点开是写信弹窗而非详情」
- * 这一处分叉。`received_at` 用 `updated_at` 填充 —— 草稿的排序语义是「最后修改时间」。
+ * The returned shape is **deliberately identical to listFolder** (disguised as a message with `direction='draft'`):
+ * the frontend's list rendering, cache fingerprint, paging, and search can all be reused as-is, with only the "opening it shows
+ * a compose dialog instead of a detail" branch differing. `received_at` is filled with `updated_at` — a draft's ordering semantics is "last modified time".
  */
 export async function listDrafts(
   env: Env,
@@ -341,7 +341,7 @@ export async function listDrafts(
     to_emails: r.to_emails,
     preview: r.preview,
     received_at: r.updated_at,
-    read: 1, // 草稿没有未读语义
+    read: 1, // drafts have no unread semantics
     starred: 0,
     status: 'draft',
     attachments_count: 0,
@@ -355,7 +355,7 @@ export async function getDraft(env: Env, id: string): Promise<DraftRow | null> {
   return (await env.DB.prepare('SELECT * FROM drafts WHERE id = ?').bind(id).first<DraftRow>()) ?? null;
 }
 
-/** 新建或覆盖草稿。前端在打开写信弹窗时就生成了 id，自动保存直接 upsert，省一次往返。 */
+/** Create or overwrite a draft. The frontend generates the id when opening the compose dialog, and autosave upserts directly, saving one round trip. */
 export async function upsertDraft(env: Env, d: DraftInput): Promise<void> {
   const now = nowSec();
   await env.DB.prepare(
@@ -412,8 +412,8 @@ export async function sidebarCounts(env: Env, mailbox?: string): Promise<{
     params.push(...c.params);
   }
   const whereSql = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
-  // 草稿在独立表里（见 schema.sql 的 drafts 说明），但**沿用同一套 mailbox 过滤条件**，
-  // 否则「全部邮箱」计数 = 各分组计数之和这条不变量会在草稿上破功。
+  // Drafts live in a separate table (see the drafts notes in schema.sql), but **reuse the same mailbox filter condition**,
+  // otherwise the invariant "all mailboxes count = sum of each group's count" would break on drafts.
   const [row, draftRow] = await Promise.all([
     env.DB.prepare(
       `SELECT
@@ -440,13 +440,13 @@ export async function sidebarCounts(env: Env, mailbox?: string): Promise<{
 }
 
 /**
- * 收件地址列表（含各地址未读数/总数），用于侧边栏切换。
- * 覆盖**全部**行：mailbox 为空串/NULL 的归入 UNKNOWN_MAILBOX 分组，不再被静默丢弃，
- * 从而保证「全部邮箱」计数（sidebarCounts 无 mailbox 参数）=== 各分组计数之和（BUG-3b）。
+ * Receiving address list (with each address's unread count/total), for sidebar switching.
+ * Covers **all** rows: empty-string/NULL mailbox falls into the UNKNOWN_MAILBOX group, no longer silently dropped,
+ * thus guaranteeing "all mailboxes" count (sidebarCounts with no mailbox arg) === the sum of each group's count (BUG-3b).
  *
- * 性能：GROUP BY 用**原始列** `mailbox`（idx_messages_counts 的前导列），可被覆盖索引的有序扫描
- * 直接满足，不再产生 `TEMP B-TREE FOR GROUP BY`（实测 20000 行 100ms → 4.0ms）。
- * 空串/NULL 的归一化在 SELECT 里标成哨兵、并在 JS 里按哨兵 key 合并（NULL 与 '' 若同时出现会得到两行）。
+ * Performance: GROUP BY uses the **raw column** `mailbox` (the leading column of idx_messages_counts), which can be satisfied directly
+ * by an ordered scan of the covering index, no longer producing `TEMP B-TREE FOR GROUP BY` (measured 20000 rows 100ms → 4.0ms).
+ * Empty-string/NULL normalization is marked as a sentinel in the SELECT and merged by sentinel key in JS (if NULL and '' appear together they produce two rows).
  */
 export async function mailboxes(env: Env): Promise<
   Array<{ mailbox: string; inbox_unread: number; inbox_total: number; sent_total: number }>
@@ -463,7 +463,7 @@ export async function mailboxes(env: Env): Promise<
      ORDER BY inbox_unread DESC, mailbox ASC`
   ).bind(UNKNOWN_MAILBOX).all<{ mailbox: string | null; inbox_unread: number | null; inbox_total: number | null; sent_total: number | null }>();
 
-  // 合并 '' / NULL 归入的哨兵分组（GROUP BY 原始列时二者是不同分组，可能各返回一行）。
+  // Merge the '' / NULL sentinel group (with GROUP BY on the raw column the two are different groups and may each return a row).
   const merged = new Map<string, { mailbox: string; inbox_unread: number; inbox_total: number; sent_total: number }>();
   for (const r of rows.results) {
     const key = r.mailbox === null || r.mailbox === '' ? UNKNOWN_MAILBOX : r.mailbox;
@@ -482,7 +482,7 @@ export async function mailboxes(env: Env): Promise<
     }
   }
   const out = [...merged.values()];
-  // 合并会打乱 SQL 的排序（未读降序），按同一口径在 JS 里重排；分组数为 0 时返回空数组（不凭空造组）。
+  // Merging disrupts the SQL ordering (unread descending), so re-sort in JS with the same convention; return an empty array when the group count is 0 (no inventing groups).
   out.sort((a, b) => (b.inbox_unread - a.inbox_unread) || (a.mailbox < b.mailbox ? -1 : a.mailbox > b.mailbox ? 1 : 0));
   return out;
 }
@@ -490,37 +490,37 @@ export async function mailboxes(env: Env): Promise<
 export interface ContactRow {
   name: string | null;
   email: string;
-  /** 往来次数（收件箱 + 发件箱），用于把常用联系人排前面。 */
+  /** Interaction count (inbox + sent), used to put frequent contacts first. */
   count: number;
 }
 
 /**
- * 本地联系人（供收件人输入联想）：从已有邮件往来里聚合，不需要额外的地址簿表。
+ * Local contacts (for recipient input suggestions): aggregated from existing mail correspondence, no extra address-book table needed.
  *
- * - **邮箱**：入站 `from_email` + 出站/入站 `to_emails` / `cc`（JSON 数组，用 `json_each` 展开）。
- * - **姓名**：只可能来自入站 `from_name`（出站我们只存裸地址）。
- *   同一地址取**最新一封带姓名**的邮件里的写法 —— 靠 SQLite「裸列与 min()/max() 同取一行」的规则。
+ * - **Emails**: inbound `from_email` + outbound/inbound `to_emails` / `cc` (JSON arrays, expanded with `json_each`).
+ * - **Names**: can only come from inbound `from_name` (for outbound we store only the bare address).
+ *   For the same address take the spelling from the **latest mail with a name** — relying on SQLite's rule that "a bare column and min()/max() take the same row".
  *
- * ⚠️ 关于那条裸列规则（2026-10-03 在真实 SQLite 3.51.2 上实测）：
- *   文档写的是「**恰好一个** min()/max() 聚合时裸列才取该行」，但实测**更宽松**：
- *   同时存在 `COUNT(*)` / `SUM(...)` 时，裸列**仍然**取 max 那一行。
- *   也就是说「多加一个聚合」并**不会**让这段查询出错 —— 但这属于未文档化的宽松行为，
- *   不要依赖它，也不要据此去改这段 SQL。真正会把它改坏的是**方向**：
- *   换成 `MIN(received_at)`，或把姓名写成 `MAX(from_name)`（取字典序最大而非最新），
- *   两种写法都会静默返回错误的姓名（`test/contacts.backend.test.js` 的 C2 分别覆盖）。
- * - **不排除自己的收件信箱**（2026-10-03 用户决定）：`mailbox` 列里既有「我自己的身份」，
- *   也可能有**同事/团队的地址**（例如账号给 `zhanglili@` 配了收信）—— 这些地址用户**本来就想发信**。
- *   早期版本按 `DISTINCT mailbox` 全部排除，导致这类同事地址在联想里**静默消失**（用户报障）。
- *   现在自己的地址也会出现在联想里（用户明确表示「也可以给自己发」）。
+ * ⚠️ About that bare-column rule (measured on real SQLite 3.51.2 on 2026-10-03):
+ *   the docs say a bare column takes that row only when there is **exactly one** min()/max() aggregate, but measurement shows it is **more lenient**:
+ *   when `COUNT(*)` / `SUM(...)` are also present, the bare column **still** takes the max row.
+ *   That is, "adding one more aggregate" does **not** break this query — but this is undocumented lenient behavior,
+ *   so do not rely on it, and do not change this SQL based on it. What really breaks it is the **direction**:
+ *   switching to `MIN(received_at)`, or writing the name as `MAX(from_name)` (taking the lexicographically largest rather than the latest),
+ *   both silently return the wrong name (test/contacts.backend.test.js C2 covers each).
+ * - **Do not exclude your own receiving mailbox** (user decision on 2026-10-03): the `mailbox` column contains both "my own identity"
+ *   and possibly **colleagues'/team addresses** (e.g. an account configured to receive at `erin@`) — the user **wants to send** to these addresses anyway.
+ *   Early versions excluded all of them by `DISTINCT mailbox`, causing such colleague addresses to **silently disappear** from suggestions (user-reported bug).
+ *   Now your own addresses also appear in suggestions (the user explicitly said "you can send to yourself too").
  *
- * ⚠️ 关于 `json_each` 的两个实测事实（2026-10-03 在真实 SQLite 上验过）：
- *   1. `json_each(NULL)` / `json_each('[]')` 都是 **0 行**（不会造出空地址）；
- *   2. 但 `json_each('')` / 任何非法 JSON 会**直接抛 `malformed JSON`**，
- *      而且 `WHERE` 里的判断**拦不住它** —— 表值函数在 JOIN 阶段就求值了，早于 WHERE。
- *      实测 `FROM messages, json_each(cc) WHERE trim(cc) <> ''` 遇到 `cc = ''` 仍然抛错。
- *   所以「是不是合法 JSON 数组」必须写进 `json_each` 的**参数表达式**里（下面的 arrayArg），
- *   顺带排除 `'{}'` / `'123'` / `'null'` 这类合法但非数组的 JSON，否则会造出 `'123'` 这种幽灵联系人。
- *   （`json_type()` 不能用在这里：`json_type('')` 本身就会抛错。）
+ * ⚠️ Two measured facts about `json_each` (verified on real SQLite on 2026-10-03):
+ *   1. `json_each(NULL)` / `json_each('[]')` are both **0 rows** (no empty address is produced);
+ *   2. but `json_each('')` / any invalid JSON **directly throws `malformed JSON`**,
+ *      and a check in `WHERE` **cannot stop it** — the table-valued function is evaluated at the JOIN stage, earlier than WHERE.
+ *      Measured: `FROM messages, json_each(cc) WHERE trim(cc) <> ''` still throws when `cc = ''`.
+ *   So "is it a valid JSON array" must be written into `json_each`'s **argument expression** (the arrayArg below),
+ *   which also excludes valid-but-non-array JSON like `'{}'` / `'123'` / `'null'`, otherwise it would produce ghost contacts like `'123'`.
+ *   (`json_type()` cannot be used here: `json_type('')` itself throws.)
  */
 export async function contacts(env: Env, limit = 500): Promise<ContactRow[]> {
   const arrayArg = (col: string) =>
@@ -563,11 +563,11 @@ export async function contacts(env: Env, limit = 500): Promise<ContactRow[]> {
 }
 
 /**
- * 会话行的形状（阅读视图的上下文条目）。
+ * The shape of a thread row (a context entry in the reading view).
  *
- * ⚠️ `copy_ids` **不是 DB 列** —— 它是 `foldLoopbackCopies()` 折叠时挂上来的
- * 「同一封物理邮件的其它记录 id」。前端靠它把「当前打开的正好是被折叠的那份副本」
- * 也算作当前行，否则会话面板里没有任何一行高亮，看起来像「我打开的那封不见了」。
+ * ⚠️ `copy_ids` **is not a DB column** — it is "the other record ids of the same physical message" attached by `foldLoopbackCopies()`
+ * when folding. The frontend uses it to count "the currently open one being exactly the folded copy"
+ * as the current row too, otherwise no row in the thread panel is highlighted, looking like "the one I opened is gone".
  */
 export interface ThreadRow {
   id: string;
@@ -576,7 +576,7 @@ export interface ThreadRow {
   from_name: string | null;
   from_email: string | null;
   to_emails: string;
-  /** 真实 Cc / Bcc 头（JSON 数组文本，可能为 NULL）。折叠回环副本要靠它。 */
+  /** Real Cc / Bcc headers (JSON array text, may be NULL). Folding loopback copies relies on them. */
   cc: string | null;
   bcc: string | null;
   subject: string | null;
@@ -587,14 +587,14 @@ export interface ThreadRow {
   copy_ids?: string[];
 }
 
-/** 回环副本的时间窗（秒）。线上实测出站/回环两条的入库时间差只有 1~2 秒。 */
+/** Time window (seconds) for loopback copies. Production measured only 1~2 seconds between the outbound and loopback store times. */
 const LOOPBACK_WINDOW_SEC = 300;
 
 function normAddr(v: string | null | undefined): string {
   return String(v ?? '').trim().toLowerCase();
 }
 
-/** 某行的全部收件人（to + cc + bcc，小写归一）。 */
+/** All recipients of a row (to + cc + bcc, normalized lowercase). */
 function rowRecipients(row: ThreadRow): string[] {
   return [...jsonArr(row.to_emails), ...jsonArr(row.cc), ...jsonArr(row.bcc)]
     .map(normAddr)
@@ -602,35 +602,35 @@ function rowRecipients(row: ThreadRow): string[] {
 }
 
 /**
- * 折叠「同一封物理邮件在本账号内的回环副本」。
+ * Fold "loopback copies of the same physical message within this account".
  *
- * 背景（2026-10-08 生产数据实测）：账号下配了多个收信信箱（bingfeng@ / support@ / zhanglili@）。
- * 用 bingfeng@ 发一封给外部收件人、**并抄送 zhanglili@** 时，Resend 会把同一封邮件投递回
- * zhanglili@，于是库里留下两条记录：
- *   - 出站：`to=[lara@…]` `cc=[zhanglili@…]`        —— 我发出的副本
- *   - 入站：`mailbox=zhanglili@` `from=bingfeng@` `to=[lara@…]` `cc=[zhanglili@…]`
- *                                                    —— 投递回本账号的副本
- * 二者 from / to / cc / 主题 / in_reply_to 完全相同、入库时间只差 1~2 秒；会话面板的时间
- * 精确到分钟 → 两行**逐字相同**，用户看到的就是「同一封信显示了两次」。
+ * Background (measured on production data 2026-10-08): several receiving mailboxes are configured under the account (dana@ / support@ / erin@).
+ * When dana@ sends to an external recipient and **also cc's erin@**, Resend delivers the same message back to
+ * erin@, so two records are left in the DB:
+ *   - outbound: `to=[frank@…]` `cc=[erin@…]`        —— the copy I sent
+ *   - inbound: `mailbox=erin@` `from=dana@` `to=[frank@…]` `cc=[erin@…]`
+ *                                                    —— the copy delivered back to this account
+ * The two have identical from / to / cc / subject / in_reply_to and store times only 1~2 seconds apart; the thread panel's time
+ * is precise to the minute → the two rows are **verbatim identical**, so the user sees "the same message shown twice".
  *
- * 判定「某条入站行是某条出站行的回环副本」需**同时**满足：
- *   ① 同一会话（调用方已按 thread_id 过滤）；
- *   ② `from_email` 相同且非空 —— 副本的发件人就是我们自己的发信身份；
- *   ③ 入站行的**投递信箱**（`mailbox`）出现在该出站行的 to/cc/bcc 里 —— 我发给谁，就从谁那里回来；
- *   ④ 入库时间相差不超过 LOOPBACK_WINDOW_SEC。
- * 四条一起卡住才折叠：真实来信（发件人是对方）不满足 ②；对方稍后回信不满足 ④；
- * 投递给**非本账号**地址的邮件不满足 ③。任何一条不成立都原样保留。
+ * Determining "some inbound row is a loopback copy of some outbound row" requires **simultaneously**:
+ *   ① the same thread (the caller has already filtered by thread_id);
+ *   ② `from_email` identical and non-empty — the copy's sender is our own sending identity;
+ *   ③ the inbound row's **delivery mailbox** (`mailbox`) appears in that outbound row's to/cc/bcc — whoever I sent to, it comes back from;
+ *   ④ store times differ by no more than LOOPBACK_WINDOW_SEC.
+ * All four must hold to fold: a real incoming mail (sender is the other party) fails ②; the other party replying later fails ④;
+ * mail delivered to an address **not in this account** fails ③. If any one does not hold, it is kept as-is.
  *
- * 折叠方向固定为「留出站、去入站」：会话面板回答的是「这封信的往来」，而不是
- * 「每个信箱各自收到了什么」—— 被折叠的那份在 zhanglili@ 自己的收件箱里照常显示。
+ * The folding direction is fixed as "keep outbound, drop inbound": the thread panel answers "the correspondence of this message", not
+ * "what each mailbox individually received" — the folded copy still shows normally in erin@'s own inbox.
  *
- * 副作用：被折叠行若有未读，把留存行的 `read` 置 0 —— 否则折叠会静默吞掉一个未读信号。
+ * Side effect: if a folded row was unread, set the surviving row's `read` to 0 — otherwise folding would silently swallow an unread signal.
  */
 export function foldLoopbackCopies(rows: ThreadRow[]): ThreadRow[] {
   const outbounds = rows.filter((r) => r.direction === 'outbound');
   if (!outbounds.length) return rows;
 
-  const copyOf = new Map<string, string>(); // 入站副本 id -> 出站行 id
+  const copyOf = new Map<string, string>(); // inbound copy id -> outbound row id
   const kept = rows.filter((r) => {
     if (r.direction !== 'inbound') return true;
     const from = normAddr(r.from_email);
@@ -658,10 +658,10 @@ export function foldLoopbackCopies(rows: ThreadRow[]): ThreadRow[] {
 }
 
 /**
- * 同一会话内的消息，**降序（最近在前）**，用于阅读视图上下文。
- * 返回前已折叠「同一封物理邮件的回环副本」（见 `foldLoopbackCopies`）。
+ * Messages within the same thread, **descending (most recent first)**, for the reading view context.
+ * Loopback copies of "the same physical message" are folded before returning (see `foldLoopbackCopies`).
  *
- * `id DESC` 只作同一秒内的稳定次序，不承担业务含义。
+ * `id DESC` only provides a stable order within the same second and carries no business meaning.
  */
 export async function listThread(env: Env, threadId: string): Promise<ThreadRow[]> {
   const rows = await env.DB.prepare(
@@ -681,7 +681,7 @@ export async function getMessage(env: Env, id: string): Promise<MessageRow | nul
   );
 }
 
-/** 按 Resend email_id 查找已入库的入站邮件（去重用）。 */
+/** Look up an already-stored inbound mail by Resend email_id (for dedup). */
 export async function findInboundByResendId(env: Env, emailId: string): Promise<string | null> {
   const row = await env.DB.prepare(
     "SELECT id FROM messages WHERE direction = 'inbound' AND resend_id = ? LIMIT 1"
@@ -824,12 +824,12 @@ function insertMessageStmt(env: Env, row: {
   receivedAt: number;
   status: string;
   resendId: string | null;
-  /** 已读态。缺省：**出站=1**（自己发出的邮件不存在「未读」语义），入站=0。 */
+  /** Read state. Default: **outbound=1** (mail you sent has no "unread" semantics), inbound=0. */
   read?: number;
 }): D1PreparedStatement {
-  // 出站邮件默认已读：sent 文件夹里不该出现未读。
-  // 历史上 read 被硬编码成 0，导致全部已发送邮件在列表里显示未读、且点开也不会变
-  // （syncOpenedReadState 只处理入站），用户侧表现为「发件箱全是未读」。
+  // Outbound mail defaults to read: no unread should appear in the sent folder.
+  // Historically read was hardcoded to 0, making all sent mail show as unread in the list and stay that way when opened
+  // (syncOpenedReadState only handles inbound), surfacing as "the sent folder is all unread".
   const read = row.read ?? (row.direction === 'outbound' ? 1 : 0);
   return env.DB.prepare(
     `INSERT INTO messages
@@ -864,7 +864,7 @@ function insertMessageStmt(env: Env, row: {
   );
 }
 
-/** 入站消息 + 附件 + webhook 幂等记录，在同一个 D1 批事务里原子写入。 */
+/** Inbound message + attachments + webhook idempotency record, written atomically in the same D1 batch transaction. */
 export async function saveInbound(env: Env, input: InboundInput, deliveryEventId: string): Promise<void> {
   const stmts: D1PreparedStatement[] = [
     insertMessageStmt(env, {
@@ -937,7 +937,7 @@ export async function saveOutbound(env: Env, input: OutboundInput): Promise<stri
   return rowId;
 }
 
-/** 为某封邮件追加附件记录（出站附件已在 R2）。 */
+/** Append attachment records for a message (outbound attachments are already in R2). */
 export async function insertOutboundAttachments(env: Env, messageId: string, files: Array<{ filename: string; contentType: string; size: number; r2Key: string }>): Promise<void> {
   if (!files.length) return;
   const stmts = files.map((f) =>
@@ -949,7 +949,7 @@ export async function insertOutboundAttachments(env: Env, messageId: string, fil
   await env.DB.batch(stmts);
 }
 
-/** 附件元数据表存在性（供代理读取用）。 */
+/** Whether the attachment metadata table exists (for proxy reads). */
 export async function getAttachment(env: Env, id: string): Promise<AttachmentRow | null> {
   return (
     (await env.DB.prepare('SELECT * FROM attachments WHERE id = ?').bind(id).first<AttachmentRow>()) ?? null
@@ -957,16 +957,16 @@ export async function getAttachment(env: Env, id: string): Promise<AttachmentRow
 }
 
 /**
- * 该类型能不能**内联**给浏览器预览（而不是强制下载）。
+ * Whether this type can be **inlined** for browser preview (rather than forced download).
  *
- * 只放行「浏览器原生能渲染、且不会在本域执行脚本」的类型：
- *  - 图片：`image/*`，**但排除 SVG** —— SVG 能带 `<script>`，内联等于把任意发件人的
- *    脚本放进本应用的同源上下文执行（XSS）；
- *  - `application/pdf` / `video/*` / `audio/*`：浏览器原生查看器，业界邮件客户端标准做法；
- *  - 纯文本类：只放行 `text/plain` / `text/csv` / `text/markdown` / `application/json`，
- *    其余 `text/*`（尤其 `text/html`、`text/xml`）一律下载。
+ * Only allow types "the browser can natively render and that do not execute scripts in this origin":
+ *  - Images: `image/*`, **but excluding SVG** — SVG can carry `<script>`, and inlining it means executing any sender's
+ *    script in this app's same-origin context (XSS);
+ *  - `application/pdf` / `video/*` / `audio/*`: native browser viewers, the industry standard for mail clients;
+ *  - Plain-text types: only allow `text/plain` / `text/csv` / `text/markdown` / `application/json`,
+ *    all other `text/*` (especially `text/html`, `text/xml`) are always downloaded.
  *
- * 注意与 `proxyAttachment` 里的 `text/html → octet-stream` 降级配套：那道防线仍然在。
+ * Note it works with the `text/html → octet-stream` downgrade in `proxyAttachment`: that defense line is still there.
  */
 export function isInlinePreviewType(contentType: string): boolean {
   const t = (contentType || '').toLowerCase().split(';')[0].trim();
@@ -978,11 +978,11 @@ export function isInlinePreviewType(contentType: string): boolean {
 }
 
 /**
- * 附件代理。
+ * Attachment proxy.
  *
- * `opts.forceDownload` 对应 `?dl=1`：无论类型一律 `Content-Disposition: attachment`
- * —— 前端每个附件都配了独立「下载」按钮，走的就是这个参数；不带参数时按
- * `isInlinePreviewType()` 决定内联（可预览）还是下载。
+ * `opts.forceDownload` corresponds to `?dl=1`: regardless of type, always `Content-Disposition: attachment`
+ * — every attachment in the frontend has its own "download" button that uses this parameter; without the parameter,
+ * `isInlinePreviewType()` decides inline (previewable) vs. download.
  */
 export async function proxyAttachment(
   env: Env,
@@ -997,7 +997,7 @@ export async function proxyAttachment(
   const type = row.content_type && !row.content_type.startsWith('text/html')
     ? row.content_type
     : 'application/octet-stream';
-  // 可预览类型内联给浏览器渲染；其余（含 SVG / HTML）一律下载，防止把用户上传内容当页面打开。
+  // Previewable types are inlined for browser rendering; the rest (including SVG / HTML) are always downloaded, to avoid opening user-uploaded content as a page.
   const inline = !opts.forceDownload && isInlinePreviewType(type);
   const headers = new Headers();
   headers.set('Content-Type', type);
@@ -1010,9 +1010,9 @@ export async function proxyAttachment(
   return new Response(obj.body, { headers });
 }
 
-/* ---------------- 入站异常看板（CF 入向「收了但没进收件箱」的可见性） ---------------- */
+/* ---------------- Inbound alerts dashboard (visibility for CF inbound "received but not in the inbox") ---------------- */
 
-/** 一条「入站异常」的对外形状。 */
+/** The external shape of an "inbound alert". */
 export interface InboundAlert {
   id: string;
   from: string | null;
@@ -1022,19 +1022,19 @@ export interface InboundAlert {
   received_at: number;
   error: string | null;
   attempts: number;
-  /** true = 仍在重试/待处理（尚无 error）；false = 已判定失败。 */
+  /** true = still retrying/pending (no error yet); false = determined to have failed. */
   pending: boolean;
 }
 
-/** 超过这个秒数仍未解析完成，就算「卡住」而不是「正在处理」。 */
+/** If parsing is not finished after this many seconds, it counts as "stuck" rather than "processing". */
 const INBOUND_PENDING_GRACE_SEC = 600;
 
 /**
- * 列出「入站异常」：要么已记 error，要么收到超过 10 分钟仍没解析完成。
+ * List "inbound alerts": either an error is recorded, or it was received more than 10 minutes ago and still not parsed.
  *
- * 收信路径已保证原始件在 R2、索引在 inbound_raw —— 这个列表把这些「没进收件箱」的邮件
- * **暴露到界面上**（否则它们只是后台日志，用户永远不知道丢了什么）。
- * 已入库（message_row 非空）的不算异常。
+ * The receiving path already guarantees the raw message is in R2 and the index in inbound_raw — this list **exposes** these
+ * "not in the inbox" messages **to the UI** (otherwise they are just backend logs and the user never knows what was lost).
+ * Already-stored ones (message_row non-empty) do not count as alerts.
  */
 export async function listInboundAlerts(env: Env, limit = 50): Promise<InboundAlert[]> {
   const rows = await env.DB.prepare(
@@ -1070,14 +1070,14 @@ export async function listInboundAlerts(env: Env, limit = 50): Promise<InboundAl
   }));
 }
 
-/** 取一条 inbound_raw 索引行。 */
+/** Fetch one inbound_raw index row. */
 export async function getInboundRaw(env: Env, id: string): Promise<InboundRawRow | null> {
   return env.DB.prepare('SELECT * FROM inbound_raw WHERE id = ?').bind(id).first<InboundRawRow>();
 }
 
 /**
- * 手动重放一条入站异常：清掉 error、归零 attempts、`parsed_at` 置 NULL，再入队重解析。
- * 幂等由消费者保证（message_row / findInboundByResendId）。
+ * Manually replay an inbound alert: clear error, zero attempts, set `parsed_at` to NULL, then enqueue for reparsing.
+ * Idempotency is guaranteed by the consumer (message_row / findInboundByResendId).
  */
 export async function retryInbound(env: Env, id: string): Promise<boolean> {
   const row = await env.DB.prepare('SELECT id FROM inbound_raw WHERE id = ?')
@@ -1091,7 +1091,7 @@ export async function retryInbound(env: Env, id: string): Promise<boolean> {
   return true;
 }
 
-/** 把某封入站异常的**原始 .eml** 取出来给用户下载（收件箱里没有时的兜底）。 */
+/** Fetch an inbound alert's **raw .eml** for the user to download (fallback when it is not in the inbox). */
 export async function proxyInboundRaw(env: Env, id: string): Promise<Response | null> {
   const row = await getInboundRaw(env, id);
   if (!row) return null;
@@ -1106,51 +1106,51 @@ export async function proxyInboundRaw(env: Env, id: string): Promise<Response | 
   return new Response(obj.body, { headers });
 }
 
-/* ---------------- 后端基础状态（CF 存储/入站 + Resend 额度），前端一屏看清、提前知道何时该升级 ----------------
- * 免费档容量：CF D1 单库 500MB、R2 10GB；Resend 100 封/天、3000 封/月。
- * 存储只能**估算**：
- *   · D1：无 pragma 权限（页面/文件大小读不到）、也没有数据库大小 API → 累计各表 TEXT/BLOB 列的
- *     UTF-8 字节。注意 `LENGTH(文本)` 按**字符**算、必须 `CAST(x AS BLOB)` 才按字节。
- *   · R2：没有「桶大小」接口 → 列举对象逐个累加 size。
- * 两者都不便宜（D1 全表扫描、R2 列举按 Class A 计费），故结果缓存进 app_stats，默认 6 小时才重算。
- * 入站计数（inbound_raw COUNT）与发信额度（messages COUNT）很便宜，每次实时算。
+/* ---------------- Backend base status (CF storage/inbound + Resend quota), giving the frontend one screen and advance warning of when to upgrade ----------------
+ * Free tier capacity: CF D1 500MB per DB, R2 10GB; Resend 100/day, 3000/month.
+ * Storage can only be **estimated**:
+ *   · D1: no pragma permission (page/file sizes are unreadable) and no DB size API → sum the UTF-8 bytes of the TEXT/BLOB columns
+ *     of each table. Note `LENGTH(text)` counts **characters**, so it must be `CAST(x AS BLOB)` to count bytes.
+ *   · R2: no "bucket size" API → list objects and sum their sizes.
+ * Both are expensive (D1 full scan, R2 listing billed as Class A), so results are cached in app_stats and only recomputed after 6 hours by default.
+ * The inbound count (inbound_raw COUNT) and send quota (messages COUNT) are cheap and computed in real time every time.
  */
 
-/** 免费档容量上限（字节）。付费档用 env.D1_LIMIT_BYTES / env.R2_LIMIT_BYTES 覆盖。 */
+/** Free tier capacity limits (bytes). Paid tiers override with env.D1_LIMIT_BYTES / env.R2_LIMIT_BYTES. */
 const D1_FREE_LIMIT = 500 * 1024 * 1024;
 const R2_FREE_LIMIT = 10 * 1024 * 1024 * 1024;
-/** Resend 免费档发信额度（封/天、封/月）。付费档用 env.RESEND_DAY_LIMIT / RESEND_MONTH_LIMIT 覆盖。 */
+/** Resend free tier send quota (messages/day, messages/month). Paid tiers override with env.RESEND_DAY_LIMIT / RESEND_MONTH_LIMIT. */
 const RESEND_DAY_FREE = 100;
 const RESEND_MONTH_FREE = 3000;
-/** 用量缓存时长（秒）：到期后下次请求才重算，避免每次开页面都全表扫描 / 列举对象。 */
+/** Usage cache duration (seconds): recomputed on the next request after expiry, to avoid a full scan / object listing on every page open. */
 const USAGE_TTL_SEC = 6 * 3600;
-/** 列举 R2 的安全阀：最多翻这么多页（每页 1000），防止对象极多时请求超时。 */
+/** Safety valve for listing R2: at most this many pages (1000 each), preventing a request timeout when there are very many objects. */
 const R2_LIST_MAX_PAGES = 100;
 
-/** 后端基础状态：CF（D1/R2 占用 + 入站队列）+ Resend（发信额度），供前端一屏看清。 */
+/** Backend base status: CF (D1/R2 usage + inbound queue) + Resend (send quota), for the frontend's one-screen view. */
 export interface BackendStatus {
   d1: { usedBytes: number; limitBytes: number; percent: number };
   r2: { usedBytes: number; limitBytes: number; percent: number; objects: number };
-  /** CF 入向流水线状态（never-lose）：待解析 / 异常 / 累计收信。 */
+  /** CF inbound pipeline status (never-lose): pending parse / alerts / cumulative received. */
   inbound: { pending: number; alerts: number; total: number };
-  /** Resend 出向额度：今日 / 本月已发的封数（按我们自己的出站记录估算）。 */
+  /** Resend outbound quota: messages sent today / this month (estimated from our own outbound records). */
   resend: {
     configured: boolean;
     day: { used: number; limit: number; percent: number };
     month: { used: number; limit: number; percent: number };
   };
-  /** 存储数据时间（D1 / R2 两次采样里较早的 updated_at，秒）。 */
+  /** Storage data time (the earlier updated_at of the two D1 / R2 samples, in seconds). */
   updatedAt: number;
-  /** D1/R2 是估算值（见上方说明），前端应标注「约」。 */
+  /** D1/R2 are estimates (see the notes above); the frontend should mark them "approx.". */
   approximate: boolean;
 }
 
 function pct(used: number, limit: number): number {
   if (!limit) return 0;
-  return Math.round((used / limit) * 1000) / 10; // 保留一位小数
+  return Math.round((used / limit) * 1000) / 10; // keep one decimal place
 }
 
-/** 汇总各表 TEXT/BLOB 列的 UTF-8 字节数，作为 D1 占用的估算（真实文件含索引/pages 会略大）。 */
+/** Sum the UTF-8 bytes of each table's TEXT/BLOB columns as an estimate of D1 usage (the real file includes indexes/pages and will be slightly larger). */
 async function estimateD1Bytes(env: Env): Promise<number> {
   const tables = await env.DB.prepare(
     `SELECT name FROM sqlite_master
@@ -1175,7 +1175,7 @@ async function estimateD1Bytes(env: Env): Promise<number> {
   return total;
 }
 
-/** 列举整个 R2 桶，累加对象大小与个数。 */
+/** List the entire R2 bucket, accumulating object sizes and count. */
 async function measureR2(env: Env): Promise<{ bytes: number; objects: number }> {
   let cursor: string | undefined;
   let bytes = 0;
@@ -1193,7 +1193,7 @@ async function measureR2(env: Env): Promise<{ bytes: number; objects: number }> 
   return { bytes, objects };
 }
 
-/** CF 入向流水线状态：待解析（parsed_at IS NULL）、异常（与提示条同口径）、累计收信。 */
+/** CF inbound pipeline status: pending parse (parsed_at IS NULL), alerts (same convention as the notice bar), cumulative received. */
 async function inboundStatus(env: Env): Promise<{ pending: number; alerts: number; total: number }> {
   const pending = await env.DB.prepare('SELECT COUNT(*) AS n FROM inbound_raw WHERE parsed_at IS NULL')
     .first<{ n: number }>();
@@ -1209,9 +1209,9 @@ async function inboundStatus(env: Env): Promise<{ pending: number; alerts: numbe
 }
 
 /**
- * Resend 出向额度用量：统计我们自己发出（resend_id 非空）的封数。
- * 免费档 100/天、3000/月，UTC 0 点与月初重置。注意：只统计经本服务发出的，
- * 若同一 Resend 账号还从别处发信，这里会偏低。
+ * Resend outbound quota usage: count the messages we ourselves sent (resend_id non-empty).
+ * Free tier is 100/day, 3000/month, resetting at UTC midnight and the start of the month. Note: it only counts what this service sent;
+ * if the same Resend account also sends from elsewhere, this will be low.
  */
 async function resendUsage(env: Env): Promise<{ day: number; month: number }> {
   const now = nowSec();
@@ -1246,8 +1246,8 @@ async function writeStat(env: Env, key: string, value: number, at: number): Prom
 }
 
 /**
- * 取后端基础状态：CF（D1/R2 占用 + 入站队列）+ Resend（发信额度）。
- * D1/R2 走缓存（`force` 强制重算）；入站计数与发信额度很便宜，每次实时算。
+ * Get the backend base status: CF (D1/R2 usage + inbound queue) + Resend (send quota).
+ * D1/R2 go through the cache (`force` forces recomputation); the inbound count and send quota are cheap and computed in real time every time.
  */
 export async function getBackendStatus(env: Env, opts: { force?: boolean } = {}): Promise<BackendStatus> {
   const now = nowSec();
@@ -1290,4 +1290,56 @@ export async function getBackendStatus(env: Env, opts: { force?: boolean } = {})
     updatedAt: Math.min(d1?.updated_at ?? now, r2?.updated_at ?? now),
     approximate: true,
   };
+}
+
+/* ---------------- Setup wizard / auth (app_config + users) ---------------- */
+
+/** Read one app config entry (key/value written by the wizard). Returns null if absent. */
+export async function getConfig(env: Env, key: string): Promise<string | null> {
+  const row = await env.DB.prepare('SELECT value FROM app_config WHERE key = ?').bind(key).first<{ value: string | null }>();
+  return row ? row.value : null;
+}
+
+/** Read all config at once (needed for wizard status and self-check). */
+export async function getConfigMap(env: Env): Promise<Record<string, string>> {
+  const { results } = await env.DB.prepare('SELECT key, value FROM app_config').all<{ key: string; value: string | null }>();
+  const out: Record<string, string> = {};
+  for (const r of results || []) out[r.key] = r.value ?? '';
+  return out;
+}
+
+export async function setConfig(env: Env, key: string, value: string | null): Promise<void> {
+  await env.DB.prepare(
+    `INSERT INTO app_config (key, value, updated_at) VALUES (?, ?, ?)
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+  )
+    .bind(key, value, nowSec())
+    .run();
+}
+
+export interface AdminUserRow {
+  id: string;
+  username: string;
+  password_hash: string;
+}
+
+/** Whether an admin account has been set up (determines whether the app is "uninitialized" or "needs login"). */
+export async function hasAdminUser(env: Env): Promise<boolean> {
+  const row = await env.DB.prepare('SELECT 1 AS n FROM users LIMIT 1').first<{ n: number }>();
+  return !!row;
+}
+
+export async function getAdminByUsername(env: Env, username: string): Promise<AdminUserRow | null> {
+  return (await env.DB.prepare('SELECT id, username, password_hash FROM users WHERE username = ?')
+    .bind(username)
+    .first<AdminUserRow>()) ?? null;
+}
+
+export async function createAdmin(env: Env, username: string, passwordHash: string): Promise<string> {
+  const id = uuid();
+  const now = nowSec();
+  await env.DB.prepare('INSERT INTO users (id, username, password_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?)')
+    .bind(id, username, passwordHash, now, now)
+    .run();
+  return id;
 }

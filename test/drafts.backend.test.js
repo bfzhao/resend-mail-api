@@ -1,24 +1,24 @@
 'use strict';
 
 /* =============================================================================
- * 草稿箱（drafts）后端回归验证 —— 真实 SQLite 当 D1 + 真实 src/ 编译产物 + 真实 Worker 路由
+ * Drafts backend regression -- real SQLite as D1 + real compiled src/ artifacts + real Worker routing
  *
- * 运行（本沙箱需 tsc 垫片，见文件末尾说明）：
- *   NODE_OPTIONS="--require <临时目录>/mm-tsc-shim.js" node test/drafts.backend.test.js
- * 正常环境：
+ * Run (this sandbox needs the tsc shim, see notes at end of file):
+ *   NODE_OPTIONS="--require <temp dir>/mm-tsc-shim.js" node test/drafts.backend.test.js
+ * Normal environment:
  *   node test/drafts.backend.test.js
  *
- * 退出码：0 = 全部通过；1 = 存在失败；2 = 环境缺失（node:sqlite 不可用 / tsc 不可用）。
+ * Exit codes: 0 = all pass; 1 = failures; 2 = missing environment (node:sqlite unavailable / tsc unavailable).
  *
- * 覆盖本轮新增的「写了一半的邮件自动存草稿」后端部分：
- *   · GET/PUT/DELETE /api/drafts/:id  —— upsert 语义、字段往返一致、参数校验
- *   · GET /api/folders/drafts         —— 返回形状与其它文件夹一致（伪装 direction='draft'）
- *   · /api/counts 的 drafts_total     —— 与草稿箱 total 同口径，且「全部邮箱」= 各分组之和
- *   · 发送成功后丢弃草稿               —— 写信 / 回复 / 合并发送三条路径
+ * Covers this round's new "auto-save half-written email as a draft" backend portion:
+ *   · GET/PUT/DELETE /api/drafts/:id  -- upsert semantics, field round-trip consistency, param validation
+ *   · GET /api/folders/drafts         -- return shape consistent with other folders (disguised as direction='draft')
+ *   · /api/counts's drafts_total      -- same convention as the drafts folder total, and "all mailboxes" = sum of the groups
+ *   · Discard draft after successful send -- compose / reply / merge send, three paths
  *
- * 为什么用真实 SQLite：这些缺陷都是「存进库里的值不对」（收件人切分口径、upsert 变插入、
- * 计数与列表不一致）。只在参数层面断言会把测试锁死在列顺序上；这里让真实的
- * routeApi 跑完，再把数据 SELECT 回来比对，断言的是**最终数据**。
+ * Why real SQLite: these defects are all "the value written to the DB is wrong" (recipient-splitting convention, upsert becoming insert,
+ * counts and list disagreeing). Asserting only at the parameter level would lock the test to column order; here the real
+ * routeApi runs to completion, then the data is SELECTed back and compared, so what is asserted is the **final data**.
  * ===========================================================================*/
 
 const fs = require('fs');
@@ -36,23 +36,23 @@ try {
 }
 
 const ROOT = path.join(__dirname, '..');
-// QA_REPO_TS 仅用于「变异验证」：指向一份人工构造的 repo.ts 变体（放仓库外）。
+// QA_REPO_TS is only for "mutation verification": point it at a hand-crafted repo.ts variant (outside the repo).
 const REPO_TS = process.env.QA_REPO_TS || path.join(ROOT, 'src', 'repo.ts');
 const WORK_DIR = path.join(os.tmpdir(), `drafts-qa-build-${process.pid}`);
 const SRC_COPY = path.join(WORK_DIR, 'src');
 const BUILD_DIR = path.join(WORK_DIR, 'out');
 const REPO_MD5 = crypto.createHash('md5').update(fs.readFileSync(REPO_TS)).digest('hex');
-const MAILBOX = 'support@notionmanager.com';
-const ALIAS = 'alias@notionmanager.com';
+const MAILBOX = 'support@example.com';
+const ALIAS = 'alias@example.com';
 
 /* ---------------------------------------------------------------------------
- * 1) 把整份 src/ 复制到仓库外（变体覆盖 repo.ts）后编译
+ * 1) Copy the whole src/ outside the repo (variant overrides repo.ts) then compile
  *
- * ⚠️ 两个必须的配套（少了任何一个都会编译失败，且报错看起来与变体无关）：
- *   a) 临时目录在 os.tmpdir() 下，类型解析与产物的裸模块解析都要靠 node_modules ——
- *      必须在**编译之前**把 WORK_DIR/node_modules 链接到仓库 node_modules；
- *   b) module 改成 commonjs 后**不要**顺手改 moduleResolution：本机 tsc 是 TypeScript 7，
- *      `node10` 已被移除（TS5108）。
+ * ⚠️ Two required companions (missing either one makes compilation fail, and the error looks unrelated to the variant):
+ *   a) The temp dir is under os.tmpdir(), so both type resolution and bare-module resolution of the build output depend
+ *      on node_modules -- WORK_DIR/node_modules must be linked to the repo's node_modules **before compiling**;
+ *   b) After switching module to commonjs, do **not** casually change moduleResolution: tsc here is TypeScript 7,
+ *      `node10` has been removed (TS5108).
  * -------------------------------------------------------------------------*/
 function build() {
   const tsc = path.join(ROOT, 'node_modules', 'typescript', 'bin', 'tsc');
@@ -100,7 +100,7 @@ function cleanup() {
 }
 
 /* ---------------------------------------------------------------------------
- * 2) 真实 SQLite 冒充 D1
+ * 2) Real SQLite impersonating D1
  * -------------------------------------------------------------------------*/
 function makeD1() {
   const schema = fs.readFileSync(path.join(ROOT, 'schema.sql'), 'utf8');
@@ -141,7 +141,7 @@ function makeD1() {
 }
 
 /* ---------------------------------------------------------------------------
- * 3) 迷你断言器
+ * 3) Mini asserter
  * -------------------------------------------------------------------------*/
 let pass = 0;
 const results = [];
@@ -153,7 +153,7 @@ function section(t) { console.log(`\n=== ${t} ===`); }
 function info(t) { console.log(`  INFO  ${t}`); }
 
 /* ===========================================================================
- * 用例
+ * Test cases
  * ===========================================================================*/
 (async function main() {
   console.log('草稿箱后端 —— 真实 SQLite + 真实编译产物 + 真实 Worker 路由');
@@ -172,7 +172,7 @@ function info(t) { console.log(`  INFO  ${t}`); }
 
   const env = { DB: db, RESEND_API_KEY: 're_test', SEND_FROM_ADDRESS: MAILBOX, SEND_FROM_NAME: 'Support' };
 
-  // 桩掉 Resend 发送：默认成功；failTo 里的收件人返回 500（用来验「部分失败不丢草稿」）
+  // stub Resend sending: succeeds by default; recipients in failTo return 500 (used to verify "partial failure does not lose the draft")
   const sentPayloads = [];
   let failTo = new Set();
   globalThis.fetch = async (url, init) => {
@@ -198,7 +198,7 @@ function info(t) { console.log(`  INFO  ${t}`); }
     return { status: res.status, json: await res.json().catch(() => null) };
   };
 
-  /* ---- T0 环境自检 ---- */
+  /* ---- T0 environment self-check ---- */
   section('T0 环境自检');
   await db.prepare('INSERT INTO drafts (id, mailbox, mode, to_emails, updated_at, created_at) VALUES (?,?,?,?,?,?)')
     .bind('self-check', MAILBOX, 'new', '[]', 1, 1).run();
@@ -207,7 +207,7 @@ function info(t) { console.log(`  INFO  ${t}`); }
   await db.prepare('DELETE FROM drafts WHERE id = ?').bind('self-check').run();
   ok(typeof worker.default.fetch === 'function', 'Worker 入口已加载（走真实路由 + 真实 repo）');
 
-  /* ---- T1 PUT 新建 → GET 回读，字段往返一致 ---- */
+  /* ---- T1 PUT create -> GET read back, fields round-trip consistently ---- */
   section('T1 草稿 PUT/GET 往返');
   let r = await call('PUT', '/api/drafts/d1', {
     mode: 'reply',
@@ -234,7 +234,7 @@ function info(t) { console.log(`  INFO  ${t}`); }
   ok(d && d.body_text === '正文内容' && d.body_html === '<p>正文内容</p>', '正文（text/html）都保留');
   ok(d && d.rich === true, 'rich 以布尔返回（不是 1/0）', d && JSON.stringify(d.rich));
 
-  /* ---- T1b 收件人切分口径与发送同源 ---- */
+  /* ---- T1b recipient-splitting convention shared with sending ---- */
   section('T1b 收件人切分口径（与发送同源）');
   r = await call('PUT', '/api/drafts/d-split', { mailbox: MAILBOX, to: 'a@x.com; b@y.com, c@z.com', body: 'x' });
   ok(r.status === 200, 'PUT 成功', r.status);
@@ -245,7 +245,7 @@ function info(t) { console.log(`  INFO  ${t}`); }
   dd = (await call('GET', '/api/drafts/d-split')).json.draft;
   ok(dd.to.join(',') === 'a@x.com,b@y.com', '数组形态同样接受', JSON.stringify(dd.to));
 
-  /* ---- T2 upsert 语义：同一 id 覆盖而不是新增 ---- */
+  /* ---- T2 upsert semantics: the same id overwrites rather than inserts ---- */
   section('T2 PUT 同一 id 必须覆盖（upsert），不能变成插入');
   const before = db.queryOne('SELECT COUNT(*) AS n FROM drafts');
   await call('PUT', '/api/drafts/d1', { mailbox: MAILBOX, subject: '改过的主题', body: 'v2' });
@@ -255,7 +255,7 @@ function info(t) { console.log(`  INFO  ${t}`); }
   ok(dd.subject === '改过的主题' && dd.body_text === 'v2', '内容被覆盖为最新', JSON.stringify(dd.subject));
   ok(dd.cc.length === 0 && dd.bcc.length === 0, '⭐ 覆盖时旧 cc/bcc 一起清空（不能留下上一版收件人）', JSON.stringify(dd.cc));
 
-  /* ---- T3 列表：形状与其它文件夹一致 ---- */
+  /* ---- T3 list: shape consistent with other folders ---- */
   section('T3 GET /api/folders/drafts');
   r = await call('GET', '/api/folders/drafts');
   ok(r.status === 200 && r.json && r.json.folder === 'drafts', 'folder 字段 = drafts', r.json && r.json.folder);
@@ -271,7 +271,7 @@ function info(t) { console.log(`  INFO  ${t}`); }
   const newest = db.queryOne('SELECT id FROM drafts ORDER BY updated_at DESC, id DESC LIMIT 1');
   ok(it0.id === newest.id, '⭐ 列表按 updated_at DESC 排序（最新改的排最前）', `${it0.id} vs ${newest.id}`);
 
-  /* ---- T4 计数：drafts_total 与草稿箱 total 同口径 ---- */
+  /* ---- T4 counts: drafts_total uses the same convention as the drafts folder total ---- */
   section('T4 /api/counts 的 drafts_total');
   r = await call('GET', '/api/counts');
   ok(r.json && r.json.drafts_total === 2, 'drafts_total = 2', String(r.json && r.json.drafts_total));
@@ -279,7 +279,7 @@ function info(t) { console.log(`  INFO  ${t}`); }
   ok(r.json.drafts_total === listAll.total, '⭐ 计数与列表 total 一致（同一套 WHERE）',
     `${r.json.drafts_total} vs ${listAll.total}`);
 
-  // 再加一封归属另一个信箱的草稿 -> 「全部邮箱」必须等于各分组之和
+  // add one more draft belonging to another mailbox -> "all mailboxes" must equal the sum of the groups
   await call('PUT', '/api/drafts/d-alias', { mailbox: ALIAS, subject: '另一个信箱的草稿', body: 'y' });
   const countsAll = (await call('GET', '/api/counts')).json;
   const cM = (await call('GET', `/api/counts?mailbox=${encodeURIComponent(MAILBOX)}`)).json;
@@ -291,7 +291,7 @@ function info(t) { console.log(`  INFO  ${t}`); }
   const listM = (await call('GET', `/api/folders/drafts?mailbox=${encodeURIComponent(MAILBOX)}`)).json;
   ok(listM.total === 2 && listM.items.every((x) => x.mailbox === MAILBOX), '按 mailbox 过滤列表正确', String(listM.total));
 
-  /* ---- T5 搜索 ---- */
+  /* ---- T5 search ---- */
   section('T5 草稿箱搜索');
   const listQ = (await call('GET', '/api/folders/drafts?q=' + encodeURIComponent('另一个'))).json;
   ok(listQ.total === 1 && listQ.items[0].id === 'd-alias', 'q 命中主题', JSON.stringify(listQ.items.map((x) => x.id)));
@@ -304,7 +304,7 @@ function info(t) { console.log(`  INFO  ${t}`); }
   r = await call('DELETE', '/api/drafts/d-alias');
   ok(r.status === 200, '重复删除幂等（不报错）', r.status);
 
-  /* ---- T7 参数校验 ---- */
+  /* ---- T7 param validation ---- */
   section('T7 参数校验与 404');
   r = await call('PUT', '/api/drafts/d-bad', null);
   ok(r.status === 400, 'PUT 无 body -> 400', r.status);
@@ -312,13 +312,13 @@ function info(t) { console.log(`  INFO  ${t}`); }
   ok(r.status === 404, 'GET 不存在的草稿 -> 404', r.status);
   r = await call('POST', '/api/drafts/d1');
   ok(r.status === 405, '不支持的 method -> 405', r.status);
-  // PUT 一个全新 id 就是新建（前端打开弹窗时先生成 id）
+  // PUT with a brand-new id is a create (the frontend generates the id when opening the composer)
   r = await call('PUT', '/api/drafts/d-new-id', { mailbox: MAILBOX, subject: 's', body: 'b' });
   ok(r.status === 200 && db.queryOne('SELECT COUNT(*) AS n FROM drafts WHERE id = ?', 'd-new-id').n === 1,
     'PUT 全新 id = 新建（前端先生成 id 的协议）');
   await call('DELETE', '/api/drafts/d-new-id');
 
-  /* ---- T8 写信成功后丢弃草稿 ---- */
+  /* ---- T8 discard draft after a successful send ---- */
   section('T8 发送成功后自动丢弃草稿');
   await call('PUT', '/api/drafts/d-send', { mailbox: MAILBOX, to: 'a@x.com', subject: 's', body: 'b' });
   r = await call('POST', '/api/messages', {
@@ -328,7 +328,7 @@ function info(t) { console.log(`  INFO  ${t}`); }
   ok(db.queryOne('SELECT COUNT(*) AS n FROM drafts WHERE id = ?', 'd-send').n === 0,
     '⭐ 发信成功后草稿被删除（不会在草稿箱里留一份已发出去的信）');
 
-  /* ---- T9 发送失败时保留草稿 ---- */
+  /* ---- T9 keep the draft on send failure ---- */
   section('T9 发送失败必须保留草稿');
   await call('PUT', '/api/drafts/d-fail', { mailbox: MAILBOX, to: 'a@x.com', subject: 's', body: 'b' });
   failTo = new Set(['a@x.com']);
@@ -339,7 +339,7 @@ function info(t) { console.log(`  INFO  ${t}`); }
     '⭐ 发送失败 -> 草稿必须保留（删了就等于把内容丢了）');
   await call('DELETE', '/api/drafts/d-fail');
 
-  /* ---- T10 合并发送：全部成功才删，部分失败要留 ---- */
+  /* ---- T10 merge send: delete only when all succeed; partial failure must keep the draft ---- */
   section('T10 合并发送的草稿丢弃策略');
   await call('PUT', '/api/drafts/d-merge-ok', { mailbox: MAILBOX, to: 'a@x.com, b@y.com', subject: 's', body: 'b' });
   r = await call('POST', '/api/messages', {
@@ -359,7 +359,7 @@ function info(t) { console.log(`  INFO  ${t}`); }
     '⭐ 部分失败 -> 草稿保留（用户可以从草稿箱重发失败的那几个）');
   await call('DELETE', '/api/drafts/d-merge-part');
 
-  /* ---- T11 回复成功后丢弃草稿 ---- */
+  /* ---- T11 discard draft after a successful reply ---- */
   section('T11 回复成功后丢弃草稿');
   const now = Math.floor(Date.now() / 1000);
   await db.prepare(
@@ -371,7 +371,7 @@ function info(t) { console.log(`  INFO  ${t}`); }
   ok(r.status === 200 && r.json.ok === true, '回复成功', JSON.stringify(r.json));
   ok(db.queryOne('SELECT COUNT(*) AS n FROM drafts WHERE id = ?', 'd-reply').n === 0, '⭐ 回复成功后草稿被删除');
 
-  /* ---- T12 不带 draft_id 的发送不受影响 ---- */
+  /* ---- T12 sending without draft_id is unaffected ---- */
   section('T12 不带 draft_id 时一切照旧（负控制）');
   await call('PUT', '/api/drafts/d-keep', { mailbox: MAILBOX, to: 'k@x.com', subject: 's', body: 'b' });
   r = await call('POST', '/api/messages', { to: 'a@x.com', subject: 's', body: 'b', mailbox: MAILBOX });
@@ -379,7 +379,7 @@ function info(t) { console.log(`  INFO  ${t}`); }
   ok(db.queryOne('SELECT COUNT(*) AS n FROM drafts WHERE id = ?', 'd-keep').n === 1,
     '⭐ 别人的草稿不会被顺手删掉（只删请求里指定的那个 id）');
 
-  /* ---- 汇总 ---- */
+  /* ---- summary ---- */
   console.log('\n================ 失败用例清单 ================');
   const failed = results.filter((x) => !x.ok);
   if (!failed.length) console.log('（无）');

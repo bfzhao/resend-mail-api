@@ -15,7 +15,7 @@ export function uuid(): string {
   return crypto.randomUUID();
 }
 
-/** 解析形如 `Name <email>` / `<email>` / `email` 的地址，返回地址实体。 */
+/** Parse an address of the form `Name <email>` / `<email>` / `email` and return the address entity. */
 export function parseAddress(raw: string | null | undefined): Address | null {
   if (!raw) return null;
   const s = raw.trim();
@@ -27,13 +27,13 @@ export function parseAddress(raw: string | null | undefined): Address | null {
     if (email) return { name: name || null, email };
     return null;
   }
-  // 无尖括号包裹的普通邮箱，或只剩邮箱部分
+  // A plain email without angle brackets, or with only the email part left
   const t = s.replace(/^.*<([^>]+)>.*$/, '$1').trim().toLowerCase();
   if (/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(t)) return { name: null, email: t };
   return null;
 }
 
-/** 将一列原始地址(字符串)解析为 Address 列表，非法项丢弃。 */
+/** Parse a list of raw addresses (strings) into an Address list, dropping invalid entries. */
 export function parseAddressList(list: unknown): Address[] {
   if (Array.isArray(list)) {
     return list
@@ -61,7 +61,7 @@ export function jsonArr(value: string | null | undefined): string[] {
   }
 }
 
-/** 把 message_id / content-id 两边的尖括号去掉。 */
+/** Strip the angle brackets from both ends of a message_id / content-id. */
 export function stripAngle(s: string | null | undefined): string | null {
   if (!s) return null;
   const t = s.trim();
@@ -70,24 +70,24 @@ export function stripAngle(s: string | null | undefined): string | null {
 }
 
 /**
- * 从 References / In-Reply-To 头里抽出全部 Message-ID，返回**带尖括号的规范形式**。
+ * Extract all Message-IDs from the References / In-Reply-To headers, returning the **canonical angle-bracketed form**.
  *
- * ⚠️ **生产实测（2026-10-15）**：Resend 收信接口返回的 `headers.references` 值**不是**
- * RFC 5322 的空格分隔列表，而是 **JSON 数组文本** —— 形如 `["<a@b>","<c@d>"]`。
+ * ⚠️ **Production measurement (2026-10-15)**: the `headers.references` value returned by the Resend receiving API is **not**
+ * an RFC 5322 space-separated list, but **JSON array text** — of the form `["<a@b>","<c@d>"]`.
  *
- * 旧实现用 `refs.split(/\s+/)[0]` 取第一条，拿到的是整个 JSON 文本（含 `["` 前缀），
- * `stripAngle` 又只认首尾尖括号、去不掉方括号，于是 `thread_id` 落成
- * `["<a@b>","<c@d>"]` 这种畸形值。更糟的是 `reply()` 把这个 JSON 文本原样拼进
- * 新 References 发回 Resend，对方再回信时转义层级又深一层
- * （实测已出现 `["<\",\"<\\\",\\\"<\\\\\\\"...` 四层嵌套），
- * 导致**同一物理线程每往返一轮就换一个 thread_id** —— 用户侧看到的就是
- * 「来回好几次了，会话面板里却只有两封」。
+ * The old implementation used `refs.split(/\s+/)[0]` to take the first item, which yielded the whole JSON text (including the `["` prefix),
+ * and `stripAngle` only recognized leading/trailing angle brackets and could not remove the square brackets, so `thread_id` ended up as
+ * a malformed value like `["<a@b>","<c@d>"]`. Worse, `reply()` spliced this JSON text verbatim into the
+ * new References sent back to Resend, and when the other party replied the escaping level went one deeper
+ * (measured nesting already four levels deep, `["<\",\"<\\\",\\\"<\\\\\\\"...`),
+ * causing **the same physical thread to get a different thread_id on every round trip** — what the user sees is
+ * "several back-and-forths, but only two messages in the thread panel".
  *
- * 因此不再按分隔符切分，而是**抽取全部 `<...>`**：JSON 数组、空格分隔、单值、
- * 以及历史上已被嵌套转义污染的值都能抽出正确结果（嵌套串里第一个 `<...>`
- * 恰好就是真正的根 Message-ID）。
+ * So it no longer splits on separators, but instead **extracts all `<...>`**: JSON arrays, space-separated, single values,
+ * and historically escape-polluted values all extract correctly (the first `<...>` inside a nested string
+ * is exactly the real root Message-ID).
  *
- * 返回带尖括号，便于直接拼装头部（`join(' ')` 即合法的 References）。
+ * Returns with angle brackets, convenient for directly assembling headers (`join(' ')` is a valid References).
  */
 export function parseReferences(raw: string | null | undefined): string[] {
   if (!raw) return [];
@@ -99,28 +99,28 @@ export function parseReferences(raw: string | null | undefined): string[] {
     if (id) out.push(`<${id}>`);
   }
   if (out.length) return out;
-  // 兜底：整串里一个 `<...>` 都没有，但本身就是一个**干净的裸 Message-ID**
-  // （非规范写法，旧实现用 stripAngle 是宽容接受的，不能因为这次改动把它弄丢）。
-  // 判据刻意收紧到「单个 token 且不含任何分隔符 / 引号 / 方括号」——
-  // 否则 `["", ""]` 这类畸形串会被切出一堆垃圾 id。
+  // Fallback: the whole string has no `<...>` at all, but is itself a **clean bare Message-ID**
+  // (non-canonical form that the old implementation accepted tolerantly via stripAngle, which must not be lost by this change).
+  // The criterion is deliberately tightened to "a single token with no separators / quotes / square brackets" —
+  // otherwise a malformed string like `["", ""]` would be split into a pile of junk ids.
   const t = raw.trim();
   if (/^[^\s,<>[\]"']+$/.test(t)) return [`<${t}>`];
   return [];
 }
 
-/** 取第一个可解析的 Message-ID（无尖括号形式）；没有 `<...>` 时返回 null。 */
+/** Take the first parseable Message-ID (without angle brackets); return null when there is no `<...>`. */
 function firstMessageId(raw: string | null | undefined): string | null {
   const first = parseReferences(raw)[0];
   return first ? stripAngle(first) : null;
 }
 
 /**
- * 会话根：References 链里最靠前的那条 Message-ID（整条线程共享），
- * 取不到时回退到 in_reply_to / 自身 message_id。结果去掉尖括号便于归组。
+ * Thread root: the earliest Message-ID in the References chain (shared by the whole thread),
+ * falling back to in_reply_to / its own message_id when unavailable. The result is de-angle-bracketed for easy grouping.
  *
- * 解析一律走 `parseReferences()`（见其说明：Resend 的 References 是 JSON 数组文本，
- * 按空白切分会得到畸形根）。`messageId` 额外兼容**不带尖括号**的裸 id
- * —— 出站邮件的 `message_id` 存的是内部 uuid。
+ * Parsing always goes through `parseReferences()` (see its notes: Resend's References is JSON array text,
+ * and splitting on whitespace yields a malformed root). `messageId` additionally accepts a **bare id without angle brackets**
+ * — an outbound mail's `message_id` stores an internal uuid.
  */
 export function rootThreadId(opts: { references?: string | null; inReplyTo?: string | null; messageId?: string | null; fallback?: string }): string {
   const root = firstMessageId(opts.references);
@@ -133,19 +133,19 @@ export function rootThreadId(opts: { references?: string | null; inReplyTo?: str
 }
 
 /**
- * `thread_id` 是否是我们自己算出来的**正常值**。
+ * Whether `thread_id` is a **normal value** that we computed ourselves.
  *
- * 历史数据里存过畸形 JSON 文本（见 `parseReferences`），特征是中括号 / 引号 /
- * 反斜杠 / 尖括号 / 空白。回复时若原邮件的 `thread_id` 干净就直接继承它
- * （语义上「回复当然属于原邮件的会话」，且能兜住 References 头缺失的来信），
- * 畸形则退回按 References 重新推导。
+ * Historical data stored malformed JSON text (see `parseReferences`), characterized by square brackets / quotes /
+ * backslashes / angle brackets / whitespace. When replying, if the original mail's `thread_id` is clean it is inherited directly
+ * (semantically "a reply of course belongs to the original mail's thread", and it also covers incoming mail with a missing References header);
+ * if malformed, fall back to re-deriving from References.
  */
 export function isSaneThreadId(v: string | null | undefined): boolean {
   const s = (v ?? '').trim();
   return !!s && !/[\s[\]"\\<>]/.test(s);
 }
 
-/** 从 header 数组里按名称(大小写不敏感)取值，可能有多个重复名。 */
+/** Get a value from a header array by name (case-insensitive); there may be multiple duplicate names. */
 export function headerValue(headers: unknown, name: string): string | null {
   if (!Array.isArray(headers)) return null;
   const lname = name.toLowerCase();
@@ -161,7 +161,7 @@ export function headerValue(headers: unknown, name: string): string | null {
   return null;
 }
 
-/** 从 headers 对象(键名不定大小写)里取值。 */
+/** Get a value from a headers object (key names of arbitrary case). */
 export function headerValueMap(headers: Record<string, unknown> | null | undefined, name: string): string | null {
   if (!headers) return null;
   const lname = name.toLowerCase();
@@ -171,7 +171,7 @@ export function headerValueMap(headers: Record<string, unknown> | null | undefin
   return null;
 }
 
-/** 从 HTML 粗提取纯文本，用于缺省 body_text。 */
+/** Crudely extract plain text from HTML, for the default body_text. */
 export function stripHtml(html: string): string {
   return html
     .replace(/<style[\s\S]*?<\/style>/gi, ' ')
@@ -191,7 +191,7 @@ export function stripHtml(html: string): string {
     .trim();
 }
 
-/** base64 -> bytes（Worker 运行时无 Buffer）。 */
+/** base64 -> bytes (the Worker runtime has no Buffer). */
 export function base64ToBytes(b64: string): Uint8Array {
   const bin = atob(b64.replace(/\s+/g, ''));
   const bytes = new Uint8Array(bin.length);
@@ -200,8 +200,8 @@ export function base64ToBytes(b64: string): Uint8Array {
 }
 
 /**
- * bytes -> base64（Worker 运行时无 Buffer）。
- * 分块 String.fromCharCode 避免 `apply` 在超大数组上爆栈（附件可达数十 MB）。
+ * bytes -> base64 (the Worker runtime has no Buffer).
+ * Chunked String.fromCharCode avoids `apply` blowing the stack on very large arrays (attachments can reach tens of MB).
  */
 export function bytesToBase64(bytes: Uint8Array): string {
   const CHUNK = 0x8000;
@@ -220,7 +220,7 @@ export function escapeHtml(s: string): string {
     .replace(/"/g, '&quot;');
 }
 
-/** 生成安全的 Content-Disposition 值（保留非 ASCII 文件名）。 */
+/** Generate a safe Content-Disposition value (preserving non-ASCII filenames). */
 export function contentDisposition(type: 'inline' | 'attachment', filename: string): string {
   const ascii = filename.replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_').replace(/\s+/g, '_');
   return `${type}; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(filename)}`;

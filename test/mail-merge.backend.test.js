@@ -1,20 +1,20 @@
 'use strict';
 
 /* =============================================================================
- * 独立验证（QA）：「合并发送」后端逻辑 —— 编译真实 src/ 后驱动真实 compose()
+ * Independent verification (QA): "merge send" backend logic -- drive the real compose() after compiling the real src/
  *
- * 运行：
+ * Run:
  *   <node.exe> test/mail-merge.backend.test.js
  *
- * 做法（项目无构建步骤、零测试框架）：
- *   1. 用仓库自带的 tsc 把 src/ 编译成 CommonJS 到**仓库外**的临时目录
- *      （os.tmpdir()/mm-qa-build-<pid>，退出时删除），不污染项目；
- *   2. require 编译产物，拿到 worker 的 default.fetch；
- *   3. 桩全局 fetch 拦截 https://api.resend.com/emails（可**按收件人**返回不同结果
- *      —— 这是本地唯一能造出「部分成功」的方式）；
- *   4. 桩 env.DB（D1）/ env.BUCKET（R2），驱动真实路由 + 真实 compose/composeMerge。
+ * Approach (the project has no build step and zero test frameworks):
+ *   1. Use the repo's own tsc to compile src/ to CommonJS into a temp dir **outside the repo**
+ *      (os.tmpdir()/mm-qa-build-<pid>, deleted on exit), without polluting the project;
+ *   2. require the build output to get the worker's default.fetch;
+ *   3. Stub global fetch to intercept https://api.resend.com/emails (can return different results **per recipient**
+ *      -- this is the only local way to produce a "partial success");
+ *   4. Stub env.DB (D1) / env.BUCKET (R2), driving the real routes + the real compose/composeMerge.
  *
- * 退出码：0 = 全部通过；1 = 存在失败。本文件不修改 public/ 与 src/。
+ * Exit codes: 0 = all pass; 1 = failures. This file does not modify public/ or src/.
  * ===========================================================================*/
 
 const fs = require('fs');
@@ -32,7 +32,7 @@ const FINGERPRINT = {
 };
 
 /* ---------------------------------------------------------------------------
- * 1) 编译 src/ -> 仓库外临时目录（CommonJS）
+ * 1) Compile src/ -> temp dir outside the repo (CommonJS)
  * -------------------------------------------------------------------------*/
 function build() {
   const tsc = path.join(ROOT, 'node_modules', 'typescript', 'bin', 'tsc');
@@ -47,8 +47,8 @@ function build() {
   if (r.status !== 0) throw new Error(`tsc 编译失败(exit=${r.status}): ${out}`);
   const entry = path.join(BUILD_DIR, 'index.js');
   if (!fs.existsSync(entry)) throw new Error(`编译产物缺失: ${entry}`);
-  // 编译产物在仓库外，Node 找不到 'resend' 等依赖；用 junction 指回仓库 node_modules
-  // （不复制、不安装，只在临时目录里建一个链接）
+  // The build output is outside the repo, so Node cannot find dependencies like 'resend'; use a junction pointing back to the repo node_modules
+  // (no copy, no install, just create a link inside the temp dir)
   const link = path.join(BUILD_DIR, 'node_modules');
   try {
     if (!fs.existsSync(link)) fs.symlinkSync(path.join(ROOT, 'node_modules'), link, 'junction');
@@ -59,14 +59,14 @@ function build() {
 }
 
 /* ---------------------------------------------------------------------------
- * 2) D1 / R2 / fetch 桩
+ * 2) D1 / R2 / fetch stubs
  * -------------------------------------------------------------------------*/
 function makeDB(opts = {}) {
   const executed = [];
-  // firstHandler(sql, args) -> row | null：默认恒 null（合并发送路径不需要读回数据）。
-  // 回信路径需要 getMessage() 拿到原邮件，故允许用例注入。
+  // firstHandler(sql, args) -> row | null: always null by default (the merge-send path does not need to read data back).
+  // The reply path needs getMessage() to get the original email, so allow cases to inject.
   const firstHandler = typeof opts.first === 'function' ? opts.first : () => null;
-  // allHandler(sql, args) -> rows：默认空数组。转发路径需要 listAttachments() 拿到原附件行。
+  // allHandler(sql, args) -> rows: empty array by default. The forward path needs listAttachments() to get the original attachment rows.
   const allHandler = typeof opts.all === 'function' ? opts.all : () => [];
   const mk = (sql) => {
     const st = {
@@ -85,7 +85,7 @@ function makeDB(opts = {}) {
     exec: async () => ({ count: 0, duration: 0 }),
     dump: async () => new ArrayBuffer(0),
     _executed: executed,
-    /** 所有 INSERT INTO messages 语句（= saveOutbound 调用记录） */
+    /** all INSERT INTO messages statements (= saveOutbound call records) */
     messageInserts() {
       return executed.filter((e) => /INSERT INTO messages/i.test(e.sql));
     },
@@ -96,11 +96,11 @@ function makeDB(opts = {}) {
 }
 
 /**
- * 按**列名**取 INSERT 绑定的参数值。
+ * Take an INSERT's bound argument value **by column name**.
  *
- * ⚠️ 不要再用 `ins.args[10]` 这种位置索引：schema 加一列，后面所有列的下标就整体位移，
- * 断言会「一致地过期」却依然看着像在检查（2026-10-08 加 `delivered_to` 时实测踩到，
- * 多条断言同时假红）。这里直接解析 INSERT 的列清单，加列自动跟随。
+ * ⚠️ Stop using positional indices like `ins.args[10]`: adding one column to the schema shifts the index of every later column,
+ * and the assertions would "expire consistently" while still looking like they check something (this was hit for real when adding `delivered_to` on 2026-10-08,
+ * multiple assertions went falsely red at once). Here the INSERT's column list is parsed directly, and added columns are followed automatically.
  */
 function colArg(insert, name) {
   const cols = /INSERT INTO\s+\w+\s*\(([^)]*)\)/i.exec(insert.sql);
@@ -116,7 +116,7 @@ function makeBucket() {
   const toBytes = (v) => (v instanceof Uint8Array ? v : new TextEncoder().encode(String(v ?? '')));
   return {
     puts,
-    /** 用例预置对象（模拟「原邮件附件已经在 R2 里」） */
+    /** case-preset object (simulating "the original email's attachment is already in R2") */
     seed(key, value) { store.set(key, toBytes(value)); },
     async put(key, value, opts) {
       const bytes = toBytes(value);
@@ -124,8 +124,8 @@ function makeBucket() {
       puts.push({ key, size: bytes.length, opts });
       return {};
     },
-    // get 必须能读回 put 过的对象：转发要从 R2 读原附件；
-    // size / body 供附件代理（repo.proxyAttachment）设置 Content-Length 与响应体
+    // get must be able to read back objects that were put: forwarding reads original attachments from R2;
+    // size / body are for the attachment proxy (repo.proxyAttachment) to set Content-Length and the response body
     async get(key) {
       if (!store.has(key)) return null;
       const bytes = store.get(key);
@@ -140,7 +140,7 @@ function makeBucket() {
   };
 }
 
-/** Resend 桩：handler(body, callIndex) -> { status, payload } 或抛异常 */
+/** Resend stub: handler(body, callIndex) -> { status, payload } or throw */
 function makeResendStub(handler) {
   const calls = [];
   global.fetch = async (input, init = {}) => {
@@ -163,14 +163,14 @@ function makeResendStub(handler) {
 }
 
 /* ---------------------------------------------------------------------------
- * 3) 调用真实的 /api/messages
+ * 3) Call the real /api/messages
  * -------------------------------------------------------------------------*/
 function makeEnv(db, bucket, extra = {}) {
   return Object.assign({
     DB: db,
     BUCKET: bucket,
     RESEND_API_KEY: 're_test_key',
-    SEND_FROM_ADDRESS: 'support@notionmanager.com',
+    SEND_FROM_ADDRESS: 'support@example.com',
     SEND_FROM_NAME: 'support',
   }, extra);
 }
@@ -212,7 +212,7 @@ async function postForward(worker, env, id, body) {
 }
 
 /* ---------------------------------------------------------------------------
- * 用例运行器
+ * test-case runner
  * -------------------------------------------------------------------------*/
 const results = [];
 let currentTest = '(init)';
@@ -231,7 +231,7 @@ function info(msg) { console.log(`  INFO  ${msg}`); }
 function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
 
 /* =============================================================================
- * 主流程
+ * main flow
  * ===========================================================================*/
 (async () => {
   const built = build();
@@ -251,12 +251,12 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
       post: (b) => postMessages(worker, env, b),
       reply: (id, b) => postReply(worker, env, id, b),
       forward: (id, b) => postForward(worker, env, id, b),
-      /** 走真实路由的 GET（附件代理等）。 */
+      /** Go through the real route's GET (attachment proxy, etc.). */
       get: (url) => worker.fetch(new Request(`https://example.com${url}`), env),
     };
   };
 
-  /* ---- B1 merge 全成功：N 次调用、每次 to 长度 1、一一对应 ---- */
+  /* ---- B1 merge all succeed: N calls, each to-length 1, one-to-one ---- */
   section('B1 merge 全成功：N 次 resend 调用 / 每次 to 长度 1 / 一一对应');
   {
     const c = mkCtx();
@@ -282,7 +282,7 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
     ok(new Set(rows.map((x) => x.from)).size === 1, '同一个 from（发件人一致）');
   }
 
-  /* ---- B2 merge 部分成功（本地唯一可造出的方式：按收件人返回不同结果） ---- */
+  /* ---- B2 merge partial success (the only local way to produce it: return different results per recipient) ---- */
   section('B2 merge 部分成功：不中断、分类正确、HTTP 200、ok=false');
   {
     const c = mkCtx((body) => {
@@ -304,7 +304,7 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
     ok(c.resend.calls.every((x) => x.body.to.length === 1), '每次调用 to 长度仍为 1');
   }
 
-  /* ---- B3 merge 全失败 ---- */
+  /* ---- B3 merge all fail ---- */
   section('B3 merge 全失败：HTTP 200 / ok=false / sent_count=0 / 无落库');
   {
     const c = mkCtx(() => ({ status: 401, payload: { message: 'API key is invalid' } }));
@@ -318,7 +318,7 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
     ok(c.db.messageInserts().length === 0, '全部失败：无 outbound 落库');
   }
 
-  /* ---- B4 merge 中 resendSend 抛异常（网络错误） ---- */
+  /* ---- B4 resendSend throws during merge (network error) ---- */
   section('B4 merge 中 fetch 抛异常：捕获为 failed、不中断');
   {
     const c = mkCtx((body) => (body.to[0] === 'a@x.com' ? { throw: 'ECONNRESET' } : { status: 200, payload: { id: 'ok' } }));
@@ -330,7 +330,7 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
     ok(r.data.sent.length === 1 && r.data.sent[0].to === 'b@y.com', '另一位仍成功', JSON.stringify(r.data.sent));
   }
 
-  /* ---- B5 非 merge：行为完全不变 ---- */
+  /* ---- B5 non-merge: behavior completely unchanged ---- */
   section('B5 非 merge：1 次调用 / to 含全部 / 响应无 merge 字段');
   {
     const c = mkCtx();
@@ -346,7 +346,7 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
     ok(c.db.messageInserts().length === 1, '落库 1 条', `inserts=${c.db.messageInserts().length}`);
   }
 
-  /* ---- B6 merge 严格 === true ---- */
+  /* ---- B6 merge strictly === true ---- */
   section('B6 merge 严格 === true：false/"true"/1/null 都走非 merge');
   {
     for (const val of [false, 'true', 1, 'yes', null, undefined]) {
@@ -362,7 +362,7 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
     }
   }
 
-  /* ---- B7 收件人切分 / trim / 去空 / 大小写去重 ---- */
+  /* ---- B7 recipient splitting / trim / drop empty / case-insensitive dedup ---- */
   section('B7 收件人切分与去重（含全角分隔符 / 大小写 / 空白）');
   {
     const c = mkCtx();
@@ -374,7 +374,7 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
     ok(tos.every((t) => t === t.trim() && t !== ''), '每段已 trim 且无空串');
   }
 
-  /* ---- B8 去重后判上限：100 个相同地址不触发 20 人上限 ---- */
+  /* ---- B8 cap checked after dedup: 100 identical addresses do not trigger the 20-recipient cap ---- */
   section('B8 去重后判上限：a@x.com ×100 -> 1 人 -> 不触发上限');
   {
     const c = mkCtx();
@@ -384,7 +384,7 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
     ok(r.data.total === 1 && r.data.sent_count === 1, 'total=1 / sent=1', JSON.stringify({ t: r.data.total, s: r.data.sent_count }));
   }
 
-  /* ---- B9 无附件上限边界：cap=22（默认 budget 45 / cost 2） ---- */
+  /* ---- B9 no-attachment cap boundary: cap=22 (default budget 45 / cost 2) ---- */
   section('B9 无附件上限边界：去重后 23 人 -> 400；正好 22 人 -> 200（22 次 fetch）');
   {
     const over = Array.from({ length: 23 }, (_, i) => `u${i}@x.com`).join(', ');
@@ -403,7 +403,7 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
     ok(r2.data.total === 22 && r2.data.sent_count === 22 && r2.data.ok === true, 'total/sent=22、ok=true', JSON.stringify({ t: r2.data.total, s: r2.data.sent_count, ok: r2.data.ok }));
   }
 
-  /* ---- B10 0 人 ---- */
+  /* ---- B10 0 recipients ---- */
   section('B10 0 个收件人 -> 400 缺少收件人');
   {
     const cases = [
@@ -418,13 +418,13 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
       ok(r.data.error === '缺少收件人', `${cs.label} -> error=缺少收件人`, r.data.error);
       ok(c.resend.calls.length === 0, `${cs.label} -> 不调用 Resend`);
     }
-    // 非 merge 的 0 人也应 400（既有行为）
+    // non-merge with 0 recipients should also be 400 (existing behavior)
     const c = mkCtx();
     const r = await c.post({ to: '', subject: 'S', body: 'B' });
     ok(r.status === 400 && r.data.error === '缺少收件人', '非 merge 0 人同样 400', `${r.status}/${r.data.error}`);
   }
 
-  /* ---- B11 附件：每封都带同一份完整附件 ---- */
+  /* ---- B11 attachments: each email carries the same complete attachment ---- */
   section('B11 附件：merge 时每封都带同一份完整附件');
   {
     const att = [{ filename: 'note.txt', content: 'aGVsbG8=', content_type: 'text/plain' }];
@@ -437,7 +437,7 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
     ok(c.db.attachmentInserts().length === 2, '附件表各记 1 行', `rows=${c.db.attachmentInserts().length}`);
   }
 
-  /* ---- B12 cc 透传 ---- */
+  /* ---- B12 cc passthrough ---- */
   section('B12 cc：切分后透传到每一封');
   {
     const c = mkCtx();
@@ -447,7 +447,7 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
     ok(r.status === 200, 'HTTP 200', `status=${r.status}`);
   }
 
-  /* ---- B13 数组入参的 to：merge 仍去重；非 merge 记录既有行为 ---- */
+  /* ---- B13 array to argument: merge still dedups; non-merge keeps the existing behavior ---- */
   section('B13 数组入参：merge 去重；非 merge 保持既有行为（不额外去重）');
   {
     const c1 = mkCtx();
@@ -464,7 +464,7 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
     ok(r2.status === 200, 'HTTP 200');
   }
 
-  /* ---- B14 merge 响应字段集合 ---- */
+  /* ---- B14 merge response field set ---- */
   section('B14 merge 响应字段集合与类型');
   {
     const c = mkCtx();
@@ -477,7 +477,7 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
     info('注：单个收件人 + merge 也走 merge 分支（total=1），这是规格允许的（0 人才是 400）。');
   }
 
-  /* ---- B15 非 merge 失败仍为 400（既有行为） ---- */
+  /* ---- B15 non-merge failure is still 400 (existing behavior) ---- */
   section('B15 非 merge 失败：HTTP 400 且 error 含 Resend 原因（既有行为）');
   {
     const c = mkCtx(() => ({ status: 422, payload: { message: 'domain not verified' } }));
@@ -487,7 +487,7 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
     ok(!Object.prototype.hasOwnProperty.call(r.data, 'merge'), '错误响应也不含 merge 字段');
   }
 
-  /* ---- B16 未配置 RESEND_API_KEY ---- */
+  /* ---- B16 RESEND_API_KEY not configured ---- */
   section('B16 未配置 RESEND_API_KEY：merge 全失败（ok=false、HTTP 200）');
   {
     const c = mkCtx(undefined, { RESEND_API_KEY: '' });
@@ -498,7 +498,7 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
     ok(c.resend.calls.length === 0, '未配置 key 时不发出网络请求');
   }
 
-  /* ---- B17 正文/主题不变 ---- */
+  /* ---- B17 body/subject unchanged ---- */
   section('B17 每封的主题与正文完全一致');
   {
     const c = mkCtx();
@@ -507,10 +507,10 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
     ok(c.resend.calls.every((x) => x.body.text === 'line1\nline2'), '纯文本正文一致');
     ok(c.resend.calls.every((x) => typeof x.body.html === 'string' && x.body.html.includes('line1')), 'HTML 正文一致');
     const froms = c.resend.calls.map((x) => x.body.from);
-    ok(new Set(froms).size === 1 && /support@notionmanager\.com/.test(froms[0]), '每封发件人一致', JSON.stringify(froms));
+    ok(new Set(froms).size === 1 && /support@example\.com/.test(froms[0]), '每封发件人一致', JSON.stringify(froms));
   }
 
-  /* ---- B18 SQL 占位符与绑定参数数量一致（真实 D1 会拒绝不一致） ---- */
+  /* ---- B18 SQL placeholder count matches bound argument count (real D1 rejects a mismatch) ---- */
   section('B18 落库 SQL：? 占位符数量 === bind 参数数量');
   {
     const c = mkCtx();
@@ -531,10 +531,10 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
     info('注：真实 D1 的写入路径在假 key 下无法触发（Resend 全失败），故本层用桩 D1 覆盖；占位符/参数一致性可部分弥补该缺口。');
   }
 
-  /* ---- B19 附件感知上限：cap 随附件数下降（1 附件 -> 11，3 附件 -> 7） ---- */
+  /* ---- B19 attachment-aware cap: cap drops as attachments increase (1 attachment -> 11, 3 attachments -> 7) ---- */
   section('B19 附件感知上限：1 附件 cap=11、3 附件 cap=7（含 400 零 fetch / 无落库）');
   {
-    // 手算：cost(1)=2+1+1=4 -> floor(45/4)=11；cost(3)=2+3+1=6 -> floor(45/6)=7
+    // hand calculation: cost(1)=2+1+1=4 -> floor(45/4)=11; cost(3)=2+3+1=6 -> floor(45/6)=7
     const att1 = [{ filename: 'a.txt', content: 'aGk=', content_type: 'text/plain' }];
     const att3 = [
       { filename: 'a.txt', content: 'aGk=', content_type: 'text/plain' },
@@ -573,10 +573,10 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
     ok(r4.data.total === 7 && r4.data.sent_count === 7 && r4.data.ok === true, '3 附件：total/sent=7、ok=true', JSON.stringify({ t: r4.data.total, s: r4.data.sent_count, ok: r4.data.ok }));
   }
 
-  /* ---- B20 MERGE_SUBREQ_BUDGET 覆盖：1000 -> 绝对上限 200；0 -> 下限 1；未设置 -> 22 ---- */
+  /* ---- B20 MERGE_SUBREQ_BUDGET override: 1000 -> absolute cap 200; 0 -> lower bound 1; unset -> 22 ---- */
   section('B20 MERGE_SUBREQ_BUDGET 覆盖：1000 -> cap=200；0 -> cap=1；未设置 -> cap=22');
   {
-    // 手算：budget=1000, cost=2 -> floor(1000/2)=500 -> min(200,500)=200
+    // hand calculation: budget=1000, cost=2 -> floor(1000/2)=500 -> min(200,500)=200
     const over200 = Array.from({ length: 201 }, (_, i) => `u${i}@x.com`).join(', ');
     const c1 = mkCtx(undefined, { MERGE_SUBREQ_BUDGET: '1000' });
     const r1 = await c1.post({ to: over200, subject: 'S', body: 'B', merge: true });
@@ -590,7 +590,7 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
     ok(r2.status === 200, 'budget=1000 / 200 人 -> HTTP 200', `status=${r2.status}`);
     ok(c2.resend.calls.length === 200, 'budget=1000 / 200 人 -> 恰好 200 次 fetch', `calls=${c2.resend.calls.length}`);
 
-    // 手算：budget=0, cost=2 -> floor(0/2)=0 -> max(1, min(200,0)) = 1
+    // hand calculation: budget=0, cost=2 -> floor(0/2)=0 -> max(1, min(200,0)) = 1
     const c3 = mkCtx(undefined, { MERGE_SUBREQ_BUDGET: '0' });
     const r3 = await c3.post({ to: 'a@x.com, b@y.com', subject: 'S', body: 'B', merge: true });
     ok(r3.status === 400, 'budget=0 / 2 人 -> HTTP 400（不会算出 0 或负数）', `status=${r3.status}`);
@@ -601,7 +601,7 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
     const r4 = await c4.post({ to: 'a@x.com', subject: 'S', body: 'B', merge: true });
     ok(r4.status === 200 && c4.resend.calls.length === 1, 'budget=0 / 1 人 -> HTTP 200 且 1 次 fetch', `${r4.status}/${c4.resend.calls.length}`);
 
-    // 未设置 -> 默认 45 -> cap=22
+    // unset -> default 45 -> cap=22
     const c5 = mkCtx();
     const r5 = await c5.post({ to: 'a@x.com', subject: 'S', body: 'B', merge: true });
     ok(r5.status === 200, '未设置 budget / 1 人 -> HTTP 200', `status=${r5.status}`);
@@ -610,7 +610,7 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
     ok(r6.status === 400 && r6.data.error === '单次合并发送最多 22 位收件人', '未设置 budget -> 默认 45 -> cap=22', `${r6.status}/${r6.data.error}`);
   }
 
-  /* ---- B21 非法 budget 值：安全回落到默认 45 -> cap=22 ---- */
+  /* ---- B21 invalid budget value: safely fall back to default 45 -> cap=22 ---- */
   section('B21 非法 MERGE_SUBREQ_BUDGET（"abc"/""/"-5"）-> 安全回落默认 45 -> cap=22');
   {
     for (const bad of ['abc', '', '-5']) {
@@ -625,7 +625,7 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
     }
   }
 
-  /* ---- B22 去重先于判上限（30 个相同地址 + 0 附件） ---- */
+  /* ---- B22 dedup before cap check (30 identical addresses + 0 attachments) ---- */
   section('B22 去重先于判上限：30 个相同地址 + 0 附件 -> 去重后 1 人 -> 200');
   {
     const c = mkCtx();
@@ -635,12 +635,12 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
     ok(r.data.total === 1 && r.data.sent_count === 1, 'total=1 / sent=1', JSON.stringify({ t: r.data.total, s: r.data.sent_count }));
   }
 
-  /* ---- B23 附加反例：不整除的 cost、cost>budget、clamp 上界、小数 budget ---- */
+  /* ---- B23 extra counterexamples: non-dividing cost, cost>budget, clamp upper bound, fractional budget ---- */
   section('B23 附加反例：2 附件 cap=9；50 附件 cost>budget -> cap=1；budget 上界/小数');
   {
     const mkAtt = (n) => Array.from({ length: n }, (_, i) => ({ filename: `f${i}.txt`, content: 'aGk=', content_type: 'text/plain' }));
 
-    // 手算：cost(2)=2+2+1=5 -> floor(45/5)=9
+    // hand calculation: cost(2)=2+2+1=5 -> floor(45/5)=9
     const c1 = mkCtx();
     const r1 = await c1.post({ to: Array.from({ length: 10 }, (_, i) => `u${i}@x.com`).join(', '), subject: 'S', body: 'B', merge: true, attachments: mkAtt(2) });
     ok(r1.status === 400 && r1.data.error === '单次合并发送最多 9 位收件人（当前 2 个附件）', '2 附件 / 10 人 -> 400 且 cap=9', `${r1.status}/${r1.data.error}`);
@@ -649,7 +649,7 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
     const r2 = await c2.post({ to: Array.from({ length: 9 }, (_, i) => `u${i}@x.com`).join(', '), subject: 'S', body: 'B', merge: true, attachments: mkAtt(2) });
     ok(r2.status === 200 && c2.resend.calls.length === 9, '2 附件 / 9 人 -> 200 且 9 次 fetch', `${r2.status}/${c2.resend.calls.length}`);
 
-    // 手算：cost(50)=2+50+1=53 > 45 -> floor(45/53)=0 -> max(1,0)=1
+    // hand calculation: cost(50)=2+50+1=53 > 45 -> floor(45/53)=0 -> max(1,0)=1
     const c3 = mkCtx();
     const r3 = await c3.post({ to: 'a@x.com, b@y.com', subject: 'S', body: 'B', merge: true, attachments: mkAtt(50) });
     ok(r3.status === 400 && r3.data.error === '单次合并发送最多 1 位收件人（当前 50 个附件）', '50 附件 / 2 人 -> 400 且 cap 下限为 1', `${r3.status}/${r3.data.error}`);
@@ -658,12 +658,12 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
     const r4 = await c4.post({ to: 'a@x.com', subject: 'S', body: 'B', merge: true, attachments: mkAtt(50) });
     ok(r4.status === 200 && c4.resend.calls.length === 1, '50 附件 / 1 人 -> 200 且 1 次 fetch', `${r4.status}/${c4.resend.calls.length}`);
 
-    // 手算：budget 上界 clamp 到 10000 -> floor(10000/2)=5000 -> min(200,5000)=200
+    // hand calculation: budget upper bound clamped to 10000 -> floor(10000/2)=5000 -> min(200,5000)=200
     const c5 = mkCtx(undefined, { MERGE_SUBREQ_BUDGET: '99999' });
     const r5 = await c5.post({ to: Array.from({ length: 201 }, (_, i) => `u${i}@x.com`).join(', '), subject: 'S', body: 'B', merge: true });
     ok(r5.status === 400 && r5.data.error === '单次合并发送最多 200 位收件人', 'budget=99999 -> clamp 10000 -> cap 仍 200', `${r5.status}/${r5.data.error}`);
 
-    // 手算：budget="90.7" -> floor 90 -> floor(90/2)=45
+    // hand calculation: budget="90.7" -> floor 90 -> floor(90/2)=45
     const c6 = mkCtx(undefined, { MERGE_SUBREQ_BUDGET: '90.7' });
     const r6 = await c6.post({ to: Array.from({ length: 46 }, (_, i) => `u${i}@x.com`).join(', '), subject: 'S', body: 'B', merge: true });
     ok(r6.status === 400 && r6.data.error === '单次合并发送最多 45 位收件人', 'budget="90.7" -> floor 90 -> cap=45', `${r6.status}/${r6.data.error}`);
@@ -672,76 +672,76 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
     ok(r7.status === 200 && c7.resend.calls.length === 45, 'budget="90.7" / 45 人 -> 200 且 45 次 fetch', `${r7.status}/${c7.resend.calls.length}`);
   }
 
-  /* ---- B20 ⭐ 回信的发件人：body.mailbox 必须生效 ---- */
+  /* ---- B20 ⭐ reply sender: body.mailbox must take effect ---- */
   {
     section('B24 ⭐ 回信发件人：body.mailbox 必须生效（曾忽略它 -> 改选发件人无效）');
     const ORIG = {
-      id: 'orig-1', direction: 'inbound', mailbox: 'inbox@notionmanager.com',
+      id: 'orig-1', direction: 'inbound', mailbox: 'inbox@example.com',
       from_email: 'alice@partner.com', from_name: 'Alice',
-      to_emails: '["inbox@notionmanager.com"]', cc: null, bcc: null, reply_to: null,
+      to_emails: '["inbox@example.com"]', cc: null, bcc: null, reply_to: null,
       subject: '报价', body_text: 'hi', body_html: null,
       message_id: '<orig-1@partner.com>', references: null, thread_id: 't-1',
       received_at: 1788000000, read: 1, deleted: 0, starred: 0, status: 'received',
       resend_id: 're_in_1',
     };
-    // 只让「按 id 取原邮件」这一次 first() 命中，其余查询保持 null（与默认桩一致）
+    // only let the "fetch original by id" first() hit once; other queries stay null (consistent with the default stub)
     const ctxOf = (extra) => mkCtx(undefined, extra, {
       first: (sql, args) =>
         /SELECT \* FROM messages WHERE id = \?/i.test(sql) && args[0] === 'orig-1' ? ORIG : null,
     });
     const fromOf = (c) => (c.resend.calls[0] ? c.resend.calls[0].body.from : undefined);
 
-    // ① 缺省：沿用「收到原邮件的那个信箱」
+    // ① default: continue using "the mailbox that received the original email"
     const c1 = ctxOf();
     const r1 = await c1.reply('orig-1', { body: '回复内容' });
     ok(r1.status === 200 && r1.data && r1.data.original_id === 'orig-1',
       '负控制：回信路由确实被驱动（否则下面的发件人断言可能是空转）',
       `${r1.status}/${JSON.stringify(r1.data)}`);
     ok(c1.resend.calls.length === 1, '恰好 1 次 Resend 调用', c1.resend.calls.length);
-    ok(fromOf(c1) === 'inbox <inbox@notionmanager.com>',
+    ok(fromOf(c1) === 'inbox <inbox@example.com>',
       '未指定 mailbox -> 沿用原邮件的收件信箱（显示名 = 该信箱前缀，不再是全局 support）', fromOf(c1));
     ok(colArg(c1.db.messageInserts()[0], 'from_name') === 'inbox',
       '⭐ 落库的 from_name 跟着实际发件信箱走（修复前恒为全局 SEND_FROM_NAME「support」）',
       colArg(c1.db.messageInserts()[0], 'from_name'));
 
-    // ② ⭐ 指定 mailbox：必须用它（这就是用户报的 bug）
+    // ② ⭐ specify mailbox: it must be used (this is the bug the user reported)
     const c2 = ctxOf();
-    const r2 = await c2.reply('orig-1', { body: '回复内容', mailbox: 'billing@notionmanager.com' });
+    const r2 = await c2.reply('orig-1', { body: '回复内容', mailbox: 'billing@example.com' });
     ok(r2.status === 200, '指定 mailbox 时回信成功', `${r2.status}/${JSON.stringify(r2.data)}`);
     ok(c2.resend.calls.length === 1, '恰好 1 次 Resend 调用', c2.resend.calls.length);
-    ok(fromOf(c2) === 'billing <billing@notionmanager.com>',
+    ok(fromOf(c2) === 'billing <billing@example.com>',
       '⭐ body.mailbox 生效：发件人 = 用户改选的信箱（不再是原邮件的收件信箱）', fromOf(c2));
 
-    // ③ 落库的 from_email / mailbox 与真正发出的发件人一致（否则发件箱会显示错的发件人）
+    // ③ the stored from_email / mailbox match the sender actually used (otherwise the outbox would show the wrong sender)
     const ins = c2.db._executed.filter((e) => /INSERT INTO messages/i.test(e.sql));
     ok(ins.length === 1, '出站记录已落库', ins.length);
     const flat = ins.length ? ins[0].args.map((a) => String(a)).join('|') : '';
-    ok(flat.includes('billing@notionmanager.com'),
+    ok(flat.includes('billing@example.com'),
       '落库的 mailbox / from_email 用的是改选后的地址', flat.slice(0, 160));
-    ok(!flat.includes('inbox@notionmanager.com'),
+    ok(!flat.includes('inbox@example.com'),
       '落库记录里不得再残留原邮件的收件信箱', flat.slice(0, 160));
 
-    // ④ 域名兜底仍然生效：非默认域不会冒充外部域名发信
+    // ④ domain fallback still works: a non-default domain does not impersonate an external domain when sending
     const c3 = ctxOf();
     const r3 = await c3.reply('orig-1', { body: '回复内容', mailbox: 'evil@other-domain.com' });
     ok(r3.status === 200, '异域地址不报错（走回退而非 4xx）', `${r3.status}/${JSON.stringify(r3.data)}`);
-    ok(fromOf(c3) === 'support <support@notionmanager.com>',
+    ok(fromOf(c3) === 'support <support@example.com>',
       '非默认域回退到默认发件人（senderFromMailbox 的既有保护，未被本次改动绕过）', fromOf(c3));
 
-    // ⑤ 空白 mailbox 视同未指定，不得把发件人变成空
+    // ⑤ blank mailbox is treated as unspecified, and must not make the sender empty
     const c4 = ctxOf();
     await c4.reply('orig-1', { body: '回复内容', mailbox: '   ' });
-    ok(fromOf(c4) === 'inbox <inbox@notionmanager.com>',
+    ok(fromOf(c4) === 'inbox <inbox@example.com>',
       'mailbox 只有空白 -> 视同未指定，回退原邮件收件信箱', fromOf(c4));
   }
 
-  /* ---- B21 ⭐ 回信收件人：请求体的 to 必须生效（曾整段被忽略 -> 补的人收不到信、发件箱只记一人） ---- */
+  /* ---- B21 ⭐ reply recipients: the request body's to must take effect (it used to be ignored entirely -> added people got nothing, and the outbox recorded only one) ---- */
   {
     section('B25 ⭐ 回信收件人：请求体 to 必须生效（曾忽略它 -> 补的收件人被丢弃）');
     const ORIG2 = {
-      id: 'orig-1', direction: 'inbound', mailbox: 'inbox@notionmanager.com',
+      id: 'orig-1', direction: 'inbound', mailbox: 'inbox@example.com',
       from_email: 'alice@partner.com', from_name: 'Alice',
-      to_emails: '["inbox@notionmanager.com"]', cc: null, bcc: null, reply_to: null,
+      to_emails: '["inbox@example.com"]', cc: null, bcc: null, reply_to: null,
       subject: '报价', body_text: 'hi', body_html: null,
       message_id: '<orig-1@partner.com>', references: null, thread_id: 't-1',
       received_at: 1788000000, read: 1, deleted: 0, starred: 0, status: 'received',
@@ -757,7 +757,7 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
       return ins.length ? JSON.parse(ins[0].args[9]) : null;
     };
 
-    // ① 前端实际发的是数组：原发件人 + 用户补的人
+    // ① the frontend actually sends an array: original sender + people the user added
     const c1 = ctxOf();
     const r1 = await c1.reply('orig-1', { to: ['alice@partner.com', 'bob@other.com'], body: '回复内容' });
     ok(r1.status === 200 && r1.data && r1.data.original_id === 'orig-1',
@@ -770,35 +770,35 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
     ok(JSON.stringify(storedTo(c1)) === JSON.stringify(['alice@partner.com', 'bob@other.com']),
       '⭐ 发件箱记录 to_emails 含两人（用户报的「只有一个人」）', JSON.stringify(storedTo(c1)));
 
-    // ② 字符串形态（直接调 API）：逗号 / 分号都算分隔符
+    // ② string form (calling the API directly): comma / semicolon both count as separators
     const c2 = ctxOf();
     await c2.reply('orig-1', { to: 'alice@partner.com; bob@other.com', body: '回复内容' });
     ok(JSON.stringify(toOf(c2)) === JSON.stringify(['alice@partner.com', 'bob@other.com']),
       '字符串形态同样解析出两人（与前端 parseRecipients 同口径）', JSON.stringify(toOf(c2)));
 
-    // ③ 去重且保序
+    // ③ dedup while preserving order
     const c3 = ctxOf();
     await c3.reply('orig-1', { to: ['bob@other.com', 'BOB@other.com', 'alice@partner.com'], body: '回复内容' });
     ok(JSON.stringify(toOf(c3)) === JSON.stringify(['bob@other.com', 'alice@partner.com']),
       '按小写去重并保留首次出现的写法/顺序', JSON.stringify(toOf(c3)));
 
-    // ④ 负控制：完全没给 to -> 回退到从原邮件推导的那一个地址（老客户端 / 直接调 API 不回归）
+    // ④ negative control: no to at all -> fall back to the single address derived from the original email (old clients / direct API calls do not regress)
     const c4 = ctxOf();
     await c4.reply('orig-1', { body: '回复内容' });
     ok(JSON.stringify(toOf(c4)) === JSON.stringify(['alice@partner.com']),
       '未给 to -> 回退原发件人单个（既有行为不变）', JSON.stringify(toOf(c4)));
 
-    // ⑤ 只给空白 to -> 视同未给，回退原发件人，不得发出空收件人
+    // ⑤ only blank to -> treated as not given, fall back to the original sender, must not send empty recipients
     const c5 = ctxOf();
     await c5.reply('orig-1', { to: '   ', body: '回复内容' });
     ok(JSON.stringify(toOf(c5)) === JSON.stringify(['alice@partner.com']),
       'to 只有空白 -> 回退原发件人', JSON.stringify(toOf(c5)));
   }
 
-  /* ---- B22 ⭐ cc / bcc：归一化（去重 + 与更高优先级分组重复的剔除） ---- */
+  /* ---- B22 ⭐ cc / bcc: normalization (dedup + dropping duplicates of higher-priority groups) ---- */
   {
     section('B26 ⭐ cc/bcc 归一化：同一地址不能既在 to 又在 cc（否则同一人收到两封）');
-    // ① cc 与 to 重复 -> 从 cc 剔除
+    // ① cc duplicates to -> drop from cc
     const c1 = mkCtx();
     const r1 = await c1.post({ to: 'a@x.com', cc: 'a@x.com, b@y.com', subject: 'S', body: 'B' });
     ok(r1.status === 200, 'HTTP 200', `${r1.status}/${JSON.stringify(r1.data)}`);
@@ -809,7 +809,7 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
     ok(String(colArg(ins0, 'cc')) === JSON.stringify(['b@y.com']),
       '落库的 cc 与真正发出的 cc 一致', colArg(ins0, 'cc'));
 
-    // ② 只填 bcc 也能发信（to 为空）
+    // ② bcc alone can also send (to empty)
     const c2 = mkCtx();
     const r2 = await c2.post({ to: '', bcc: 'secret@x.com', subject: 'S', body: 'B' });
     ok(r2.status === 200, '⭐ 只填密送也能发信（to/cc/bcc 任一非空即可）', `${r2.status}/${JSON.stringify(r2.data)}`);
@@ -819,20 +819,20 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
       'bcc 落库（发件人自己回看时能看到密送给了谁）', colArg(c2.db.messageInserts()[0], 'bcc'));
     ok(c2.resend.calls[0].body.cc === undefined, '没有 cc 时不传 cc 字段（不传空数组）');
 
-    // ③ bcc 与 to / cc 重复 -> 剔除；bcc 内部去重
+    // ③ bcc duplicates to / cc -> drop; dedup within bcc
     const c3 = mkCtx();
     await c3.post({ to: 'a@x.com', cc: 'b@y.com', bcc: 'A@X.com, b@y.com, s@z.com, S@Z.com', subject: 'S', body: 'B' });
     ok(JSON.stringify(c3.resend.calls[0].body.bcc) === JSON.stringify(['s@z.com']),
       '⭐ bcc 剔除与 to/cc 重复的（大小写不敏感）并在自身内部去重', JSON.stringify(c3.resend.calls[0].body.bcc));
 
-    // ④ 三组全空 -> 400（既有文案不变）
+    // ④ all three groups empty -> 400 (existing message unchanged)
     const c4 = mkCtx();
     const r4 = await c4.post({ to: '', cc: ' , ; ', bcc: [], subject: 'S', body: 'B' });
     ok(r4.status === 400 && r4.data.error === '缺少收件人', '三组全空 -> 400 缺少收件人', `${r4.status}/${r4.data.error}`);
     ok(c4.resend.calls.length === 0, '不发信');
   }
 
-  /* ---- B23 ⭐ merge 与 bcc 互斥：明确拒绝，不静默忽略 ---- */
+  /* ---- B23 ⭐ merge and bcc are mutually exclusive: reject explicitly, do not silently ignore ---- */
   {
     section('B27 ⭐ merge + bcc -> 400（不静默忽略密送）');
     const c = mkCtx();
@@ -840,20 +840,20 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
     ok(r.status === 400, 'HTTP 400', `${r.status}/${JSON.stringify(r.data)}`);
     ok(/密送/.test(String(r.data.error)) && /合并发送/.test(String(r.data.error)), '错误文案说明是「合并发送不支持密送」', r.data.error);
     ok(c.resend.calls.length === 0, '⭐ 一封都不发（若静默忽略 bcc，用户会以为密送生效了）', c.resend.calls.length);
-    // 负控制：同样的收件人但不勾 merge -> 正常发出，且带 bcc
+    // negative control: same recipients but merge unchecked -> sends normally, with bcc
     const c2 = mkCtx();
     const r2 = await c2.post({ to: 'a@x.com, b@y.com', bcc: 's@x.com', subject: 'S', body: 'B' });
     ok(r2.status === 200 && c2.resend.calls.length === 1, '负控制：不勾 merge 时同样入参可以发（区分度成立）', `${r2.status}/${c2.resend.calls.length}`);
     ok(JSON.stringify(c2.resend.calls[0].body.bcc) === JSON.stringify(['s@x.com']), '负控制：bcc 正常透传');
   }
 
-  /* ---- B24 ⭐ 回复也支持 cc / bcc ---- */
+  /* ---- B24 ⭐ reply also supports cc / bcc ---- */
   {
     section('B28 ⭐ 回复：cc/bcc 透传并落库；与 to 重复的被剔除');
     const ORIG_R = {
-      id: 'orig-1', direction: 'inbound', mailbox: 'inbox@notionmanager.com',
+      id: 'orig-1', direction: 'inbound', mailbox: 'inbox@example.com',
       from_email: 'alice@partner.com', from_name: 'Alice',
-      to_emails: '["inbox@notionmanager.com"]', cc: null, bcc: null, reply_to: null,
+      to_emails: '["inbox@example.com"]', cc: null, bcc: null, reply_to: null,
       subject: '报价', body_text: 'hi', body_html: null,
       message_id: '<orig-1@partner.com>', references: null, thread_id: 't-1',
       received_at: 1788000000, read: 1, deleted: 0, starred: 0, status: 'received',
@@ -875,20 +875,20 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
     ok(String(colArg(ins, 'cc')) === JSON.stringify(['cc@x.com']), '回复的 cc 落库', colArg(ins, 'cc'));
     ok(String(colArg(ins, 'bcc')) === JSON.stringify(['bcc@x.com']), '回复的 bcc 落库', colArg(ins, 'bcc'));
 
-    // cc 与 to 重复（大小写不同）-> 剔除
+    // cc duplicates to (different case) -> drop
     const c2 = ctxOf();
     await c2.reply('orig-1', { to: ['alice@partner.com'], cc: ['ALICE@partner.com'], body: '回复内容' });
     ok(c2.resend.calls[0].body.cc === undefined,
       '⭐ cc 与 to 是同一个地址（仅大小写不同）-> 剔除，不重复投递', JSON.stringify(c2.resend.calls[0].body.cc));
   }
 
-  /* ---- B25 ⭐ 转发：任意方向、新会话、原附件服务端复制 ---- */
+  /* ---- B25 ⭐ forward: any direction, new thread, original attachments copied server-side ---- */
   {
     section('B29 ⭐ 转发：任意方向 / 新会话 / 原附件服务端复制到新 R2 key');
     const ORIG_F = {
-      id: 'orig-1', direction: 'inbound', mailbox: 'inbox@notionmanager.com',
+      id: 'orig-1', direction: 'inbound', mailbox: 'inbox@example.com',
       from_email: 'alice@partner.com', from_name: 'Alice',
-      to_emails: '["inbox@notionmanager.com"]', cc: null, bcc: null, reply_to: null,
+      to_emails: '["inbox@example.com"]', cc: null, bcc: null, reply_to: null,
       subject: '报价', body_text: 'hi', body_html: null,
       message_id: '<orig-1@partner.com>', references: null, thread_id: 't-1',
       received_at: 1788000000, read: 1, deleted: 0, starred: 0, status: 'received',
@@ -905,7 +905,7 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
         /FROM attachments WHERE message_id = \?/i.test(sql) && args[0] === 'orig-1' ? ATTS : [],
     });
 
-    // ① 基本转发（带原附件）
+    // ① basic forward (with the original attachments)
     const c1 = ctxOf();
     c1.bucket.seed('attachments/orig/a1-note.txt', 'hello');
     c1.bucket.seed('attachments/orig/a2-logo.png', 'png');
@@ -925,8 +925,8 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
 
     const ins1 = c1.db.messageInserts();
     ok(ins1.length === 1, '1 条出站记录', ins1.length);
-    // `|| null` + `x && ...`：前置条件不成立时给出 FAIL，而不是在下一行解引用抛 TypeError
-    // 把整个套件打崩（那样汇总行都打不出来，下游断言全部失去信号）。
+    // `|| null` + `x && ...`: when the precondition fails, produce a FAIL instead of dereferencing on the next line and throwing a TypeError
+    // that crashes the whole suite (which would prevent even the summary line from printing, leaving downstream assertions with no signal).
     const row1 = ins1[0] || null;
     ok(row1 && row1.args[5] !== 't-1', '⭐ threadId 是新会话（不是原邮件的 thread_id）', row1 && row1.args[5]);
     ok(row1 && row1.args[3] === null && row1.args[4] === null, '落库的 in_reply_to / references 为空', row1 && `${row1.args[3]}/${row1.args[4]}`);
@@ -938,17 +938,17 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
     ok(newKey && row1 && String(newKey).startsWith(`attachments/${row1.args[0]}/`), '新 key 挂在新 messageId 下', newKey);
     ok(c1.bucket.puts.some((p) => p.key === newKey), 'R2 里确实写入了新 key', JSON.stringify(c1.bucket.puts.map((p) => p.key)));
 
-    // ② 主题已有 Fwd: 前缀 -> 不重复叠加
+    // ② subject already has the Fwd: prefix -> do not stack it again
     const c2 = ctxOf(Object.assign({}, ORIG_F, { subject: 'Fwd: 报价' }));
     const r2 = await c2.forward('orig-1', { to: 'bob@x.com', body: 'x' });
     ok(r2.status === 200 && c2.resend.calls[0].body.subject === 'Fwd: 报价', '已有 Fwd: 前缀不重复叠加', c2.resend.calls[0].body.subject);
 
-    // ③ 转发出站邮件也允许（reply 只允许 inbound，forward 不限方向）
-    const c3 = ctxOf(Object.assign({}, ORIG_F, { direction: 'outbound', from_email: 'me@notionmanager.com', from_name: null }));
+    // ③ forwarding an outbound email is also allowed (reply only allows inbound; forward is not restricted by direction)
+    const c3 = ctxOf(Object.assign({}, ORIG_F, { direction: 'outbound', from_email: 'me@example.com', from_name: null }));
     const r3 = await c3.forward('orig-1', { to: 'bob@x.com', body: 'x' });
     ok(r3.status === 200, '⭐ 出站（已发送）的邮件也能转发（「转发任何邮件」）', `${r3.status}/${JSON.stringify(r3.data)}`);
 
-    // ④ 原附件在 R2 读不到 -> 跳过但**明确列出**，不静默少发
+    // ④ original attachment unreadable from R2 -> skip but **list explicitly**, no silent under-send
     const c4 = ctxOf();
     const r4 = await c4.forward('orig-1', { to: 'bob@x.com', body: 'x' });
     ok(r4.status === 200, '附件读不到仍转发（不整封拦下）', `${r4.status}/${JSON.stringify(r4.data)}`);
@@ -956,7 +956,7 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
       '⭐ 明确列出跳过的附件（否则用户以为附件跟着走了）', JSON.stringify(r4.data.skipped_attachments));
     ok(c4.resend.calls[0].body.attachments === undefined, '没有附件随信发出');
 
-    // ⑤ 附件合计超 40MB -> 400 且不发信
+    // ⑤ attachments total over 40MB -> 400 and no send
     const c5 = ctxOf();
     c5.bucket.seed('attachments/orig/a1-note.txt', new Uint8Array(41 * 1024 * 1024));
     const r5 = await c5.forward('orig-1', { to: 'bob@x.com', body: 'x' });
@@ -964,7 +964,7 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
     ok(/40 MB/.test(String(r5.data.error)), '错误文案说明是大小超限', r5.data.error);
     ok(c5.resend.calls.length === 0, '不发信');
 
-    // ⑥ 收件人为空 / 原邮件不存在
+    // ⑥ empty recipient / original email does not exist
     const c6 = ctxOf();
     const r6 = await c6.forward('orig-1', { to: '', body: 'x' });
     ok(r6.status === 400 && r6.data.error === '缺少收件人', '收件人为空 -> 400 缺少收件人', `${r6.status}/${r6.data.error}`);
@@ -973,7 +973,7 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
     ok(r7.status === 404, '原邮件不存在 -> 404', `${r7.status}/${JSON.stringify(r7.data)}`);
   }
 
-  /* ---- B15 附件代理路由：?dl=1 强制下载（真实路由，不是直调 repo） ---- */
+  /* ---- B15 attachment proxy route: ?dl=1 forces download (real route, not a direct repo call) ---- */
   section('B15 附件代理路由 GET /api/attachments/:id（?dl=1 强制下载）');
   {
     const bytes = new TextEncoder().encode('PDFDATA');
@@ -1008,7 +1008,7 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
     ok(r3.status === 404, '附件不存在 -> 404', r3.status);
   }
 
-  /* ---- 汇总 ---- */
+  /* ---- summary ---- */
   console.log('\n================ 失败用例清单 ================');
   const failed = results.filter((r) => !r.ok);
   if (!failed.length) console.log('（无）');

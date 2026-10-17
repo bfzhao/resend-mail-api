@@ -2,22 +2,23 @@
 'use strict';
 
 /**
- * 第 3 层验证：真实 HTTP 集成（合并发送）
+ * Layer 3 verification: real HTTP integration (merge send)
  *
- * 与另外 4 个套件的区别：本套件**不打任何桩**，直接对真实运行的 Worker 发 HTTP 请求，
- * 走真实的 D1 / R2 / 路由 / JSON 解析。用于补上「编译后驱动 compose()」层无法覆盖的
- * 端到端链路（路由、鉴权、静态资源、真实序列化）。
+ * Difference from the other 4 suites: this suite stubs **nothing**; it sends HTTP requests directly to a really running Worker,
+ * exercising the real D1 / R2 / routes / JSON parsing. It fills in the end-to-end chain (routes, auth, static assets, real serialization)
+ * that the "drive compose() after compiling" layer cannot cover.
  *
- * 用法：
- *   1) 另开一个终端起本地服务：  npx wrangler dev --port 8799 --local
- *   2) 跑本套件：                node test/mail-merge.live.js
- *   端口/地址不同可覆盖：        BASE=http://127.0.0.1:8787 node test/mail-merge.live.js
+ * Usage:
+ *   1) Open another terminal and start the local server:  npx wrangler dev --port 8799 --local
+ *   2) Run this suite:                node test/mail-merge.live.js
+ *   Override a different port/address:        BASE=http://127.0.0.1:8787 node test/mail-merge.live.js
  *
- * 零依赖：只用 Node 内置能力（Node 18+ 的全局 fetch）。
+ * Zero dependencies: uses only Node's built-in capabilities (Node 18+'s global fetch).
  *
- * ⚠️ 无真实 RESEND_API_KEY 时，所有**实际投递**都会失败（错误文案「未配置 RESEND_API_KEY」），
- *    因此本套件覆盖的是：参数校验、动态上限、去重顺序、HTTP 状态契约、失败分类与响应形状。
- *    真实投递需配好 key 后手测（见交付说明 E2–E4）。
+ * ⚠️ Without a real RESEND_API_KEY, all **actual deliveries** fail (the runtime error is a Chinese
+ *    "RESEND_API_KEY not configured" message),
+ *    so what this suite covers is: parameter validation, dynamic cap, dedup order, HTTP status contract, failure classification and response shape.
+ *    Real delivery must be manually tested after configuring a key (see delivery notes E2-E4).
  */
 
 const BASE = (process.env.BASE || process.argv[2] || 'http://127.0.0.1:8799').replace(/\/+$/, '');
@@ -49,7 +50,7 @@ async function post(path, body) {
   });
   const text = await res.text();
   let data = null;
-  try { data = JSON.parse(text); } catch { /* 非 JSON 时保留 null，便于断言报错 */ }
+  try { data = JSON.parse(text); } catch { /* keep null on non-JSON, to aid assertion error reporting */ }
   return { status: res.status, data, text };
 }
 
@@ -71,7 +72,7 @@ const addrs = (n) => Array.from({ length: n }, (_, i) => `u${i}@x.com`).join(', 
 const MERGE_KEYS = ['merge', 'total', 'sent_count', 'failed_count', 'sent', 'failed'];
 
 async function main() {
-  // ---- 前置：确认服务在跑，否则明确告知怎么起，而不是伪装成失败 ----
+  // ---- precondition: confirm the service is running, otherwise clearly say how to start it rather than masquerading as a failure ----
   let health;
   try {
     health = await get('/health');
@@ -86,7 +87,7 @@ async function main() {
   }
   ok(health.status === 200, '/health 可达且 200', `status=${health.status}`);
 
-  // ---- A. 静态资源确实带上了新功能 ----
+  // ---- A. static assets really carry the new feature ----
   section('[A] 静态资源：合并发送 UI 已随部署生效');
   const idx = await get('/');
   ok(idx.status === 200, '/ 返回 200', `status=${idx.status}`);
@@ -101,11 +102,11 @@ async function main() {
   ok(js.status === 200, '/app.js 返回 200', `status=${js.status}`);
   ok(js.text.includes('parseRecipients'), '/app.js 含 parseRecipients（前端多收件人解析已上线）');
   ok(js.text.includes('f-merge'), '/app.js 含 f-merge 接线');
-  // 会话行/信封卡显示「实际收发信箱」——抓「代码改了但没生效」
+  // the conversation row / envelope card show "the actual sending/receiving mailbox" -- catches "code changed but did not take effect"
   ok(js.text.includes('endpointsOf'), '/app.js 含 endpointsOf（会话行收发双方口径已上线）');
   ok(js.text.includes('收至'), '/app.js 含「收至」（来信显示我方收件信箱）');
 
-  // ---- B. 参数校验与动态上限（不需要真实 key）----
+  // ---- B. parameter validation and dynamic cap (no real key needed)----
   section('[B] 参数校验与「按附件数动态计算」的上限');
   const b1 = await post('/api/messages', { to: '', subject: 'S', body: 'B', merge: true });
   ok(b1.status === 400, 'merge + 0 收件人 -> 400', `status=${b1.status}`);
@@ -132,7 +133,7 @@ async function main() {
   const b7 = await post('/api/messages', { to: addrs(7), subject: 'S', body: 'B', merge: true, attachments: att(3) });
   ok(b7.status === 200, '3 附件 + 7 人 -> 200', `status=${b7.status}`);
 
-  // 去重必须发生在判上限之前：30 个相同地址去重后只有 1 人，绝不能被判超限
+  // dedup must happen before the cap check: 30 identical addresses dedup to only 1, and must never be flagged as over the cap
   const b8 = await post('/api/messages', { to: Array.from({ length: 30 }, () => 'a@x.com').join(', '), subject: 'S', body: 'B', merge: true });
   ok(b8.status === 200, '30 个相同地址 -> 200（去重先于判上限）', `status=${b8.status}`);
   ok(b8.data && b8.data.total === 1, '去重后 total=1', JSON.stringify(b8.data));
@@ -141,7 +142,7 @@ async function main() {
   ok(b9.status === 400, 'attachments 非数组 -> 400', `status=${b9.status}`);
   ok(b9.data && b9.data.error === '附件格式错误', '错误文案 = 附件格式错误', JSON.stringify(b9.data));
 
-  // ---- C. merge 响应契约（真实 HTTP 200 + 失败分类）----
+  // ---- C. merge response contract (real HTTP 200 + failure classification)----
   section('[C] merge 响应契约：一律 HTTP 200 + 失败明细');
   const c1 = await post('/api/messages', { to: 'a@x.com, b@y.com', subject: 'S', body: 'B', merge: true });
   ok(c1.status === 200, '全部失败仍是 HTTP 200（不是 5xx）', `status=${c1.status}`);
@@ -156,7 +157,7 @@ async function main() {
   ok(c.failed && c.failed[0] && c.failed[0].to === 'a@x.com' && c.failed[1] && c.failed[1].to === 'b@y.com', 'failed 保序对应输入', JSON.stringify(c.failed));
   ok(c.failed && c.failed.every((f) => typeof f.error === 'string' && f.error.length > 0), '每条 failed 都带非空 error');
 
-  // ---- D. 向后兼容：非 merge 路径响应里绝不能出现 merge 字段 ----
+  // ---- D. backward compatibility: a non-merge response must never contain any merge field ----
   section('[D] 向后兼容：非 merge 请求响应不含任何 merge 字段');
   for (const [label, val] of [['缺省', undefined], ['false', false], ['"true" 字符串', 'true'], ['1 数字', 1], ['null', null]]) {
     const body = { to: 'a@x.com', subject: 'S', body: 'B' };
@@ -168,7 +169,7 @@ async function main() {
     ok(!('merge' in d), `merge=${label} -> 严格非 merge 路径`, r.text.slice(0, 120));
   }
 
-  // ---- 汇总 ----
+  // ---- summary ----
   console.log('\n================ 失败用例清单 ================');
   if (failures.length === 0) {
     console.log('（无）');

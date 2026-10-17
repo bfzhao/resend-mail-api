@@ -1,31 +1,31 @@
--- 006：入向从 Resend 迁到 Cloudflare Email Routing —— 「绝不丢」索引表
+-- 006: migrate inbound from Resend to Cloudflare Email Routing — the "never lose" index table
 --
--- 背景：CF Email Routing 是**路由器、不是邮箱**，官方不存收到的邮件、也没有任何接口能重拉
--- （对比 Resend 存 30 天并支持 retrieve-received-email）。因此入向的第一优先级不是「解析好」
--- 而是「**绝不丢**」：收到信先落原始副本，解析失败也有兜底。
+-- Background: CF Email Routing is a **router, not a mailbox**; it does not store received mail and has no interface to re-fetch it
+-- (unlike Resend, which stores mail for 30 days and supports retrieve-received-email). So inbound's top priority is not "parse it well"
+-- but "**never lose it**": on receipt store the raw copy first, so even a parse failure has a fallback.
 --
--- 流程（`src/inbound-email.ts`）：
---   1. `email()`：读头 + 把 `message.raw` **流式**落 R2（不整读进内存）+ 在此表登记一行 + 入队（只发 id 指针）
---   2. `queue()`：从 R2 取原始件 → postal-mime 解析 → 复用现有 saveInbound 写入 messages/attachments
---      → 回填 parsed_at / message_row
+-- Flow (`src/inbound-email.ts`):
+--   1. `email()`: read headers + **stream** `message.raw` to R2 (without reading it all into memory) + register a row in this table + enqueue (sending only the id pointer)
+--   2. `queue()`: fetch the raw message from R2 → parse with postal-mime → reuse the existing saveInbound to write messages/attachments
+--      → backfill parsed_at / message_row
 --
--- 幂等：`id` 同时用作 webhook_deliveries 的幂等 id（saveInbound 内部 INSERT OR IGNORE）；
--- `message_row` 非空即表示已入库，重复投递（Queue 至少一次）直接跳过。
+-- Idempotency: `id` is also used as the webhook_deliveries idempotency id (INSERT OR IGNORE inside saveInbound);
+-- a non-null `message_row` means it is already stored, so a duplicate delivery (Queue at-least-once) is skipped directly.
 --
--- 本表**纯新增**，不改动 messages/attachments 任何列 —— 历史数据与 Resend 入向路径（/webhook/inbound）完全不受影响。
+-- This table is **purely additive** and changes no column of messages/attachments — historical data and the Resend inbound path (/webhook/inbound) are completely unaffected.
 
 CREATE TABLE IF NOT EXISTS inbound_raw (
-    id           TEXT PRIMARY KEY,                  -- uuid；同时作为 Queue 指针与 webhook_deliveries 幂等 id
-    r2_key       TEXT NOT NULL,                     -- 原始 .eml 的 R2 key
-    from_email   TEXT,                              -- 信封发件人（SMTP MAIL FROM）
-    to_email     TEXT,                              -- 信封收件人（投递地址）
-    size         INTEGER NOT NULL DEFAULT 0,        -- 原始字节数
-    message_id   TEXT,                              -- 头里的 Message-ID（去尖括号），仅用于诊断
+    id           TEXT PRIMARY KEY,                  -- uuid; also used as the Queue pointer and the webhook_deliveries idempotency id
+    r2_key       TEXT NOT NULL,                     -- R2 key of the raw .eml
+    from_email   TEXT,                              -- envelope sender (SMTP MAIL FROM)
+    to_email     TEXT,                              -- envelope recipient (delivery address)
+    size         INTEGER NOT NULL DEFAULT 0,        -- raw byte count
+    message_id   TEXT,                              -- Message-ID in the headers (angle brackets stripped), for diagnostics only
     received_at  INTEGER NOT NULL,
-    parsed_at    INTEGER,                           -- 解析完成时间；NULL = 待解析
-    message_row  TEXT,                              -- 解析后写入的 messages.id（幂等：非空=已入库）
-    error        TEXT,                              -- 永久解析失败原因（原始件仍保留在 R2）
-    attempts     INTEGER NOT NULL DEFAULT 0         -- 重试次数（瞬时失败）；超阈值后不再重试
+    parsed_at    INTEGER,                           -- parse completion time; NULL = pending parse
+    message_row  TEXT,                              -- messages.id written after parsing (idempotent: non-null = already stored)
+    error        TEXT,                              -- permanent parse failure reason (raw message is still kept in R2)
+    attempts     INTEGER NOT NULL DEFAULT 0         -- retry count (transient failures); no more retries after the threshold
 );
 CREATE INDEX IF NOT EXISTS idx_inbound_raw_pending ON inbound_raw(parsed_at, received_at) WHERE parsed_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_inbound_raw_message_id ON inbound_raw(message_id) WHERE message_id IS NOT NULL;

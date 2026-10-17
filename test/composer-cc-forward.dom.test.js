@@ -1,22 +1,25 @@
 'use strict';
 
 /* =============================================================================
- * 收件人联想 / 抄送密送 / 转发 —— 真实 jsdom + 完整 index.html + 完整 app.js
+ * Recipient autocomplete / cc-bcc / forward -- real jsdom + full index.html + full app.js
  *
- * 运行：
- *   NODE_PATH=C:\Users\Bingfeng\.workbuddy-ai\binaries\node\workspace\node_modules \
+ * Run:
+ *   NODE_PATH=<NODE_PATH> \
  *     <node.exe> test/composer-cc-forward.dom.test.js
  *
- * 退出码：0 = 全部通过；1 = 存在失败。
+ * Exit code: 0 = all passed; 1 = some failed.
  *
- * 覆盖三件事：
- *   1) 收件人联想（to / cc / bcc 三个字段共用一套下拉）：按光标所在段过滤本地联系人、
- *      选中后只替换那一段、键盘上下+回车、Esc 只关下拉不关弹窗；
- *   2) 抄送 / 密送：展开收起、进请求体、与「合并发送」互斥时前端先拦；
- *   3) 转发：阅读面板按钮（入站与出站都有）、弹窗预填（Fwd: 主题 / 原文引用 / 收件人留空）、
- *      发送打到 /forward、跳过附件时给警示而不是假装成功。
+ * Covers three things:
+ *   1) Recipient autocomplete (to / cc / bcc share one dropdown): filter local contacts by the
+ *      segment at the caret, replace only that segment on selection, keyboard up/down + Enter,
+ *      Esc closes only the dropdown without closing the compose window;
+ *   2) Cc / Bcc: expand/collapse, entering the request body, and the frontend blocking first when
+ *      mutually exclusive with "merge send";
+ *   3) Forward: read-pane button (present for both inbound and outbound), composer prefill
+ *      (Fwd: subject / original quote / empty recipient), send hits /forward, warns instead of
+ *      pretending success when attachments are skipped.
  *
- * 本文件不修改 public/ 与 src/ 下任何源码。
+ * This file does not modify any source under public/ and src/.
  * ===========================================================================*/
 
 const fs = require('fs');
@@ -25,10 +28,10 @@ const crypto = require('crypto');
 const { JSDOM } = require('jsdom');
 
 const ROOT = path.join(__dirname, '..');
-// QA_APP_JS 仅用于「变异验证」：指向一份人工构造的缺陷版 app.js。
+// QA_APP_JS is only for "mutation verification": points to a hand-crafted defective app.js.
 const APP_JS_PATH = process.env.QA_APP_JS || path.join(ROOT, 'public', 'app.js');
-// QA_INDEX_HTML 仅用于「变异验证」：指向一份人工构造的缺陷版 index.html（变体放仓库外）。
-// 缺了这个钩子，HTML 变体会「跑仓库原文件却以为跑的是变体」→ 变体恒不被抓（假阴性）。
+// QA_INDEX_HTML is only for "mutation verification": points to a hand-crafted defective index.html (the variant lives outside the repo).
+// Without this hook, the HTML variant would "run the repo's original file while thinking it ran the variant" -> the variant is never caught (false negative).
 const INDEX_PATH = process.env.QA_INDEX_HTML || path.join(ROOT, 'public', 'index.html');
 const APP_JS = fs.readFileSync(APP_JS_PATH, 'utf8');
 const INDEX_HTML = fs.readFileSync(INDEX_PATH, 'utf8');
@@ -38,7 +41,7 @@ const FINGERPRINT = {
   'public/index.html': crypto.createHash('md5').update(INDEX_HTML).digest('hex'),
 };
 
-/** 本地联系人固定装置：输入 lili 应当命中前三个（姓名包含 / 邮箱包含），不命中 Bob Li。 */
+/** Local contacts fixture: typing lili should hit the first three (name contains / email contains) but not Bob Li. */
 const CONTACTS = [
   { name: 'Lili Wang', email: 'lili.wang@partner.com', count: 5 },
   { name: 'Lili Chen', email: 'lili.chen@other.com', count: 2 },
@@ -47,7 +50,7 @@ const CONTACTS = [
 ];
 
 /* ---------------------------------------------------------------------------
- * fetch 打桩
+ * fetch stub
  * -------------------------------------------------------------------------*/
 function makeFetchStub() {
   const calls = [];
@@ -103,7 +106,7 @@ function makeFetchStub() {
 }
 
 /* ---------------------------------------------------------------------------
- * 启动一个已跑完 init() 的应用实例
+ * Boot an application instance that has finished running init()
  * -------------------------------------------------------------------------*/
 const tick = (win) => new Promise((r) => win.setTimeout(r, 0));
 async function ticks(win, n = 1) { for (let i = 0; i < n; i++) await tick(win); }
@@ -112,7 +115,7 @@ async function boot() {
   const dom = new JSDOM(INDEX_HTML, { runScripts: 'dangerously', url: 'http://localhost/' });
   const win = dom.window;
   const stub = makeFetchStub();
-  win.fetch = stub.fetchImpl; // 必须在注入 app.js 之前
+  win.fetch = stub.fetchImpl; // must be before injecting app.js
 
   const script = win.document.createElement('script');
   script.textContent = APP_JS;
@@ -130,7 +133,7 @@ async function boot() {
 }
 
 /* ---------------------------------------------------------------------------
- * 辅助
+ * Helpers
  * -------------------------------------------------------------------------*/
 const clickEvt = (win) => new win.MouseEvent('click', { bubbles: true, cancelable: true });
 const mouseEvt = (win) => new win.MouseEvent('mousedown', { bubbles: true, cancelable: true });
@@ -150,7 +153,7 @@ const suggestItems = (ctx) => Array.from(el(ctx, '#addr-suggest').querySelectorA
 const suggestTexts = (ctx) => suggestItems(ctx).map((n) => n.textContent);
 const hidden = (ctx, sel) => el(ctx, sel).classList.contains('hidden');
 
-/** 模拟用户输入：写入 value 并把光标放到末尾（联想按光标所在段取 token）。 */
+/** Simulate user input: write value and put the caret at the end (autocomplete takes the token at the caret). */
 function typeInto(ctx, sel, text) {
   const node = el(ctx, sel);
   node.value = text;
@@ -166,7 +169,7 @@ function setChecked(ctx, sel, v) {
 
 async function openCompose(ctx) {
   clickEl(ctx, '#compose-btn');
-  await ticks(ctx.win, 5); // 等 loadContacts() 落地
+  await ticks(ctx.win, 5); // wait for loadContacts() to settle
 }
 
 async function send(ctx) { clickEl(ctx, '#composer-send'); await ticks(ctx.win, 10); }
@@ -180,7 +183,7 @@ const MSG_IN = {
 const MSG_OUT = Object.assign({}, MSG_IN, { direction: 'outbound', from_email: 'me@example.com', from_name: null, status: 'sent' });
 const ATTS = [{ id: 'a1', filename: 'note.txt', size: 5, inline: false, url: '/api/attachments/a1' }];
 
-/** 把阅读面板渲染成「某封邮件已打开」的状态（openId 必须对上，否则按钮是空转的）。 */
+/** Render the read pane into the "some message is open" state (openId must match, otherwise the buttons do nothing). */
 function renderReadFor(ctx, m, atts) {
   evalIn(ctx, `currentMessage = ${JSON.stringify(m)}; currentAttachments = ${JSON.stringify(atts || [])}; state.openId = ${JSON.stringify(m.id)}; renderRead();`);
 }
@@ -194,7 +197,7 @@ function clickReadAction(ctx, label) {
 }
 
 /* ---------------------------------------------------------------------------
- * 用例运行器
+ * Test case runner
  * -------------------------------------------------------------------------*/
 const results = [];
 let currentTest = '(boot)';
@@ -224,13 +227,13 @@ async function test(name, fn) {
 }
 
 /* =============================================================================
- * 用例
+ * Test cases
  * ===========================================================================*/
 (async () => {
   console.log(`被测版本: app.js md5=${FINGERPRINT['public/app.js']}  index.html md5=${FINGERPRINT['public/index.html']}`);
   console.log(`被测文件: ${APP_JS_PATH}${process.env.QA_APP_JS ? '  ← QA_APP_JS 变异体' : ''}`);
 
-  /* ---- D1 抄送 / 密送展开收起 ---- */
+  /* ---- D1 cc / bcc expand-collapse ---- */
   await test('D1 抄送/密送：默认收起、点击展开、有内容时不许收起', async (ctx) => {
     await openCompose(ctx);
     ok(hidden(ctx, '#f-cc-row') && hidden(ctx, '#f-bcc-row'), '默认两行都收起');
@@ -249,7 +252,7 @@ async function test(name, fn) {
     ok(hidden(ctx, '#f-cc-row'), '清空后可以收起');
   });
 
-  /* ---- D2 cc/bcc 进请求体 ---- */
+  /* ---- D2 cc/bcc go into the request body ---- */
   await test('D2 cc/bcc 进入请求体；为空时不带该字段', async (ctx) => {
     await openCompose(ctx);
     clickEl(ctx, '#f-cc-toggle');
@@ -266,7 +269,7 @@ async function test(name, fn) {
     ok(JSON.stringify(body.bcc) === JSON.stringify(['s1@x.com']), '⭐ bcc 进请求体', JSON.stringify(body.bcc));
     ok(ctx.stub.lastSend().url === '/api/messages', '打到写信接口', ctx.stub.lastSend().url);
 
-    // 负控制：cc/bcc 为空时不得带空数组字段（后端会当成「有值」处理）
+    // Negative control: when cc/bcc are empty, don't include empty-array fields (the backend would treat them as "present")
     await openCompose(ctx);
     typeInto(ctx, '#f-to', 'a@x.com');
     evalIn(ctx, "$('#f-body').value = 'body';");
@@ -275,7 +278,7 @@ async function test(name, fn) {
     ok(!('cc' in b2) && !('bcc' in b2), '负控制：没有 cc/bcc 时不带这两个字段', JSON.stringify(Object.keys(b2)));
   });
 
-  /* ---- D3 merge 与 bcc 互斥：前端先拦 ---- */
+  /* ---- D3 merge and bcc mutually exclusive: the frontend blocks first ---- */
   await test('D3 合并发送 + 密送：前端先拦下，不发请求', async (ctx) => {
     await openCompose(ctx);
     clickEl(ctx, '#f-cc-toggle');
@@ -289,13 +292,13 @@ async function test(name, fn) {
     ok(toastText(ctx).includes('密送'), '提示里说明是密送冲突', toastText(ctx));
     ok(composerOpen(ctx), '弹窗保持打开，内容不丢');
 
-    // 负控制：取消密送后同样入参可以发出去
+    // Negative control: after clearing bcc the same input can be sent
     typeInto(ctx, '#f-bcc', '');
     await send(ctx);
     ok(ctx.stub.sends().length === before + 1, '负控制：清空密送后能正常发送', ctx.stub.sends().length);
   });
 
-  /* ---- D4 阅读面板的「转发」按钮 ---- */
+  /* ---- D4 the "forward" button in the read pane ---- */
   await test('D4 阅读面板：入站有「回复+转发」，出站也有「转发」（无回复）', async (ctx) => {
     renderReadFor(ctx, MSG_IN, ATTS);
     const inBtns = readActionButtons(ctx);
@@ -308,7 +311,7 @@ async function test(name, fn) {
     ok(!outBtns.includes('回复'), '出站没有「回复」（只能回复收到的邮件）', outBtns.join('/'));
   });
 
-  /* ---- D5 转发弹窗预填 + 发送 ---- */
+  /* ---- D5 forward composer prefill + send ---- */
   await test('D5 转发弹窗：Fwd: 主题 / 原文引用 / 收件人留空 / 附件提示；发送打到 /forward', async (ctx) => {
     renderReadFor(ctx, MSG_IN, ATTS);
     clickReadAction(ctx, '转发');
@@ -335,7 +338,7 @@ async function test(name, fn) {
     ok(toastText(ctx).includes('转发'), '成功提示是「已转发」而不是「已发送」', toastText(ctx));
   });
 
-  /* ---- D6 转发时附件读取失败 -> 警示，不假装成功 ---- */
+  /* ---- D6 attachment read failure on forward -> warn, don't pretend success ---- */
   await test('D6 转发响应里 skipped_attachments -> 警示 toast（不假装附件跟着走了）', async (ctx) => {
     ctx.stub.setSendResponse(200, { ok: true, id: 'row-9', resend_id: 're-9', skipped_attachments: ['note.txt'] });
     renderReadFor(ctx, MSG_IN, ATTS);
@@ -347,7 +350,7 @@ async function test(name, fn) {
     ok(el(ctx, '#toast').classList.contains('error'), '以错误样式呈现', '');
   });
 
-  /* ---- D7 联想：输入名字片段 -> 下拉 -> 点击替换为邮箱 ---- */
+  /* ---- D7 autocomplete: type a name fragment -> dropdown -> click replaces with email ---- */
   await test('D7 联想：输入 lili -> 列出所有名字含 lili 的联系人 -> 选中替换为邮箱', async (ctx) => {
     await openCompose(ctx);
     typeInto(ctx, '#f-to', 'lili');
@@ -363,7 +366,7 @@ async function test(name, fn) {
       '⭐ 选中后该段被替换为纯邮箱（并补了分隔符方便接着输）', JSON.stringify(val(ctx, '#f-to')));
     ok(!suggestOpen(ctx), '选中后下拉收起');
 
-    // 继续输第二个：前面已选的不受影响
+    // Continue typing the second one: earlier selections are unaffected
     typeInto(ctx, '#f-to', 'lili.wang@partner.com, lili.chen');
     ok(suggestOpen(ctx), '继续输入第二个也能联想');
     suggestItems(ctx)[0].dispatchEvent(mouseEvt(ctx.win));
@@ -371,7 +374,7 @@ async function test(name, fn) {
       '⭐ 只替换光标所在的那一段，已选中的第一个原样保留', JSON.stringify(val(ctx, '#f-to')));
   });
 
-  /* ---- D8 键盘操作 ---- */
+  /* ---- D8 keyboard interaction ---- */
   await test('D8 联想：↓ 移动高亮、回车选中；无匹配时下拉不出现', async (ctx) => {
     await openCompose(ctx);
     typeInto(ctx, '#f-to', 'lili');
@@ -389,7 +392,7 @@ async function test(name, fn) {
     ok(!suggestOpen(ctx), '⭐ 没有匹配时下拉不出现（不显示空盒子）');
   });
 
-  /* ---- D9 Esc 只关下拉，不关弹窗 ---- */
+  /* ---- D9 Esc closes only the dropdown, not the composer ---- */
   await test('D9 Esc：下拉打开时只收起下拉，绝不顺带关掉写信弹窗', async (ctx) => {
     await openCompose(ctx);
     typeInto(ctx, '#f-to', 'lili');
@@ -400,13 +403,13 @@ async function test(name, fn) {
     ok(composerOpen(ctx), '⭐ 弹窗仍然打开（stopPropagation 生效）');
     ok(!confirmShown(ctx), '⭐ 也没有弹出「放弃编辑」确认框');
 
-    // 下拉已收起时，Esc 恢复既有语义：请求关闭弹窗（本轮起语义是「存草稿并关闭」，不再弹确认）
+    // When the dropdown is already collapsed, Esc restores the existing semantics: request close (this round's semantics is "save draft and close", no more confirm)
     el(ctx, '#f-to').dispatchEvent(keyEvt(ctx.win, 'Escape'));
     ok(!composerOpen(ctx), '下拉收起后 Esc 回到「请求关闭弹窗」的既有行为（存草稿并关闭）', `open=${composerOpen(ctx)}`);
     ok(!confirmShown(ctx), '不再弹「放弃编辑」确认框');
   });
 
-  /* ---- D10 cc / bcc 字段同样能联想 ---- */
+  /* ---- D10 autocomplete also works for cc / bcc fields ---- */
   await test('D10 联想对 cc / bcc 字段同样生效（不是只有 to）', async (ctx) => {
     await openCompose(ctx);
     clickEl(ctx, '#f-cc-toggle');
@@ -421,7 +424,7 @@ async function test(name, fn) {
     ok(suggestTexts(ctx).some((t) => t.includes('bob@x.com')), '按邮箱片段匹配到 Bob', JSON.stringify(suggestTexts(ctx)));
   });
 
-  /* ---- D11 脏检查纳入 cc/bcc ---- */
+  /* ---- D11 dirty check includes cc/bcc ---- */
   await test('D11 isComposerDirty 把 cc/bcc 计入（否则改了抄送直接关窗会静默丢弃）', async (ctx) => {
     await openCompose(ctx);
     ok(isDirty(ctx) === false, '刚打开 -> 不脏');
@@ -436,19 +439,19 @@ async function test(name, fn) {
     ok(isDirty(ctx) === false, '清空密送 -> 回到不脏');
   });
 
-  /* ---- D12 联想下拉的宽度策略 ---- */
+  /* ---- D12 width strategy of the autocomplete dropdown ---- */
   await test('D12 联想下拉宽度：铺满弹窗内容宽度，不再跟随（很窄的）输入框', async (ctx) => {
     await openCompose(ctx);
 
-    // ① 纯函数层：宽度只由弹窗内容宽度决定，锚点宽度不参与
+    // 1) Pure function layer: the width is determined only by the composer content width; the anchor width doesn't participate
     const g = JSON.parse(evalIn(ctx,
       "JSON.stringify(suggestBoxGeom({ hostWidth: 320, padLeft: 14, padRight: 14, anchorTop: 40, anchorHeight: 36 }))"));
     ok(g.width === 292, '⭐ 宽度 = 内容宽度 - 左右内边距（320-14-14）', JSON.stringify(g.width));
     ok(g.left === 14, '左边界对齐内容左边缘（不是贴弹窗边框）', JSON.stringify(g.left));
     ok(g.top === 80, '上边界 = 锚点底边 + 4（40+36+4）', JSON.stringify(g.top));
 
-    // ② 真实调用路径：把输入框做成很窄、弹窗做成很宽，宽度必须跟着弹窗走
-    //    （jsdom 没有排版，clientWidth/offsetWidth 恒为 0，只能自己钉死这两个数字）
+    // 2) Real call path: make the input very narrow and the composer very wide; the width must follow the composer
+    //    (jsdom has no layout, clientWidth/offsetWidth are always 0, so we must pin these two numbers ourselves)
     const host = el(ctx, '#composer');
     const input = el(ctx, '#f-to');
     Object.defineProperty(host, 'clientWidth', { value: 700, configurable: true });
@@ -464,13 +467,13 @@ async function test(name, fn) {
       '⭐ 负控制：宽度确实不再等于输入框宽度（回退成 anchor.offsetWidth 会被这条抓住）', box.style.width);
     ok(box.style.top === '98px', '位置仍跟着输入框（60+34+4）', box.style.top);
 
-    // ③ 边界：弹窗比内边距还窄时不得出现负宽度
+    // 3) Edge: when the composer is narrower than the padding, no negative width may appear
     const tiny = JSON.parse(evalIn(ctx,
       "JSON.stringify(suggestBoxGeom({ hostWidth: 10, padLeft: 14, padRight: 14, anchorTop: 0, anchorHeight: 0 }))"));
     ok(tiny.width === 0, '弹窗窄于内边距时宽度夹到 0，不产生负数', JSON.stringify(tiny.width));
   });
 
-  /* ---- 汇总 ---- */
+  /* ---- summary ---- */
   console.log('\n================ 失败用例清单 ================');
   const failed = results.filter((r) => !r.ok);
   if (!failed.length) console.log('（无）');

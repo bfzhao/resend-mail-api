@@ -1,10 +1,10 @@
 'use strict';
 
 /* =========================================================
- * 邮件收件箱前端（无构建，纯原生）
- * 布局：左侧邮件清单 + 右侧详情（类 Yahoo/常见客户端）
- * 能力：多收件地址 · 会话上下文 · 附件发送 · 富文本
- * 性能：本地持久化缓存（localStorage）优先渲染 + 后台 revalidate + 静默刷新 + 定时同步
+ * Mail inbox frontend (no build, pure vanilla)
+ * Layout: message list on the left + detail on the right (Yahoo-like / common clients)
+ * Features: multiple recipient addresses · conversation context · attachment sending · rich text
+ * Performance: local persistent cache (localStorage) render-first + background revalidate + silent refresh + periodic sync
  * ========================================================= */
 
 const FOLDERS = [
@@ -19,46 +19,46 @@ const PAGE_SIZE = 50;
 const MAX_FILE_BYTES = 40 * 1024 * 1024;
 
 const TTL = { folder: 45 * 1000, message: 3 * 60 * 1000, counts: 20 * 1000, mailboxes: 10 * 1000 };
-// 后台同步间隔：60s → 5min。理由：计数/列表的 TTL 是 20~45s，60s 一轮几乎每轮都在重拉；
-// 而列表/计数只在「有变化」时才需要刷新，5min 已能覆盖「长时间挂着页面」的场景，
-// 页面重新可见时还有 visibilitychange 兜底立即同步一次。
+// Background sync interval: 60s → 5min. Reason: counts/list TTL is 20~45s, so a 60s cycle refetches almost every round;
+// list/counts only need refreshing when something "changed", and 5min already covers the "page left open for a long time" case,
+// and when the page becomes visible again visibilitychange still forces an immediate sync as a fallback.
 const SYNC_MS = 5 * 60 * 1000;
 
-/* 本地持久化缓存：刷新页面后首屏 0 请求即可显示列表 / 计数徽标 / 账号下拉。 */
+/* Local persistent cache: after a page refresh, the first paint needs 0 requests to show the list / count badges / account dropdown. */
 const CACHE_KEY = 'inbox-cache-v1';
-// v2：会话项新增 `copy_ids`、且顺序由升序改为降序（见 src/repo.ts listThread）。
-// 旧快照里的 thread 数组带着**旧顺序与重复行**，且 TTL 内不会重新校验，
-// 不升版会让「已经修好的会话面板」在刷新后仍显示旧结果（一次全量重拉换立即正确）。
-// v3：会话归组的根因修复（Resend 的 References 是 JSON 数组文本，旧解析产出畸形 thread_id）
-//     —— 旧快照里的 thread 数组是按错误分组拼出来的，必须整份作废；
-//     同时新增「草稿」文件夹，counts 多了 drafts_total 字段。
-// v4：列表行的 thread_count 改为「折叠回环副本后」的封数（见 src/repo.ts applyFoldedThreadCounts），
-//     与会话面板口径对齐。旧快照里的列表徽标仍是折叠前的原始行数（如 3 vs 2），
-//     而列表 revalidate 的指纹不含 thread_count，不升版会一直显示旧徽标。
+// v2: conversation items gained `copy_ids`, and order changed from ascending to descending (see src/repo.ts listThread).
+// Old snapshots' thread arrays carry the **old order and duplicate rows**, and are not revalidated within the TTL;
+// not bumping the version would leave the "already-fixed conversation panel" still showing old results after refresh (one full refetch buys immediate correctness).
+// v3: root-cause fix for conversation grouping (Resend's References is JSON array text, the old parsing produced malformed thread_id)
+//     —— old snapshots' thread arrays were assembled from wrong groupings and must be discarded wholesale;
+//     also added the "drafts" folder and the drafts_total field to counts.
+// v4: list rows' thread_count changed to the count "after folding loop-back duplicates" (see src/repo.ts applyFoldedThreadCounts),
+//     aligned with the conversation panel's definition. Old snapshots' list badges still hold the raw pre-folding row count (e.g. 3 vs 2),
+//     and the list revalidate fingerprint does not include thread_count, so not bumping the version would keep showing the old badge.
 const CACHE_VERSION = 4;
 const PERSIST_DEBOUNCE_MS = 300;
 
-/* 已打开邮件正文的内存 LRU：最多 40 封或合计 2MB，先到为准。 */
+/* In-memory LRU for opened message bodies: max 40 messages or 2MB total, whichever comes first. */
 const MSG_CACHE_MAX = 40;
 const MSG_CACHE_BYTES = 2 * 1024 * 1024;
 
 /*
- * 落盘正文**不另设条数/字节上限**：内存 LRU 里有什么就落什么（LRU 自身已封顶 40 封 / 2MB）。
- * 真正的兜底是 localStorage 的硬配额（通常 5MB/源）—— 见 writePersisted 的对半砍重试。
- * 这样「读过的邮件刷新后免下载」覆盖到全部最近读过的邮件，而不是只有最近 12 封。
+ * Persisted bodies have **no separate count/byte limit**: whatever is in the in-memory LRU gets persisted (the LRU itself is already capped at 40 messages / 2MB).
+ * The real fallback is localStorage's hard quota (usually 5MB/origin) —— see the halving retry in writePersisted.
+ * This way "read messages don't need re-downloading after refresh" covers all recently read messages, not just the most recent 12.
  */
 
-/** 后端把 mailbox 为空/NULL 的行归入这个显式分组；必须与 src/repo.ts 的 UNKNOWN_MAILBOX 一致。 */
+/** The backend puts rows with empty/NULL mailbox into this explicit group; must match src/repo.ts's UNKNOWN_MAILBOX. */
 const UNKNOWN_MAILBOX = '(未识别)';
 
 /*
- * 后台预下载正文：列表渲染完成后，空闲时顺序把当前列表里**尚未缓存**的正文抓回来。
- * 目的：用户点开时正文已经在本地，不再看到「正在下载」。
+ * Background body prefetch: after the list renders, sequentially fetch the bodies of the current list that are **not yet cached** while idle.
+ * Goal: when the user opens a message the body is already local, so they no longer see "downloading".
  */
-const PREFETCH_MAX = 50;             // 一次预取上限（正好一页）
-const PREFETCH_START_DELAY_MS = 500; // 先让首屏的关键请求走完，再开始预取
-const PREFETCH_GAP_MS = 100;         // 每封之间留间隔，不与用户点击争抢
-const PREFETCH_PERSIST_EVERY = 5;    // 每预取 N 封落盘一次，中途离开也不会全丢
+const PREFETCH_MAX = 50;             // per-run prefetch cap (exactly one page)
+const PREFETCH_START_DELAY_MS = 500; // let the first-paint critical requests finish first, then start prefetching
+const PREFETCH_GAP_MS = 100;         // leave a gap between messages so we don't compete with user clicks
+const PREFETCH_PERSIST_EVERY = 5;    // persist once every N messages prefetched, so leaving midway doesn't lose everything
 
 const STATUS_LABEL = {
   sent: '已发送',
@@ -77,7 +77,7 @@ const state = {
   mailbox: '',
   mailboxList: [],
   items: [],
-  itemsKey: null, // 当前 state.items 对应的视图 key，用于判断「同视图刷新」而非清屏重来
+  itemsKey: null, // view key that the current state.items corresponds to, used to tell "same-view refresh" apart from clearing the screen and starting over
   selected: new Set(),
   q: '',
   total: 0,
@@ -87,12 +87,12 @@ const state = {
   canSend: false,
   fromAddress: '',
   fromName: '',
-  /** 本地联系人（GET /api/contacts），供收件人输入联想。 */
+  /** Local contacts (GET /api/contacts), used for recipient input autocomplete. */
   contacts: [],
   contactsLoaded: false,
   openId: null,
-  pendingOpenId: null, // 从本地缓存恢复、待列表就绪后重新打开的邮件 id
-  /** 用户拖动分隔条设定的列表宽度（px）。null = 未自定义，走 CSS 默认值与响应式夹取。 */
+  pendingOpenId: null, // message id to reopen after the list is ready, restored from the local cache
+  /** List width (px) set by the user dragging the splitter. null = not customized, uses the CSS default and responsive clamping. */
   listWidth: null,
   loading: false,
   firstOpen: true,
@@ -110,17 +110,17 @@ const $ = (sel) => document.querySelector(sel);
 const listEl = $('#list');
 const readEl = $('#read-message');
 
-/* ---------------- 移动端布局（单栏 + 抽屉） ----------------
- * 断点必须与 app.css 里的 `@media (max-width: 768px)` 保持一致。
+/* ---------------- Mobile layout (single column + drawer) ----------------
+ * The breakpoint must stay in sync with `@media (max-width: 768px)` in app.css.
  */
 const MOBILE_MAX_W = 768;
 
 /**
- * 视口宽度。
+ * Viewport width.
  *
- * 用 `globalThis` 而不是 `window`：两个 vm 套件（compose-guard / mail-merge）的 sandbox 里
- * **没有 window**，裸访问会 `ReferenceError` 把整个套件打挂；`globalThis` 在浏览器里就是
- * window、在 sandbox 里是 sandbox 自身，两边都安全。
+ * Uses `globalThis` instead of `window`: the sandboxes of two vm suites (compose-guard / mail-merge)
+ * have **no window**, and a bare access would throw `ReferenceError` and take down the whole suite; `globalThis` is
+ * window in the browser and the sandbox itself in the sandbox, safe on both sides.
  */
 function viewportWidth() {
   const w = globalThis.innerWidth;
@@ -128,15 +128,15 @@ function viewportWidth() {
 }
 
 /**
- * 是否走移动端（单栏 + 抽屉）布局。
+ * Whether to use the mobile (single column + drawer) layout.
  *
- * matchMedia 优先：真机上它还能感知旋转 / 分屏，且不依赖读时机的 innerWidth。
- * 缺失时回退到 innerWidth —— jsdom 不实现 matchMedia（实测 `typeof window.matchMedia`
- * 是 `undefined`），不做这层特性检测，4 个 jsdom 套件会在 init() 里直接抛错全挂。
+ * matchMedia preferred: on real devices it also senses rotation / split screen, and doesn't depend on
+ * innerWidth read at an arbitrary moment. When missing, fall back to innerWidth —— jsdom doesn't implement
+ * matchMedia (measured: `typeof window.matchMedia` is `undefined`), and without this feature check, the 4 jsdom suites would throw in init() and all fail.
  *
- * ⚠️ 不要用「触摸能力」判断移动端：jsdom 里 `'ontouchstart' in window` 是 **true**，
- * 会把所有测试误判成移动端；`navigator.maxTouchPoints` 在 jsdom 里是 undefined，同样不可靠。
- * 只认宽度。
+ * ⚠️ Don't judge mobile by "touch capability": in jsdom `'ontouchstart' in window` is **true**,
+ * which would misclassify all tests as mobile; `navigator.maxTouchPoints` is undefined in jsdom, equally unreliable.
+ * Only trust width.
  */
 function isMobile() {
   const mm = globalThis.matchMedia;
@@ -144,21 +144,21 @@ function isMobile() {
     try {
       return mm(`(max-width: ${MOBILE_MAX_W}px)`).matches;
     } catch {
-      /* matchMedia 存在但不可用（被桩成不完整对象等）→ 回退到宽度判断 */
+      /* matchMedia exists but is unusable (stubbed as an incomplete object, etc.) → fall back to the width check */
     }
   }
   return viewportWidth() <= MOBILE_MAX_W;
 }
 
-/** 抽屉是否展开。仅移动端有意义。 */
+/** Whether the drawer is open. Only meaningful on mobile. */
 let drawerOpen = false;
 
 /**
- * 移动端布局的**唯一收敛点**：把 (isMobile, state.openId, drawerOpen) 全量对齐到
- * `#app` 上的状态类。任何地方都不许直接 toggle 这几个类，只调这里。
+ * The **single convergence point** for the mobile layout: fully aligns (isMobile, state.openId, drawerOpen) to
+ * the state classes on `#app`. Nothing anywhere is allowed to toggle these classes directly, only call this.
  *
- * 桌面端下这些类不生效（对应规则全在 @media 内），所以从移动端缩放到桌面时不必额外清理；
- * 但仍在这里把 drawerOpen 归零，避免缩回移动端时抽屉莫名是开着的。
+ * On desktop these classes have no effect (the corresponding rules are all inside @media), so no extra cleanup is needed when resizing from mobile to desktop;
+ * but drawerOpen is still reset to zero here, to avoid the drawer mysteriously being open when shrinking back to mobile.
  */
 function syncLayout() {
   const app = $('#app');
@@ -168,11 +168,11 @@ function syncLayout() {
   app.classList.toggle('is-mobile', mobile);
   app.classList.toggle('mobile-detail', mobile && state.openId !== null);
   app.classList.toggle('drawer-open', mobile && drawerOpen);
-  // 写信弹窗的浮动几何：移动端要把内联 left/top/width/height 清掉（内联值优先于媒体查询），
-  // 桌面端则把几何重新夹进新视口。放在这里而不是另开一个 resize 监听，是为了让
-  // 「断点切换」和「窗口缩放」共用同一个收敛点。
+  // Floating geometry of the compose window: on mobile the inline left/top/width/height must be cleared (inline values win over media queries),
+  // on desktop the geometry is re-clamped into the new viewport. Putting it here instead of a separate resize listener is so that
+  // "breakpoint switching" and "window resizing" share the same convergence point.
   syncComposerWindowLayout();
-  // 同理：列表宽度也要按新视口重新夹取（窗口缩小时不能把详情栏挤没）
+  // Likewise: list width must be re-clamped for the new viewport (shrinking the window must not squeeze the detail pane away)
   syncListWidth();
 }
 
@@ -181,27 +181,27 @@ function setDrawer(open) {
   syncLayout();
 }
 
-/** 收起抽屉。桌面端调用无副作用（drawerOpen 本来就是 false）。 */
+/** Collapse the drawer. Calling on desktop has no side effects (drawerOpen is already false). */
 function closeDrawer() {
   if (drawerOpen) setDrawer(false);
 }
 
-/* ---------------- 列表 / 详情分隔条（可拖动） ----------------
- * 桌面双栏下，用户拖动中间竖线调整列表宽度。
+/* ---------------- List / detail splitter (draggable) ----------------
+ * In the desktop two-column layout, the user drags the middle vertical line to adjust the list width.
  *
- * 宽度只有一个真值来源：`state.listWidth`（**用户期望宽度**），
- * 唯一出口是 `applyListWidth()`（写 CSS 变量 `--list-w` + 挂 `list-w-custom` 类）。
- * 拖动 / 键盘 / 双击复位 / 窗口缩放全部收敛到这里，任何地方不许自己写 style.width。
+ * Width has only one source of truth: `state.listWidth` (**the width the user wants**),
+ * and the only outlet is `applyListWidth()` (writes the CSS variable `--list-w` + adds the `list-w-custom` class).
+ * Drag / keyboard / double-click reset / window resize all converge here; nothing anywhere is allowed to write style.width itself.
  *
- * ⚠️ `state.listWidth` 存期望值而非夹取后的实际值：否则窗口缩小被夹一次、再放大就回不去了。
+ * ⚠️ `state.listWidth` stores the desired value, not the clamped actual value: otherwise shrinking the window clamps it once, and enlarging again can't get it back.
  */
 
 const LIST_W_KEY = 'inbox-list-w';
-const LIST_W_DEFAULT = 430; // 与 app.css 里 :root 的 --list-w 初始值一致
-const LIST_W_MIN = 260; // 再窄主题与发件人都显示不全
-const LIST_W_MAX_RATIO = 0.7; // 最多占视口 70%，详情栏永远留得住
+const LIST_W_DEFAULT = 430; // matches the --list-w initial value in :root in app.css
+const LIST_W_MIN = 260; // any narrower and both subject and sender get truncated
+const LIST_W_MAX_RATIO = 0.7; // at most 70% of the viewport, so the detail pane always keeps its space
 
-/** 当前视口允许的最大列表宽度。 */
+/** Maximum list width allowed in the current viewport. */
 function listWidthMax() {
   return Math.max(LIST_W_MIN, Math.floor(viewportWidth() * LIST_W_MAX_RATIO));
 }
@@ -212,7 +212,7 @@ function clampListWidth(px) {
   return Math.min(listWidthMax(), Math.max(LIST_W_MIN, n));
 }
 
-/** `px == null` → 恢复默认（清掉自定义类与内联变量，回到 CSS 的 430px + 响应式夹取）。 */
+/** `px == null` → restore the default (clears the custom class and inline variable, back to CSS's 430px + responsive clamping). */
 function applyListWidth(px) {
   const app = $('#app');
   if (!app) return;
@@ -227,7 +227,7 @@ function applyListWidth(px) {
   app.classList.add('list-w-custom');
 }
 
-/** 视口变化后重新夹取（保留期望值，不把「临时夹小」写回 state）。 */
+/** Re-clamp after the viewport changes (keeps the desired value, doesn't write the "temporary clamp" back to state). */
 function syncListWidth() {
   if (state.listWidth == null) return;
   applyListWidth(state.listWidth);
@@ -249,11 +249,11 @@ function saveListWidth() {
     if (state.listWidth == null) localStorage.removeItem(LIST_W_KEY);
     else localStorage.setItem(LIST_W_KEY, String(state.listWidth));
   } catch {
-    /* 存储不可用（隐私模式 / 配额满）：本次会话内仍然生效 */
+    /* storage unavailable (private mode / quota full): still effective within this session */
   }
 }
 
-/** 列表当前实际宽度，作为键盘步进的基准。 */
+/** Current actual list width, used as the base for keyboard stepping. */
 function currentListWidth() {
   const pane = $('#list-pane');
   const w = pane && typeof pane.getBoundingClientRect === 'function' ? pane.getBoundingClientRect().width : 0;
@@ -267,8 +267,8 @@ function onSplitterDown(e) {
   if (e.button != null && e.button !== 0) return;
   const sp = $('#splitter');
   if (!sp) return;
-  // 双击复位：连击时 pointerdown 的 detail 递增（第二次为 2）。
-  // 不用 dblclick，是因为下面的 preventDefault 会干扰 click 序列。
+  // Double-click reset: during repeated clicks pointerdown's detail increments (2 on the second one).
+  // Not using dblclick because the preventDefault below would interfere with the click sequence.
   if (e.detail >= 2) {
     applyListWidth(LIST_W_DEFAULT);
     saveListWidth();
@@ -278,12 +278,12 @@ function onSplitterDown(e) {
   splitDrag = { x: e.clientX, start: currentListWidth(), id: e.pointerId };
   const app = $('#app');
   if (app) app.classList.add('resizing');
-  // 指针捕获：拖动时即使掠过详情区也能持续收到 move/up
+  // Pointer capture: while dragging, move/up keep arriving even when the pointer passes over the detail area
   if (e.pointerId != null && typeof sp.setPointerCapture === 'function') {
     try {
       sp.setPointerCapture(e.pointerId);
     } catch {
-      /* 捕获不可用则退化成普通事件流，功能不受影响 */
+      /* if capture is unavailable, degrade to the normal event stream, functionality unaffected */
     }
   }
   e.preventDefault();
@@ -304,7 +304,7 @@ function onSplitterUp(e) {
   saveListWidth();
 }
 
-/** 键盘调整（分隔条可聚焦）：← → 步进，Shift 加速，Home 复位。 */
+/** Keyboard adjustment (splitter is focusable): ← → step, Shift to accelerate, Home to reset. */
 function onSplitterKey(e) {
   const step = e.shiftKey ? 50 : 16;
   if (e.key === 'ArrowLeft') applyListWidth(currentListWidth() - step);
@@ -335,6 +335,11 @@ async function api(path, opts = {}) {
     throw new Error('网络错误，请检查 Worker 是否可访问');
   }
   if (res.status === 401) {
+    // Session mode (wizard install): show the login box, don't reload (reload causes a 401 loop).
+    if (gateMode === 'session') {
+      showLogin();
+      throw new Error('unauthorized');
+    }
     showToast('认证失败，请刷新页面重新登录', true);
     setTimeout(() => location.reload(), 800);
     throw new Error('unauthorized');
@@ -347,13 +352,13 @@ async function api(path, opts = {}) {
   return data;
 }
 
-/* ---------------- 缓存 ---------------- */
+/* ---------------- Cache ---------------- */
 
 function folderKey() {
   return `${state.mailbox}|${state.folder}|${state.q}`;
 }
 
-/** 轻量指纹：首尾 id + 总数 + 每行 read/starred，用于「数据没变就不重渲染」。 */
+/** Lightweight fingerprint: first/last id + total + per-row read/starred, used for "don't re-render if data hasn't changed". */
 function folderFingerprint(items, total) {
   let s = `${total}|${items.length}`;
   for (const it of items) s += `|${it.id}${it.read ? 'r' : 'u'}${it.starred ? 's' : ''}`;
@@ -381,9 +386,9 @@ function findItem(id) {
 }
 
 /**
- * 单一来源对齐「当前打开」高亮：列表里最多只有 state.openId 对应的一行带 active。
- * 必须遍历全部行做全量对齐，否则旧行上的 active 会残留，出现多个蓝色选择标记（BUG-1）。
- * 只切 class、不重渲染整表，避免丢失滚动位置。
+ * Aligns the "currently open" highlight from a single source: at most the one row matching state.openId is active.
+ * Must iterate over all rows for a full realignment, otherwise active remains on old rows and multiple blue selection marks appear (BUG-1).
+ * Only toggles class, doesn't re-render the whole table, to avoid losing scroll position.
  */
 function syncActiveRow() {
   for (const row of Array.from(document.querySelectorAll('.list-item[data-id]'))) {
@@ -436,14 +441,14 @@ function invalidateFolderCaches() {
   state.cache.folders.clear();
 }
 
-/* ---------------- 已打开邮件正文的内存 LRU ---------------- */
+/* ---------------- In-memory LRU for opened message bodies ---------------- */
 
 function entryBytes(entry) {
   const m = entry.message || {};
   return String(m.body_html || '').length + String(m.body_text || '').length + 512;
 }
 
-/** 写入并置为最近使用；超上限（40 封 / 2MB）时从最久未使用的一端逐出。 */
+/** Store and mark as most recently used; when over the limit (40 messages / 2MB), evict from the least recently used end. */
 function putMessageCache(id, entry) {
   const e = { ...entry, bytes: entryBytes(entry) };
   state.cache.messages.delete(id);
@@ -458,7 +463,7 @@ function putMessageCache(id, entry) {
   }
 }
 
-/** 命中即刷新 LRU 顺序（Map 的插入顺序即使用顺序）。 */
+/** On a hit, refresh the LRU order (a Map's insertion order is its usage order). */
 function touchMessageCache(id) {
   const v = state.cache.messages.get(id);
   if (!v) return;
@@ -466,44 +471,44 @@ function touchMessageCache(id) {
   state.cache.messages.set(id, v);
 }
 
-/* ---------------- 后台预下载正文 ---------------- */
+/* ---------------- Background body prefetch ---------------- */
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-let prefetchGen = 0;      // 递增即作废上一轮预取
-let prefetchActive = null; // 正在预取的视图 token（同视图不重复启动）
+let prefetchGen = 0;      // incrementing invalidates the previous prefetch round
+let prefetchActive = null; // view token currently being prefetched (same view won't start twice)
 
 /**
- * 空闲时按顺序预取当前列表里尚未缓存的正文，写入消息 LRU（并随快照落盘）。
+ * While idle, sequentially prefetch the not-yet-cached bodies in the current list, writing them to the message LRU (persisted along with snapshots).
  *
- * 约束（每条都对应一个回归用例）：
- *  - 只处理**当前列表** `state.items`，跳过已在缓存里的；上限 PREFETCH_MAX；
- *  - 顺序执行 + 间隔，不与用户点击争抢；页面不可见（document.hidden）立即暂停；
- *  - 视图切换（folder/mailbox/q）通过 token 比对立刻作废；
- *  - **绝不触碰 state.openId / detailSeq / 右侧面板** —— 预取是纯后台行为，
- *    不改变用户看到的任何东西。真正点开时走 openMessage 自己的路径。
+ * Constraints (each maps to a regression test):
+ *  - Only handles the **current list** `state.items`, skipping ones already cached; capped at PREFETCH_MAX;
+ *  - Sequential + spaced out, so it doesn't compete with user clicks; pauses immediately when the page is hidden (document.hidden);
+ *  - View switches (folder/mailbox/q) are invalidated at once via token comparison;
+ *  - **Never touches state.openId / detailSeq / the right pane** —— prefetch is purely a background activity
+ *    and changes nothing the user sees. Actually opening a message follows openMessage's own path.
  */
 function prefetchBodies() {
   if (document.hidden) return;
   const token = folderKey();
-  if (prefetchActive === token) return; // 同一视图已在预取，不重开
+  if (prefetchActive === token) return; // same view is already prefetching, don't restart
   prefetchActive = token;
   const gen = ++prefetchGen;
   void (async () => {
     try {
       await sleep(PREFETCH_START_DELAY_MS);
       if (gen !== prefetchGen || token !== folderKey()) return;
-      // 用游标扫 state.items，而不是一开始拍一张快照：
-      // 「加载更多」会把新页追加进 state.items，游标扫描能自然把它们带上。
+      // Scan state.items with a cursor rather than taking a snapshot up front:
+      // "load more" appends new pages into state.items, and the cursor scan naturally picks them up.
       let cursor = 0;
-      let done = 0; // 只统计真正发起的请求数，用来卡上限
+      let done = 0; // counts only requests actually issued, used to enforce the cap
       while (done < PREFETCH_MAX) {
-        if (gen !== prefetchGen || token !== folderKey()) return; // 视图已切换
-        if (document.hidden) return;                              // 页面不可见，暂停
+        if (gen !== prefetchGen || token !== folderKey()) return; // view has switched
+        if (document.hidden) return;                              // page hidden, pause
         const ids = state.items.map((it) => it.id);
-        if (cursor >= ids.length) break; // 当前列表已走完
+        if (cursor >= ids.length) break; // current list is exhausted
         const id = ids[cursor++];
-        if (state.cache.messages.has(id)) continue; // 已缓存（或期间被别的路径填上）
+        if (state.cache.messages.has(id)) continue; // already cached (or filled in by another path meanwhile)
         done++;
         try {
           const data = await api(`/api/messages/${encodeURIComponent(id)}`);
@@ -514,24 +519,24 @@ function prefetchBodies() {
             at: Date.now(),
           });
         } catch {
-          // 预取失败不打扰用户：真正点开时会重新请求并给出错误态
+          // Prefetch failure doesn't bother the user: opening it for real will re-request and show an error state
         }
         if (done % PREFETCH_PERSIST_EVERY === 0) persistSoon();
         await sleep(PREFETCH_GAP_MS);
       }
       persistSoon();
     } finally {
-      // 只在「仍是本轮」时清标记：被新视图 / 新预取顶替时，不能把后来者的标记清掉
+      // Only clear the marker when "still this round": when superseded by a new view / new prefetch, must not clear the newcomer's marker
       if (prefetchGen === gen && prefetchActive === token) prefetchActive = null;
     }
   })();
 }
 
-/* ---------------- 本地持久化缓存（localStorage，防抖 + 全链路 try/catch） ---------------- */
+/* ---------------- Local persistent cache (localStorage, debounced + try/catch along the whole path) ---------------- */
 
 let persistTimer = null;
 
-/** 读取本地快照。版本不符 / JSON 损坏 / 隐私模式禁用 localStorage 一律安全降级为 null。 */
+/** Read the local snapshot. Version mismatch / corrupt JSON / localStorage disabled in private mode all safely degrade to null. */
 function readPersisted() {
   try {
     const raw = localStorage.getItem(CACHE_KEY);
@@ -545,10 +550,10 @@ function readPersisted() {
 }
 
 /**
- * 收集要落盘的正文：**内存 LRU 里有什么就收什么**（LRU 自身已封顶 40 封 / 2MB）。
- * Map 的迭代顺序即 LRU 顺序（最久未用在前），所以直接遍历即可得到
- * 「最久未用 → 最近使用」；恢复时按序 set 就能还原 LRU 次序。
- * 不在这里设预算 —— 超配额的退让统一交给 writePersisted（对半砍重试）。
+ * Collect the bodies to persist: **whatever is in the in-memory LRU** (the LRU itself is already capped at 40 messages / 2MB).
+ * A Map's iteration order is its LRU order (least recently used first), so iterating directly yields
+ * "least recently used → most recently used"; on restore, setting them in order restores the LRU order.
+ * No budget is set here —— yielding on over-quota is handled uniformly by writePersisted (halving retry).
  */
 function collectPersistMessages() {
   const out = [];
@@ -558,7 +563,7 @@ function collectPersistMessages() {
   return out;
 }
 
-/** 写一次快照。成功返回 true；隐私模式 / 超配额（QuotaExceededError）返回 false。 */
+/** Write a snapshot once. Returns true on success; false in private mode / over quota (QuotaExceededError). */
 function tryWritePersisted(payload) {
   try {
     localStorage.setItem(CACHE_KEY, JSON.stringify(payload));
@@ -569,12 +574,12 @@ function tryWritePersisted(payload) {
 }
 
 /**
- * 把当前视图（列表 + 计数 + 账号列表 + openId + 最近读过的正文）写入本地。
- * 空列表不写（避免把 loading 态落盘）。不持久化 state.selected：选中态跨刷新保留会让人困惑。
+ * Write the current view (list + counts + account list + openId + recently read bodies) to local storage.
+ * Empty lists are not written (to avoid persisting the loading state). state.selected is not persisted: keeping the selection across refreshes would be confusing.
  *
- * 超配额时**对半砍重试**（保留较新的那一半），而不是一次性全丢：
- * 否则读了几十封大正文的用户，一超限就一封正文都缓存不上，与「不设上限」的意图相反。
- * 砍到一封都写不下时，最后只写列表 —— **列表缓存永远不会被正文赔进去**。
+ * On over-quota, **halve and retry** (keeping the newer half) rather than dropping everything at once:
+ * otherwise a user who has read dozens of large bodies couldn't cache a single body once over the limit, contradicting the "no limit" intent.
+ * When even one body no longer fits, finally write only the list —— **the list cache is never sacrificed for bodies**.
  */
 function writePersisted() {
   if (!state.items.length) return;
@@ -590,7 +595,7 @@ function writePersisted() {
     mailboxes: state.mailboxList,
     openId: state.openId,
   };
-  // 顺序为「最久未用 → 最近使用」，所以保留尾部 = 保留较新的
+  // Order is "least recently used → most recently used", so keeping the tail = keeping the newer ones
   let messages = collectPersistMessages();
   while (messages.length) {
     if (tryWritePersisted({ ...base, messages })) return;
@@ -599,18 +604,18 @@ function writePersisted() {
   tryWritePersisted(base);
 }
 
-/** 防抖写入，避免读信 / 翻页 / 批量操作时高频 JSON.stringify 卡主线程。 */
+/** Debounced write, to avoid high-frequency JSON.stringify blocking the main thread during reading / paging / batch operations. */
 function persistSoon() {
   clearTimeout(persistTimer);
   persistTimer = setTimeout(writePersisted, PERSIST_DEBOUNCE_MS);
 }
 
 /**
- * 启动时**同步**恢复本地快照并立即渲染（0 请求）。
- * 只恢复与当前默认视图（inbox / 无搜索）一致的列表；计数与账号列表始终可用。
- * 正文缓存独立于列表恢复 —— 即使列表不可用（上次在别的文件夹 / 搜索态），
- * 之前读过的邮件仍能立刻打开、不必重新下载。
- * 任何异常都安全降级为「没有缓存」，绝不白屏。返回是否恢复了列表内容。
+ * On startup, **synchronously** restore the local snapshot and render immediately (0 requests).
+ * Only restores the list matching the current default view (inbox / no search); counts and the account list are always available.
+ * The body cache is independent of list restoration —— even if the list is unavailable (last time in another folder / search state),
+ * previously read messages can still open immediately without re-downloading.
+ * Any exception safely degrades to "no cache", never a blank screen. Returns whether list content was restored.
  */
 function restorePersisted() {
   const p = readPersisted();
@@ -620,13 +625,13 @@ function restorePersisted() {
     if (Array.isArray(p.mailboxes)) state.mailboxList = p.mailboxes;
     if (typeof p.mailbox === 'string') state.mailbox = p.mailbox;
     if (typeof p.openId === 'string') state.openId = p.openId;
-    // 落盘顺序是「最久未用 → 最近使用」，按序 set 即可还原 LRU 次序
+    // Persisted order is "least recently used → most recently used"; setting them in order restores the LRU order
     if (Array.isArray(p.messages)) {
       for (const pair of p.messages) {
         if (!Array.isArray(pair) || pair.length !== 2) continue;
         const [id, entry] = pair;
         if (typeof id !== 'string' || !entry || typeof entry !== 'object' || !entry.message) continue;
-        putMessageCache(id, entry); // 复用同一套条数/字节上限与 LRU 逻辑
+        putMessageCache(id, entry); // reuse the same count/byte caps and LRU logic
       }
     }
     const listOk =
@@ -649,7 +654,7 @@ function restorePersisted() {
   }
 }
 
-/* ---------------- 通用 ---------------- */
+/* ---------------- Common ---------------- */
 
 function esc(s) {
   return String(s ?? '').replace(/[&<>"']/g, (c) => (
@@ -668,16 +673,16 @@ function showToast(msg, isError = false) {
 }
 
 /**
- * 把「可能是已解析数组、也可能是库里存的 JSON 文本」的字段统一成数组。
+ * Normalizes a field that may be an already-parsed array or JSON text stored in the DB into an array.
  *
- * ⚠️ **两个接口的形态不一样，两种都必须吃得下**：
- *  - 列表接口 `/api/folders/*` 直接把库列 `to_emails` / `cc` / `bcc` 原样返回 ——
- *    它们是 **JSON 文本**（`'["a@x.com"]'`）；
- *  - 详情 / 会话接口返回的是**已解析数组**。
+ * ⚠️ **The two APIs have different shapes, and both must be handled**:
+ *  - The list API `/api/folders/*` returns the DB columns `to_emails` / `cc` / `bcc` as-is ——
+ *    they are **JSON text** (`'["a@x.com"]'`);
+ *  - The detail / conversation APIs return an **already-parsed array**.
  *
- * 旧实现只认数组（`Array.isArray(v) ? v : []`），于是列表里的收件人恒为空 ——
- * 实测确认：出站行与草稿行全部显示成「致 (未知)」「(无收件人)」。
- * 这里与 `src/util.ts` 的 jsonArr 保持同一口径（能解析就用，解析不出来当空数组）。
+ * The old implementation only accepted arrays (`Array.isArray(v) ? v : []`), so recipients in the list were always empty ——
+ * confirmed by test: outbound rows and draft rows all displayed as "to (unknown)" "(no recipients)".
+ * This stays consistent with jsonArr in `src/util.ts` (use it if parseable, treat as an empty array if not).
  */
 function jsonArr(v) {
   if (Array.isArray(v)) return v;
@@ -698,7 +703,7 @@ function timeLong(sec) {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
 }
 
-/** 列表/会话行显示明确时间：YYYY-MM-DD HH:MM。 */
+/** List/conversation rows show an explicit time: YYYY-MM-DD HH:MM. */
 function fmtDateTime(sec) {
   if (!sec) return '';
   const d = new Date(sec * 1000);
@@ -717,18 +722,18 @@ function recipientsLabel(toList) {
   return jsonArr(toList).join(', ');
 }
 
-/** 收件人角色文案（信封卡摘要行「你是抄送 / 你是密送」角标用）。 */
+/** Recipient role labels (used for the "you are cc / you are bcc" badge in the envelope card summary row). */
 const ROLE_LABEL = { to: '收件人', cc: '抄送', bcc: '密送' };
 
 /**
- * 「我」在这封**入站**邮件里是以什么身份收到的 → `'to' | 'cc' | 'bcc' | null`。
+ * The role in which "I" received this **inbound** message → `'to' | 'cc' | 'bcc' | null`.
  *
- * ⚠️ 判定顺序必须是 **cc → bcc → to**，不能反过来。原因：修复前入库的行
- * `to_emails` 存的是**投递地址（信封收件人）**，我方地址必然在里面 —— 先判 to
- * 就会把「我只是被抄送」的邮件标成「收件人」（这正是用户报障的现象）。
- * `cc` / `bcc` 两列存的始终是真实头，先看它们才不会误判。
+ * ⚠️ The check order must be **cc → bcc → to**, never the reverse. Reason: rows stored before the fix
+ * had `to_emails` holding the **delivery address (envelope recipient)**, which necessarily contains our address —— checking to first
+ * would mark a "merely cc'd" message as "to" (this is exactly the symptom users reported).
+ * The `cc` / `bcc` columns always store the real headers, so checking them first avoids misjudgment.
  *
- * 修复后入库的行 `to_emails` 已是真实 `To:` 头，顺序无关；两代数据用同一条规则。
+ * Rows stored after the fix have `to_emails` as the real `To:` header, so order doesn't matter; both generations use the same rule.
  */
 function myRecipientRole(m) {
   const mine = String(m.mailbox || '').trim().toLowerCase();
@@ -741,16 +746,16 @@ function myRecipientRole(m) {
 }
 
 /**
- * 入站邮件详情要显示的「收件人」清单（= 真实 `To:` 头）。
+ * The "recipients" list to show in inbound message details (= the real `To:` header).
  *
- * 两代数据：
- *  - 修复后入库：详情接口给 `delivered_to`（投递地址），`to_emails` 就是真实 To 头，直接用；
- *  - 修复前入库：`delivered_to` 显式为 `null`，`to_emails` 其实是投递地址，真实 To 头没落库
- *    → 只能把投递地址**减去 cc/bcc**（信封 = To∩本域 ∪ Cc∩本域 ∪ Bcc∩本域）。
- *    减不出来就返回空数组 —— 宁可显示「—」，也不要再把自己显示成收件人。
+ * Two generations of data:
+ *  - Stored after the fix: the detail API provides `delivered_to` (delivery address), and `to_emails` is the real To header, use it directly;
+ *  - Stored before the fix: `delivered_to` is explicitly `null`, and `to_emails` is actually the delivery address with the real To header not stored
+ *    → we can only **subtract cc/bcc** from the delivery address (envelope = To∩local-domain ∪ Cc∩local-domain ∪ Bcc∩local-domain).
+ *    If nothing remains, return an empty array —— better to show "—" than to show ourselves as a recipient again.
  *
- * 列表项（乐观渲染）没有 `delivered_to` 字段（`undefined`，不是 `null`），
- * 此时 cc/bcc 也还没拿到，减法无从谈起，直接原样返回。
+ * List items (optimistic render) have no `delivered_to` field (`undefined`, not `null`),
+ * and cc/bcc aren't available yet either, so subtraction is moot and we return it as-is.
  */
 function inboundRecipients(m) {
   const tos = jsonArr(m.to_emails);
@@ -761,39 +766,39 @@ function inboundRecipients(m) {
   return tos.filter((x) => !others.has(String(x).trim().toLowerCase()));
 }
 
-/** 入站邮件详情「收件人」一行的文案（空清单给调用方自己决定占位符）。 */
+/** Text for the "recipients" line in inbound message details (an empty list leaves the placeholder to the caller). */
 function inboundRecipientsLabel(m) {
   return recipientsLabel(inboundRecipients(m));
 }
 
 /**
- * 会话行 / 信封卡共用的「收发双方」唯一真值 → `[发件方, 收件方]`。
+ * The single source of truth for the "sender/recipient pair" shared by conversation rows / envelope cards → `[sender, recipient]`.
  *
- * ⚠️ 改这里之前先读这两条（都曾踩过）：
- *  1) 详情接口返回的**会话项**收件人字段名是 `to`（见 src/index.ts 里 thread.map），
- *     而**消息本身**用的是 `to_emails`。历史上只读 `t.to_emails` → 恒为 undefined
- *     → 会话行永远显示「我 → ?」。两个字段名都必须兼容。
- *  2) 出站不能用字面量「我」：用户要看到**实际发件信箱**，否则多身份时无法分辨是哪个信箱发的。
+ * ⚠️ Read these two before changing this (both have been tripped over):
+ *  1) The recipient field name on **conversation items** returned by the detail API is `to` (see thread.map in src/index.ts),
+ *     while **the message itself** uses `to_emails`. Historically only `t.to_emails` was read → always undefined
+ *     → conversation rows always showed "me → ?". Both field names must be handled.
+ *  2) Outbound must not use the literal "me": the user needs to see the **actual sending mailbox**, otherwise with multiple identities you can't tell which mailbox sent it.
  */
 function endpointsOf(item) {
   const mine = String(item.mailbox || '').trim();
   const tos = jsonArr(item.to_emails !== undefined ? item.to_emails : item.to);
   if (item.direction === 'inbound') {
-    // 对方（有名字优先用名字） → 我方收到的信箱（mailbox 权威，回退收件人首个地址）
+    // The other party (prefer name if present) → the mailbox we received at (mailbox is authoritative, fall back to the first recipient address)
     return [senderLabel(item), mine || tos[0] || '?'];
   }
-  // 我方实际发件信箱 → 收件人清单（全量，不截成首个地址的 local part）
+  // Our actual sending mailbox → recipient list (full, not truncated to the local part of the first address)
   return [String(item.from_email || '').trim() || mine || '我', tos.join(', ') || '?'];
 }
 
-/** 信封卡第二行：入站「对方邮箱 · 收至 <我的信箱>」，出站「致 <收件人清单>」。 */
+/** Envelope card's second line: inbound "other mailbox · received at <my mailbox>", outbound "to <recipient list>". */
 function envelopeSubLine(m, pending) {
   if (m.direction === 'inbound') {
     const from = String(m.from_email || '').trim();
     const mine = String(m.mailbox || '').trim();
     const parts = [];
     if (from) parts.push(from);
-    // 自己发给自己的邮件两者相同，避免重复显示
+    // For a message you sent to yourself the two are identical, avoid showing it twice
     if (mine && mine.toLowerCase() !== from.toLowerCase()) parts.push(`收至 ${mine}`);
     return parts.join(' · ');
   }
@@ -807,7 +812,7 @@ function avatarChar(item) {
   return ch;
 }
 
-/* ---------------- 侧边栏 / 多邮箱 ---------------- */
+/* ---------------- Sidebar / multiple mailboxes ---------------- */
 
 function renderMailboxSelect() {
   const wrap = $('#mailbox-wrap');
@@ -818,8 +823,8 @@ function renderMailboxSelect() {
     return;
   }
   wrap.classList.remove('hidden');
-  // 真值来源是 state.mailbox；sel.value 只是它的派生显示，启动恢复路径上 DOM 还可能是空的。
-  // '' = 「全部邮箱」，是合法选择，必须原样保留。
+  // The source of truth is state.mailbox; sel.value is only its derived display, and on the startup restore path the DOM may still be empty.
+  // '' = "all mailboxes", a legitimate selection that must be preserved as-is.
   const prev = state.mailbox || '';
   sel.innerHTML = '';
   const allOpt = document.createElement('option');
@@ -833,8 +838,8 @@ function renderMailboxSelect() {
     sel.appendChild(opt);
   }
 
-  // 只有当前选择确实已不存在（账号被删/改名）时才回退；
-  // 回退时同时更新下拉显示与 state.mailbox，二者永不脱钩（BUG-3a）。
+  // Only fall back when the current selection truly no longer exists (account deleted/renamed);
+  // on fallback, update both the dropdown display and state.mailbox, the two never get decoupled (BUG-3a).
   const keep = prev === '' || list.some((m) => m.mailbox === prev);
   const target = keep ? prev : (list.find((m) => m.inbox_unread > 0) || list[0]).mailbox;
   sel.value = target;
@@ -855,7 +860,7 @@ function renderNav() {
     label.textContent = f.label;
     btn.appendChild(label);
 
-    // 收件箱徽标 = 未读数；草稿徽标 = 草稿条数（草稿没有「未读」语义，两个口径不混用）
+    // Inbox badge = unread count; drafts badge = draft count (drafts have no "unread" semantics, the two definitions aren't mixed)
     const badgeN = f.key === 'inbox'
       ? Number(state.counts.inbox_unread) || 0
       : f.key === 'drafts'
@@ -874,11 +879,11 @@ function renderNav() {
 }
 
 /**
- * 浏览器标签标题：有新邮件时显示「(N) 收件箱」，没有未读时回退纯「收件箱」。
+ * Browser tab title: shows "(N) Inbox" when there are new messages, falls back to plain "Inbox" when there are no unread.
  *
- * 数据源与侧边栏徽标**同一个** `state.counts.inbox_unread`，且由 `renderNav()` 统一驱动 ——
- * 计数变化只有这一处落地，标题不会和徽标各说各话（也不会在切文件夹时被覆盖回默认值）。
- * 超过 999 与徽标同口径截断，避免标题被撑爆。
+ * The data source is the **same** `state.counts.inbox_unread` as the sidebar badge, driven uniformly by `renderNav()` ——
+ * count changes land in only one place, so the title never disagrees with the badge (and isn't overwritten back to the default when switching folders).
+ * Truncated at 999 with the same convention as the badge, to avoid blowing up the title.
  */
 function renderTitle() {
   const n = Number(state.counts.inbox_unread) || 0;
@@ -899,14 +904,14 @@ async function refreshCounts(force = false) {
     renderNav();
     persistSoon();
   } catch {
-    /* 静默 */
+    /* silent */
   }
 }
 
 /**
- * 拉取收件地址列表。会改变计数状态的操作（读信/标星/删除/批量/发送）后用 force=true 调用，
- * 保证下拉里的「未读」数与实际同步（BUG-3c）；非强制调用走 TTL，且同一时刻只允许一个在途请求，
- * 期间到达的请求合并为一次补拉，避免高频。
+ * Fetch the receiving-address list. After operations that change count state (read/star/delete/batch/send), call with force=true
+ * to keep the "unread" number in the dropdown in sync with reality (BUG-3c); non-forced calls go through the TTL, and only one in-flight request
+ * is allowed at a time, with requests arriving meanwhile merged into a single re-fetch to avoid high frequency.
  */
 async function loadMailboxes(force = false) {
   const c = state.cache;
@@ -923,7 +928,7 @@ async function loadMailboxes(force = false) {
     renderMailboxSelect();
     persistSoon();
   } catch {
-    /* 保留已有列表：一次网络抖动不该把选择器清空 */
+    /* Keep the existing list: one network blip shouldn't empty the selector */
   } finally {
     c.mailboxesLoading = false;
     if (c.mailboxesPending) {
@@ -933,7 +938,7 @@ async function loadMailboxes(force = false) {
   }
 }
 
-/* ---------------- 列表 ---------------- */
+/* ---------------- List ---------------- */
 
 function folderLabel() {
   const f = FOLDERS.find((x) => x.key === state.folder);
@@ -941,7 +946,7 @@ function folderLabel() {
 }
 
 function renderListTitle() {
-  // 明确标注口径：这里是「该文件夹总数」，与侧边栏/下拉的「未读」是不同语义，不强行统一（BUG-3d）。
+  // Explicitly label the definition: this is "the folder's total count", semantically different from the "unread" in the sidebar/dropdown, and not forcibly unified (BUG-3d).
   const extra = state.total ? ` · 共 ${state.total} 封` : '';
   const q = state.q ? `：搜索“${state.q}”` : '';
   $('#list-title').textContent = `${folderLabel()}${q}${extra}`;
@@ -955,7 +960,7 @@ function openFolder(folder) {
   if (input) input.value = '';
   state.offset = 0;
   closeMessagePane();
-  closeDrawer(); // 移动端：选完文件夹收起抽屉，否则它一直挡着刚切出来的列表
+  closeDrawer(); // Mobile: collapse the drawer after picking a folder, otherwise it keeps covering the just-switched list
   renderNav();
   renderListTitle();
   renderSelectBar();
@@ -983,17 +988,17 @@ function afterListRender() {
 }
 
 /**
- * 渲染列表区（列表 + 空态/更多 + 批量条）。
- * 收敛点：一次加载里每个阶段只调用一次，避免「loading 一次 + 数据一次 + finally 又一次」的重复重建 DOM。
+ * Render the list area (list + empty/more + batch bar).
+ * Convergence point: called only once per stage within a load, avoiding duplicate DOM rebuilds of "once for loading + once for data + once more in finally".
  */
 function paintList() {
   renderList();
   afterListRender();
   renderSelectBar();
-  prefetchBodies(); // 列表画完就顺手把正文预取回来（空闲、可取消、不碰 UI）
+  prefetchBodies(); // once the list is painted, conveniently prefetch the bodies (idle, cancellable, doesn't touch the UI)
 }
 
-/** 后台 revalidate 的比对基准：内存缓存里该视图的指纹。 */
+/** Comparison baseline for background revalidate: the fingerprint of this view in the in-memory cache. */
 function cachedFolderFingerprint(token) {
   const c = state.cache.folders.get(token);
   return c ? c.fp : null;
@@ -1007,9 +1012,9 @@ function fetchFolderPage(offset) {
 }
 
 /**
- * 拉取当前视图第 1 页。
- * - first=true：无可用缓存，走 loading 态（首屏必须等它），数据到达后渲染一次。
- * - first=false：stale-while-revalidate 的后台刷新；指纹没变就什么都不做。
+ * Fetch page 1 of the current view.
+ * - first=true: no usable cache, show the loading state (first paint waits for it), render once data arrives.
+ * - first=false: background stale-while-revalidate refresh; do nothing if the fingerprint is unchanged.
  */
 async function revalidateFolder(token, first) {
   let data;
@@ -1022,10 +1027,10 @@ async function revalidateFolder(token, first) {
     if (!state.items.length) showToast(e.message, true);
     return;
   }
-  if (token !== folderKey()) return; // 视图已切换，丢弃过期响应
+  if (token !== folderKey()) return; // view switched, discard stale response
   state.loading = false;
   const fp = folderFingerprint(data.items, data.total);
-  if (!first && fp === cachedFolderFingerprint(token)) return; // 数据没变：不重渲染
+  if (!first && fp === cachedFolderFingerprint(token)) return; // data unchanged: skip re-render
   state.items = data.items;
   state.itemsKey = token;
   state.total = data.total;
@@ -1062,7 +1067,7 @@ async function loadFolder(append = false, force = false) {
   const cached = state.cache.folders.get(token);
 
   if (!force && cached && cached.items.length) {
-    // 缓存优先（不再要求「新鲜」）：立即渲染，同时在后台 revalidate
+    // cache-first (no longer require "fresh"): render immediately, revalidate in background
     const painted = state.itemsKey === token && folderFingerprint(state.items, state.total) === cached.fp;
     if (!painted) {
       state.items = cached.items;
@@ -1085,12 +1090,12 @@ async function loadFolder(append = false, force = false) {
     state.total = 0;
     state.offset = 0;
     state.loading = true;
-    paintList(); // loading 态渲染一次（清屏）
+    paintList(); // render the loading state once (clear screen)
   }
   await revalidateFolder(token, true);
 }
 
-/** 首次进入收件箱时自动打开最新一封，方便看到详情区。 */
+/** Auto-open the latest message when first entering the inbox, so the detail pane is visible. */
 function maybeAutoOpen() {
   if (state.firstOpen && !state.openId && !state.q && state.folder === 'inbox' && state.items.length) {
     state.firstOpen = false;
@@ -1124,17 +1129,17 @@ async function toggleStar(item, btn) {
     btn.title = next ? '取消星标' : '加星标';
     state.cache.countsAt = 0;
     void refreshCounts();
-    void loadMailboxes(true); // 星标数计入账号计数（BUG-3c）
+    void loadMailboxes(true); // starred count feeds account counts (BUG-3c)
   } catch (e) {
     showToast(e.message, true);
   }
 }
 
 function itemRow(item) {
-  // 草稿与普通邮件共用同一套列表结构（服务端把草稿也返回成同形状的行，direction='draft'），
-  // 只有三处分叉：勾选框（草稿没有批量操作语义）、发件人位显示收件人、点开是写信弹窗。
+  // Drafts and normal mail share the same list structure (the server returns drafts as rows of the same shape, direction='draft'),
+  // with only three divergences: the checkbox (drafts have no batch-action semantics), the sender slot shows recipients, and opening shows the composer.
   const isDraft = item.direction === 'draft';
-  // thread_unread 为后端聚合字段；旧缓存/旧 fixture 里可能不存在，回退到单行的 read 状态。
+  // thread_unread is a backend aggregate field; it may be absent in old caches/fixtures, so fall back to the single row's read state.
   const threadUnread = item.thread_unread !== undefined ? item.thread_unread : (item.read ? 0 : 1);
   const hasUnread = threadUnread > 0;
   const row = document.createElement('div');
@@ -1211,7 +1216,7 @@ function itemRow(item) {
   const starWrap = document.createElement('span');
   starWrap.className = 'li-star';
   if (isDraft) {
-    // 草稿没有「星标」概念，这个位置改放删除按钮（省得为草稿单独开一套行内操作）
+    // Drafts have no "star" concept, so this slot holds a delete button instead (avoids a separate inline action set for drafts)
     const del = document.createElement('button');
     del.type = 'button';
     del.className = 'star-btn draft-del';
@@ -1234,11 +1239,11 @@ function itemRow(item) {
   return row;
 }
 
-/** 删除一条草稿（列表上的 × 按钮）。 */
+/** Delete a draft (the × button in the list). */
 async function deleteDraftItem(id) {
   try {
     await api(`/api/drafts/${encodeURIComponent(id)}`, { method: 'DELETE' });
-    state.cache.folders.clear(); // 草稿列表与侧边栏计数都变了
+    state.cache.folders.clear(); // draft list and sidebar counts both changed
     state.cache.countsAt = 0;
     void refreshCounts();
     void loadFolder(false, true);
@@ -1249,9 +1254,9 @@ async function deleteDraftItem(id) {
 }
 
 /**
- * 由 state.selected **单向派生** #select-all 的勾选态，消除「全选框 checked 与选中集合脱钩」（BUG-1b）。
- * #select-all 不再持有独立真值：所有入口只改 state.selected，再经 renderSelectBar() 收敛 UI。
- * 判定口径：pageIds = 当前页 .list-item[data-id] 的 id 集合；sel = state.selected。
+ * One-way derive #select-all's checked state from state.selected, eliminating "select-all checkbox checked desyncs from the selected set" (BUG-1b).
+ * #select-all no longer holds independent truth: every entry point only mutates state.selected, then renderSelectBar() reconciles the UI.
+ * Rule: pageIds = ids of .list-item[data-id] on the current page; sel = state.selected.
  */
 function syncSelectAll() {
   const box = $('#select-all');
@@ -1291,7 +1296,7 @@ function renderSelectBar() {
       mk('删除', 'trash');
     }
   }
-  syncSelectAll(); // 收敛点：所有会改 state.selected 的路径都经此对齐全选框
+  syncSelectAll(); // convergence point: every path that mutates state.selected syncs the select-all box here
 }
 
 async function bulk(action) {
@@ -1306,37 +1311,37 @@ async function bulk(action) {
     invalidateFolderCaches();
     state.cache.countsAt = 0;
     void refreshCounts();
-    void loadMailboxes(true); // 批量已读/星标/删除都会改变账号计数（BUG-3c）
+    void loadMailboxes(true); // batch read/star/delete all change account counts (BUG-3c)
     await loadFolder(false, true);
   } catch (e) {
     showToast(e.message, true);
   }
 }
 
-/* ---------------- 阅读面板 ---------------- */
+/* ---------------- Read pane ---------------- */
 
 let currentMessage = null;
 let currentAttachments = [];
 let currentThread = [];
 
 /**
- * 详情「正文下载中 / 下载失败」的占位状态。
- * 列表项本身已带主题、发件人、时间、星标、方向、附件数，足够立刻画出信封卡；
- * 只有正文 / 附件明细 / 会话上下文必须等详情接口。因此点击后**同步**先渲染头部，
- * 正文位交给这个占位态，详情回来后原地替换——不阻塞点击。
- * 形如 { id, phase: 'loading' | 'error', message? }
+ * Placeholder state for the detail pane's "body downloading / download failed".
+ * The list item already carries subject, sender, time, star, direction, and attachment count, enough to draw the envelope card immediately;
+ * only the body / attachment details / thread context must wait for the detail endpoint. So after a click, render the header **synchronously** first,
+ * hand the body slot to this placeholder state, and swap it in place once details arrive — without blocking the click.
+ * Shaped like { id, phase: 'loading' | 'error', message? }
  */
 let detailPending = null;
 
 /**
- * 详情请求序号。用户快速连点多封时，先发的响应可能后到；
- * 过期响应必须丢弃，否则会把后选的邮件覆盖成先选的那封。
- * closeMessagePane() 也会自增它，使「关闭后又被加载完成重新打开」不可能发生。
+ * Detail request sequence number. When the user rapidly clicks several messages, an earlier response may arrive later;
+ * stale responses must be discarded, or the later-selected message would be overwritten by the earlier-selected one.
+ * closeMessagePane() also increments it, making "reopened by a finished load after closing" impossible.
  */
 let detailSeq = 0;
 
 function closeMessagePane() {
-  detailSeq++; // 作废在途详情响应
+  detailSeq++; // invalidate in-flight detail responses
   detailPending = null;
   state.openId = null;
   currentMessage = null;
@@ -1344,8 +1349,8 @@ function closeMessagePane() {
   currentThread = [];
   $('#read-message').classList.add('hidden');
   $('#read-placeholder').classList.remove('hidden');
-  syncActiveRow(); // 关闭后清掉残留的 active 高亮（BUG-1）
-  syncLayout(); // 移动端：退出单栏详情视图，让列表重新占满
+  syncActiveRow(); // clear leftover active highlight after closing (BUG-1)
+  syncLayout(); // mobile: leave the single-column detail view and let the list fill again
 }
 
 function isReadMode() {
@@ -1353,11 +1358,11 @@ function isReadMode() {
 }
 
 /**
- * 打开详情后同步「已读」状态（BUG-2）。
- * 服务端 GET 详情时已把 read 置 1 并把新值返回，前端若用 `!currentMessage.read` 判断会永远为假，
- * 导致本地补丁整段被跳过、列表行继续显示未读。这里改为幂等、不依赖服务端返回值：
- * 无条件把 read:1 写入 state.items / 所有文件夹缓存 / 消息缓存 / 当前行 DOM；
- * 是否刷新计数只取决于「打开前本地是否确实观察到未读」（prior 为 null 视为未知，按未读处理）。
+ * Sync the "read" state after opening a detail (BUG-2).
+ * The server sets read to 1 on GET detail and returns the new value; if the frontend tests with `!currentMessage.read` it is always false,
+ * skipping the whole local patch and leaving the list row showing unread. Here it is made idempotent and independent of the server return value:
+ * unconditionally write read:1 into state.items / all folder caches / the message cache / the current row DOM;
+ * whether to refresh counts depends only on "was unread actually observed locally before opening" (prior null means unknown, treated as unread).
  */
 function syncOpenedReadState(message, prior) {
   if (!message || message.direction !== 'inbound') return;
@@ -1367,39 +1372,39 @@ function syncOpenedReadState(message, prior) {
   if (wasUnread) {
     state.cache.countsAt = 0;
     void refreshCounts();
-    void loadMailboxes(true); // 账号未读数随阅读一起更新（BUG-3c）
+    void loadMailboxes(true); // account unread count updates together with reading (BUG-3c)
   }
 }
 
 async function openMessage(id) {
   const cached = state.cache.messages.get(id);
 
-  // 缓存命中：正文是不可变的，所以**无论缓存多旧都先渲染**（阅读不被网络阻塞），
-  // 需要时再后台校验。这样刷新页面后重新点开读过的邮件是即时的。
+  // Cache hit: the body is immutable, so **render first no matter how old the cache is** (reading is not blocked by the network),
+  // then revalidate in the background if needed. This makes reopening a read message after a page refresh instant.
   if (cached && cached.message) {
     const cacheFresh = Date.now() - cached.at < TTL.message;
-    // 入站邮件若在缓存里仍是未读（用户曾手动标为未读），必须请求服务端让它落库「已读」，
-    // 否则下次刷新列表又会变回未读。
+    // If an inbound message is still unread in the cache (the user manually marked it unread), the server must be asked to persist it as "read",
+    // otherwise the next list refresh reverts it to unread.
     const mustRecordRead = cached.message.direction === 'inbound' && !cached.message.read;
 
-    detailSeq++; // 已用缓存立刻出画面，作废任何在途的旧请求
+    detailSeq++; // cache already paints instantly, invalidate any in-flight old request
     detailPending = null;
     touchMessageCache(id);
     currentMessage = cached.message;
     currentAttachments = cached.attachments || [];
     currentThread = cached.thread || [];
     state.openId = id;
-    syncOpenedReadState(cached.message); // 先补本地已读态，再渲染，按钮文案才是对的
+    syncOpenedReadState(cached.message); // patch the local read state before rendering so button labels are correct
     renderRead();
     persistSoon();
     if (!cacheFresh || mustRecordRead) void revalidateMessage(id);
     return;
   }
 
-  const prior = findItem(id); // 打开前的本地状态，用于判断是否真的发生 0→1 跃迁
+  const prior = findItem(id); // local state before opening, used to tell whether a real 0→1 transition occurred
 
-  // 乐观渲染：先用列表项把头部画出来，正文位显示「正在下载」。
-  // 这样点击的反馈是同步的，不会被详情请求的往返卡住主流程。
+  // Optimistic render: draw the header from the list item first, show "downloading" in the body slot.
+  // This makes click feedback synchronous, not stuck on the detail request round trip.
   if (prior) {
     state.openId = id;
     currentMessage = prior;
@@ -1414,13 +1419,13 @@ async function openMessage(id) {
   const seq = ++detailSeq;
   try {
     const data = await api(`/api/messages/${encodeURIComponent(id)}`);
-    // 过期响应（用户已切走 / 已关闭 / 又点了别的邮件）直接丢弃，不覆盖当前视图
+    // Stale response (user switched away / closed / clicked another message) is discarded and does not overwrite the current view
     if (seq !== detailSeq) return;
     applyDetailToView(id, data, prior);
   } catch (e) {
     if (seq !== detailSeq) return;
     if (prior) {
-      // 保留已经画好的头部，只把正文位换成错误态 + 重试，不留一块空白正文
+      // Keep the already-drawn header, only swap the body slot to error state + retry, leaving no blank body
       detailPending = { id, phase: 'error', message: e.message };
       renderRead();
     }
@@ -1428,7 +1433,7 @@ async function openMessage(id) {
   }
 }
 
-/** 把详情响应写进缓存并更新当前视图（正文位从「下载中」换成真实内容）。 */
+/** Write the detail response into the cache and update the current view (body slot goes from "downloading" to real content). */
 function applyDetailToView(id, data, prior) {
   currentMessage = data.message;
   currentAttachments = data.attachments || [];
@@ -1447,16 +1452,16 @@ function applyDetailToView(id, data, prior) {
 }
 
 /**
- * 后台校验详情。正文已经用缓存渲染出来了，所以这里**不阻塞、失败静默**。
- * 用途：① 缓存已过期（read / starred / status 可能已变）② 入站未读必须让服务端落库「已读」。
- * 用户若已切走，只更新缓存与列表行，不动右侧面板。
+ * Background detail revalidation. The body is already rendered from cache, so this is **non-blocking and silent on failure**.
+ * Purposes: ① cache expired (read / starred / status may have changed) ② an inbound unread must be persisted as "read" on the server.
+ * If the user has switched away, only the cache and list row are updated, not the right pane.
  */
 async function revalidateMessage(id) {
   let data;
   try {
     data = await api(`/api/messages/${encodeURIComponent(id)}`);
   } catch {
-    return; // 后台校验失败不打扰用户：正文已经可见
+    return; // background revalidation failure stays silent: the body is already visible
   }
   putMessageCache(id, {
     message: data.message,
@@ -1494,7 +1499,7 @@ async function setFlag(key, value) {
     renderRead();
     state.cache.countsAt = 0;
     void refreshCounts();
-    void loadMailboxes(true); // 账号未读数随标记一起更新（BUG-3c）
+    void loadMailboxes(true); // account unread count updates together with the flag (BUG-3c)
   } catch (e) {
     showToast(e.message, true);
   }
@@ -1510,7 +1515,7 @@ async function deleteFromRead() {
     invalidateFolderCaches();
     state.cache.countsAt = 0;
     void refreshCounts();
-    void loadMailboxes(true); // 删除会改变账号计数（BUG-3c）
+    void loadMailboxes(true); // deletion changes account counts (BUG-3c)
     showToast('已移入已删除');
     closeMessagePane();
     void loadFolder(false, true);
@@ -1542,25 +1547,25 @@ function metaLines() {
   };
   if (m.direction === 'inbound') {
     add('发件人', m.from_name ? `${m.from_name} <${m.from_email || ''}>` : (m.from_email || ''));
-    // ⚠️ 不能直接显示 to_emails：修复前的数据里它是投递地址（信封），会显示成用户自己。
-    // 口径统一走 inboundRecipients()（真实 To: 头）。
+    // ⚠️ Don't show to_emails directly: in pre-fix data it is the delivery address (envelope) and would display as the user themselves.
+    // Always go through inboundRecipients() (the real To: header) for consistency.
     add('收件人', inboundRecipientsLabel(m));
-    // 抄送/密送只在有内容时列出 —— 与出站分支同一口径。入站邮件绝大多数没有抄送，
-    // 无条件列出会给每一封都白多一行「抄送 —」。
+    // List cc/bcc only when present — same rule as the outbound branch. The vast majority of inbound mail has no cc,
+    // so listing unconditionally would add a useless "cc —" line to every message.
     if (jsonArr(m.cc).length) add('抄送', jsonArr(m.cc).join(', '));
     if (jsonArr(m.bcc).length) add('密送', jsonArr(m.bcc).join(', '));
-    // ⛔ 这里曾经还有三行，2026-10-08 第三轮按用户要求删掉（都是纯重复，不是信息丢失）：
-    //   · 「收件地址」= m.mailbox —— 信封卡副标题已经写了「收至 <mailbox>」（`envelopeSubLine()`，
-    //      而且自己发给自己时会自动省略）；侧边栏/收件箱上下文本身也在说明「这是哪个信箱」。
-    //   · 「你的身份」= ROLE_LABEL[role] —— 被抄送/密送时，默认可见的摘要行上就有
-    //      「你是抄送 / 你是密送」角标；是收件人时「收件人」那一行里就有自己。两条路径全覆盖。
-    //   · 「时间」= timeLong() —— 信封卡右上角 fmtDateTime() 渲染的是**同一格式的同一串字符**
-    //      （这两个函数是逐字相同的实现），零增量信息。
-    //   ⚠️ ROLE_LABEL / myRecipientRole() 仍被摘要行角标使用，**不能跟着一起删**。
+    // ⛔ There used to be three more lines here, removed on 2026-10-08 (third round) at the user's request (all pure duplication, no lost information):
+    //   · "Delivery address" = m.mailbox —— the envelope card subtitle already shows "to <mailbox>" (`envelopeSubLine()`,
+    //      and it is omitted automatically when sending to yourself); the sidebar/inbox context already says which mailbox this is.
+    //   · "Your identity" = ROLE_LABEL[role] —— when cc'd/bcc'd, the default-visible summary line already shows
+    //      the "you are cc / you are bcc" chip; when you are a recipient, the "recipient" line contains you. Both paths fully covered.
+    //   · "Time" = timeLong() —— the envelope card's top-right fmtDateTime() renders the **same string in the same format**
+    //      (the two functions are character-for-character identical implementations), zero incremental information.
+    //   ⚠️ ROLE_LABEL / myRecipientRole() are still used by the summary-line chip, **do not delete them along with this**.
   } else {
     add('发件人', m.from_email || m.mailbox || '');
     add('收件人', jsonArr(m.to_emails).join(', '));
-    // 抄送/密送只在有内容时列出，避免每封都多两行「—」
+    // List cc/bcc only when present, avoiding two extra "—" lines on every message
     if (jsonArr(m.cc).length) add('抄送', jsonArr(m.cc).join(', '));
     if (jsonArr(m.bcc).length) add('密送', jsonArr(m.bcc).join(', '));
     add('状态', STATUS_LABEL[m.status] || m.status || '—');
@@ -1572,7 +1577,7 @@ function renderRead() {
   const m = currentMessage;
   if (!m) return;
   const isInbound = m.direction === 'inbound';
-  // 正文是否仍在下载（或下载失败）。头部字段来自列表项，只有正文/附件明细依赖详情接口。
+  // Whether the body is still downloading (or failed). Header fields come from the list item; only the body/attachment details depend on the detail endpoint.
   const pending = detailPending && detailPending.id === m.id ? detailPending : null;
 
   $('#read-placeholder').classList.add('hidden');
@@ -1580,7 +1585,7 @@ function renderRead() {
   readEl.innerHTML = '';
   const isOpen = () => state.openId === m.id && currentMessage === m;
 
-  // 主题
+  // Subject
   const subjectWrap = document.createElement('div');
   subjectWrap.className = 'mail-subject';
   const h1 = document.createElement('h1');
@@ -1598,13 +1603,13 @@ function renderRead() {
   subjectWrap.appendChild(sStar);
   readEl.appendChild(subjectWrap);
 
-  // 换一封邮件时把附件预览浮层收掉：renderRead 是详情内容的**唯一出口**，放这里天然不漏
+  // Close the attachment preview overlay when switching messages: renderRead is the **sole exit** for detail content, so placing it here never misses
   closeAttachmentPreview();
 
-  // 会话上下文
+  // Thread context
   if (currentThread.length > 1) readEl.appendChild(threadPanel());
 
-  // 信封卡
+  // Envelope card
   const env = document.createElement('div');
   env.className = 'mail-card mail-envelope';
 
@@ -1621,7 +1626,7 @@ function renderRead() {
   const nameRow = document.createElement('div');
   const name = document.createElement('span');
   name.className = 'who-name';
-  // 出站显示**实际发件信箱**（不是字面量「我」），入站显示对方；口径统一走 endpointsOf。
+  // Outbound shows the **actual sending mailbox** (not the literal "me"), inbound shows the other party; always go through endpointsOf for consistency.
   name.textContent = endpointsOf(m)[0];
   nameRow.appendChild(name);
   if (!isInbound && m.status) {
@@ -1643,35 +1648,35 @@ function renderRead() {
   top.appendChild(date);
   env.appendChild(top);
 
-  // 操作按钮
+  // Action buttons
   const actions = document.createElement('div');
   actions.className = 'env-actions';
   if (isInbound) {
     actions.appendChild(readBtn('回复', () => { if (isOpen()) openReplyComposer(); }, 'btn-primary'));
   }
-  // 转发对入站 / 出站邮件都开放（自己的已发送邮件同样可以转给别人）
+  // Forwarding is available for both inbound / outbound mail (you can forward your own sent mail to others too)
   actions.appendChild(readBtn('转发', () => { if (isOpen()) openForwardComposer(); }));
   actions.appendChild(readBtn(m.read ? '标为未读' : '标为已读', () => { if (isOpen()) void setFlag('read', !m.read); }));
   actions.appendChild(readBtn('删除', () => { if (isOpen()) void deleteFromRead(); }));
   env.appendChild(actions);
 
-  // 详情摘要 + 展开行
+  // Detail summary + expandable lines
   const toLine = document.createElement('div');
   toLine.className = 'env-details';
   const toggle = document.createElement('a');
   toggle.className = 'toggle-detail';
   toggle.textContent = '查看详情';
   const lines = metaLines();
-  // 入站显示**真实 To: 头**（不是投递地址），否则被抄送时会显示成用户自己
+  // Inbound shows the **real To: header** (not the delivery address), otherwise a cc'd message would display as the user themselves
   const toText = isInbound ? inboundRecipientsLabel(m) : recipientsLabel(m.to_emails);
   toLine.innerHTML = `<b>收件人：</b>${esc(toText || (pending ? '…' : '—'))} `;
-  // 「收件人：—」只有一种成因：这封是**修复前**入库的（`delivered_to` 仍为 null，真实 To 头没落库），
-  // 且投递地址减掉 cc/bcc 后为空。能不能补回来取决于上游保留期 —— Resend 只留 30 天，
-  // 2026-10-08 回填后仍有 10 行已超期、永久取不回。给个 title 说明，免得被当成 bug 反复排查。
+  // "recipient: —" has only one cause: the message was stored **before the fix** (`delivered_to` is still null, the real To: header was not persisted),
+  // and the delivery address minus cc/bcc is empty. Whether it can be recovered depends on upstream retention — Resend keeps only 30 days,
+  // and after the 2026-10-08 backfill 10 rows were still past retention and permanently unrecoverable. Add a title explaining this so it isn't repeatedly investigated as a bug.
   if (isInbound && !toText && !pending && m.delivered_to === null) {
     toLine.title = '这封邮件入库时未保存原始收件人（To:）信息，且已超出上游保留期，无法恢复';
   }
-  // 我只是被抄送/密送时，在默认可见的这一行就给个角标 —— 详情行是折叠的，藏在那里等于没说
+  // When I'm only cc'd/bcc'd, show a chip on this default-visible line — the detail lines are collapsed, so hiding it there is as good as saying nothing
   const role = isInbound ? myRecipientRole(m) : null;
   if (role === 'cc' || role === 'bcc') {
     const chip = document.createElement('span');
@@ -1686,7 +1691,7 @@ function renderRead() {
   env.appendChild(toLine);
   env.appendChild(lines);
 
-  // 附件
+  // Attachments
   if (currentAttachments.length) {
     const box = document.createElement('div');
     box.className = 'attachments';
@@ -1702,8 +1707,8 @@ function renderRead() {
     box.appendChild(list);
     env.appendChild(box);
   } else if (pending && m.attachments_count > 0) {
-    // 附件明细要等详情接口，但列表项已带附件数量：先把数量显示出来，
-    // 否则用户在下载期间会以为这封邮件没有附件。
+    // Attachment details wait on the detail endpoint, but the list item already carries the attachment count: show the count first,
+    // otherwise the user would think the message has no attachments while it is downloading.
     const box = document.createElement('div');
     box.className = 'attachments';
     const title = document.createElement('div');
@@ -1714,7 +1719,7 @@ function renderRead() {
   }
   readEl.appendChild(env);
 
-  // 正文：下载中 / 下载失败时用占位态，不渲染一块空正文
+  // Body: use the placeholder state while downloading / on failure, rather than rendering a blank body
   const bodyCard = document.createElement('div');
   bodyCard.className = 'mail-body';
   if (pending) {
@@ -1730,15 +1735,15 @@ function renderRead() {
   readEl.appendChild(bodyCard);
 
   syncRowUI(m.id);
-  // 详情渲染完再对齐布局。放在这里而不是 openMessage 的每个分支里各加一次：
-  // renderRead() 是详情内容出现的**唯一出口**（缓存命中 / 乐观渲染 / 详情返回都走它），
-  // 放这里天然不会漏。
+  // Align the layout after the detail renders. Placed here rather than repeated in every branch of openMessage:
+  // renderRead() is the **sole exit** where detail content appears (cache hit / optimistic render / detail return all go through it),
+  // so placing it here naturally never misses.
   syncLayout();
 }
 
 /**
- * 正文位的占位：下载中显示转圈 + 文案；失败显示原因 + 重试。
- * 两种情况都**保留信封卡**，用户始终能看到主题 / 发件人 / 时间。
+ * Body-slot placeholder: while downloading show a spinner + text; on failure show the reason + retry.
+ * Both cases **keep the envelope card**, so the user can always see subject / sender / time.
  */
 function detailPlaceholder(pend) {
   const wrap = document.createElement('div');
@@ -1761,13 +1766,13 @@ function detailPlaceholder(pend) {
 }
 
 /**
- * 该会话行是否代表「当前正在看的那封邮件」。
+ * Whether this thread row represents "the message currently being viewed".
  *
- * 服务端会把「同一封物理邮件的回环副本」折叠掉（用 `copy_ids` 挂在留存行上，
- * 见 src/repo.ts 的 foldLoopbackCopies）—— 典型场景：我从 bingfeng@ 发信并抄送
- * zhanglili@，这封信又被投递回本账号的 zhanglili@，于是库里既有出站副本、又有入站副本。
- * 此时若用户打开的正是**被折叠的那份**（例如从 zhanglili@ 的收件箱点进来），
- * 只比 id 会导致面板里一行都不高亮，看起来像「我打开的那封不见了」。
+ * The server folds "loopback copies of the same physical message" (attached to the retained row via `copy_ids`,
+ * see foldLoopbackCopies in src/repo.ts) — a typical scenario: I send from dana@ and cc
+ * erin@, and the message is delivered back to erin@ on this account, so the DB holds both an outbound copy and an inbound copy.
+ * If the user opens exactly the **folded one** (e.g. coming from erin@'s inbox), comparing only id
+ * would leave no row in the panel highlighted, looking like "the one I opened is gone".
  */
 function isCurrentThreadRow(t) {
   if (!currentMessage) return false;
@@ -1801,7 +1806,7 @@ function threadPanel() {
     sender.className = 't-sender';
     const senderText = displayThreadSender(t);
     sender.textContent = senderText;
-    // 会话行宽度有限，长地址会被省略号截断；悬停给出完整收发双方。
+    // Thread rows are narrow, so long addresses get truncated with an ellipsis; hover reveals the full sender/recipient pair.
     sender.title = senderText;
     btn.appendChild(sender);
 
@@ -1821,7 +1826,7 @@ function threadPanel() {
     btn.appendChild(time);
 
     btn.addEventListener('click', () => {
-      // 已经是当前这封（含「它就是被折叠的副本」）就不重复打开
+      // If it's already the current one (including "it is the folded copy"), don't reopen
       if (!isCurrentThreadRow(t)) void openMessage(t.id);
     });
     panel.appendChild(btn);
@@ -1829,7 +1834,7 @@ function threadPanel() {
   return panel;
 }
 
-/** 会话行的收发方文案：`发件方 → 收件方`（口径见 endpointsOf）。 */
+/** Thread row sender/recipient text: `sender → recipient` (see endpointsOf for the rule). */
 function displayThreadSender(t) {
   const [from, to] = endpointsOf(t);
   return `${from} → ${to}`;
@@ -1852,23 +1857,23 @@ function fmtSize(n) {
   return `${(n / 1024 / 1024).toFixed(1)} MB`;
 }
 
-/* ---------------- 附件：单击预览 + 独立下载 ----------------
+/* ---------------- Attachments: click to preview + separate download ----------------
  *
- * 用户诉求：已知格式（图片 / 视频 / PDF / 纯文本…）点一下就能看，下载另给一个按钮。
+ * User request: known formats (image / video / PDF / plain text…) open on a single click, with a separate download button.
  *
- * ⚠️ **前端 `attachmentKind()` 与后端 `repo.isInlinePreviewType()` 必须同一口径**：
- * 前端据此决定「点开是预览还是提示下载」，后端据此决定 `Content-Disposition` 是
- * inline 还是 attachment。两边不一致会出现「浮层开了、后端却让浏览器下载」的割裂。
- * 改一边必须改另一边（composer-cc-forward 套件有断言直接比对两份清单）。
+ * ⚠️ **Frontend `attachmentKind()` and backend `repo.isInlinePreviewType()` must use the same rule**:
+ * the frontend decides "click opens a preview or prompts download", the backend decides whether `Content-Disposition` is
+ * inline or attachment. If the two disagree, you get the split of "overlay opened, but the backend makes the browser download".
+ * Changing one requires changing the other (the composer-cc-forward suite has an assertion that directly compares the two lists).
  *
- * **SVG 明确不预览**：SVG 能内嵌 `<script>`，内联进本应用的同源上下文等于 XSS。
- * 后端同样把它降级成下载。
+ * **SVG is explicitly not previewed**: SVG can embed `<script>`, and inlining it into this app's same-origin context equals XSS.
+ * The backend likewise downgrades it to a download.
  */
 
-/** 可内嵌预览的非 image/video/audio 类型（与后端 isInlinePreviewType 保持一致）。 */
+/** Non image/video/audio types that can be previewed inline (kept consistent with the backend isInlinePreviewType). */
 const INLINE_PREVIEW_TYPES = ['application/pdf', 'text/plain', 'text/csv', 'text/markdown', 'application/json'];
 
-/** 附件类型 → 预览方式：`image | video | audio | pdf | text | none`。 */
+/** Attachment type → preview mode: `image | video | audio | pdf | text | none`. */
 function attachmentKind(a) {
   const t = String((a && a.content_type) || '').toLowerCase().split(';')[0].trim();
   if (!t) return 'none';
@@ -1881,18 +1886,18 @@ function attachmentKind(a) {
   return 'none';
 }
 
-/** 预览地址：不带参数，后端按类型给 inline。 */
+/** Preview URL: no parameters; the backend serves inline based on type. */
 function attachmentUrl(a) {
   return String((a && a.url) || '');
 }
 
-/** 下载地址：`?dl=1` 强制 attachment（否则 PDF/图片会被浏览器就地打开而不是存盘）。 */
+/** Download URL: `?dl=1` forces attachment (otherwise PDF/images would be opened in place by the browser instead of saved). */
 function attachmentDownloadUrl(a) {
   const url = attachmentUrl(a);
   return url + (url.indexOf('?') >= 0 ? '&' : '?') + 'dl=1';
 }
 
-/** 附件 chip：文件名可点（预览），右侧独立「下载」按钮。 */
+/** Attachment chip: filename is clickable (preview), with a separate "Download" button on the right. */
 function attachmentChip(a) {
   const kind = attachmentKind(a);
   const chip = document.createElement('span');
@@ -1927,16 +1932,16 @@ function attachmentChip(a) {
   return chip;
 }
 
-/** 预览请求序号：关闭 / 换一个附件后，旧的异步文本回调不许再写进浮层。 */
+/** Preview request sequence number: after closing / switching attachments, old async text callbacks must not write into the overlay. */
 let attPreviewSeq = 0;
 
-/** 关掉预览浮层。返回「本次是否真的关了」，供 Esc 处理器判断要不要继续往下传。 */
+/** Close the preview overlay. Returns "whether it actually closed this time", for the Esc handler to decide whether to keep propagating. */
 function closeAttachmentPreview() {
   const box = $('#att-preview');
   if (!box || box.classList.contains('hidden')) return false;
   box.classList.add('hidden');
   const body = $('#att-preview-body');
-  // 清空内容：`<video>` / `<audio>` 只有在被移出文档后才会停止继续加载
+  // Clear the content: `<video>` / `<audio>` only stop loading further once removed from the document
   if (body) body.innerHTML = '';
   attPreviewSeq++;
   return true;
@@ -1966,7 +1971,7 @@ function openAttachmentPreview(a) {
     node.src = url;
     node.alt = a.filename || '';
   } else if (kind === 'pdf') {
-    // PDF 交给浏览器内置查看器：iframe 内嵌，不离开当前页面
+    // Hand PDFs to the browser's built-in viewer: embedded via iframe, without leaving the current page
     node = document.createElement('iframe');
     node.src = url;
     node.title = a.filename || 'PDF 预览';
@@ -1979,7 +1984,7 @@ function openAttachmentPreview(a) {
     node.src = url;
     node.controls = true;
   } else {
-    // 文本类自己拉回来渲染：用 iframe 会让浏览器把它当独立页面加载，样式和交互都不受控
+    // Text types are fetched and rendered ourselves: an iframe would make the browser load it as a standalone page, leaving style and interaction uncontrolled
     node = document.createElement('pre');
     node.className = 'att-preview-text';
     node.textContent = '加载中…';
@@ -2001,15 +2006,15 @@ function setupAttachmentPreview() {
   if (!box) return;
   const close = $('#att-preview-close');
   if (close) close.addEventListener('click', closeAttachmentPreview);
-  // 点浮层空白（不是内容盒）关闭
+  // Click the overlay blank area (not the content box) to close
   box.addEventListener('click', (e) => {
     if (e.target === e.currentTarget) closeAttachmentPreview();
   });
-  // Esc 关预览。**必须挂在捕获阶段**并 stopPropagation：
-  // 全局那个 Esc 处理器（收抽屉 / 确认框 / 关写信弹窗）在 setupEvents 里，而那两个 vm 套件
-  // 会把 setupEvents 中间那段整段抽出来单独执行 —— 在那里调用本模块的函数会直接
-  // ReferenceError 打挂套件。挂捕获阶段还有个好处：预览是最外层浮层，Esc 天然优先，
-  // 预览关掉后事件不再下传，不会顺手把抽屉也关了。
+  // Esc closes the preview. **Must be bound in the capture phase** with stopPropagation:
+  // the global Esc handler (close drawer / confirm box / close composer) lives in setupEvents, and those two vm suites
+  // extract that whole middle section of setupEvents and run it standalone — calling a function from this module there
+  // would throw ReferenceError and crash the suite. Binding in the capture phase has another benefit: the preview is the outermost overlay, so Esc naturally takes priority,
+  // and once the preview closes the event no longer propagates down, so it won't also close the drawer.
   document.addEventListener(
     'keydown',
     (e) => {
@@ -2023,7 +2028,7 @@ function setupAttachmentPreview() {
   );
 }
 
-/* ---------------- HTML 清洗 ---------------- */
+/* ---------------- HTML sanitization ---------------- */
 
 const SAFE_TAGS = new Set([
   'A', 'ABBR', 'B', 'BLOCKQUOTE', 'BR', 'CENTER', 'CODE', 'DD', 'DEL', 'DIV', 'DL', 'DT',
@@ -2098,7 +2103,7 @@ function unwrap(el) {
   parent.removeChild(el);
 }
 
-/* ---------------- 写信 / 回复 / 附件 / 富文本 ---------------- */
+/* ---------------- Compose / reply / attachments / rich text ---------------- */
 
 function plainToHtmlText(text) {
   return String(text || '')
@@ -2112,9 +2117,9 @@ function isRich() {
 }
 
 /**
- * 解析收件人输入：逗号 / 分号（含中文全角）/ 空白均为分隔符，
- * 每段 trim 后去空，再按小写去重（保留首次出现的写法）。
- * 与后端 parseRecipient() 的字符串分支同一口径，避免前后端解析结果漂移。
+ * Parse recipient input: comma / semicolon (including full-width Chinese) / whitespace are all separators,
+ * each segment is trimmed then dropped if empty, then deduped case-insensitively (keeping the first spelling).
+ * Same convention as the string branch of the backend parseRecipient(), to avoid front/back-end parsing drift.
  */
 function parseRecipients(raw) {
   const seen = new Set();
@@ -2129,21 +2134,21 @@ function parseRecipients(raw) {
   return out;
 }
 
-/** 更新「合并发送」提示：勾选且收件人 > 1 时显示将分别发送的封数，否则清空。 */
+/** Update the "merge send" hint: when checked and recipients > 1, show how many separate emails will be sent; otherwise clear it. */
 function updateMergeHint() {
   const n = parseRecipients($('#f-to').value).length;
   $('#merge-hint').textContent = $('#f-merge').checked && n > 1 ? `将分别单独发送给 ${n} 位收件人` : '';
 }
 
-/* ---------------- 收件人联想（本地联系人） ---------------- */
+/* ---------------- Recipient autocomplete (local contacts) ---------------- */
 
 const RECIPIENT_FIELDS = ['#f-to', '#f-cc', '#f-bcc'];
 const SUGGEST_MAX = 8;
 
-/** 当前联想状态；field 为 null 表示下拉未打开。 */
+/** Current autocomplete state; field being null means the dropdown is not open. */
 let addrSuggest = { field: null, items: [], index: -1, query: '', start: 0, end: 0 };
 
-/** 懒加载本地联系人；失败只是联想不可用，不能影响发信，所以静默降级。 */
+/** Lazily load local contacts; failure only disables autocomplete and must not affect sending, so degrade silently. */
 async function loadContacts(force = false) {
   if (state.contactsLoaded && !force) return;
   try {
@@ -2156,8 +2161,8 @@ async function loadContacts(force = false) {
 }
 
 /**
- * 取光标所在的那一段地址（逗号 / 分号 / 空白为分隔）。
- * 返回 start/end 供替换用 —— 选中后只替换这一段，字段里其余收件人保持不动。
+ * Get the address segment at the cursor (comma / semicolon / whitespace as separators).
+ * Returns start/end for replacement — after selection only this segment is replaced, the other recipients in the field stay untouched.
  */
 function recipientToken(input) {
   const v = String(input.value || '');
@@ -2172,8 +2177,8 @@ function recipientToken(input) {
 }
 
 /**
- * 联想排序：姓名前缀 > 姓名包含 > 邮箱前缀 > 邮箱包含，同级按往来次数降序。
- * 输入 lili 时，名字里带 lili 的人排在「只是邮箱碰巧含 lili」的前面。
+ * Autocomplete ranking: name prefix > name contains > email prefix > email contains, ties broken by interaction count descending.
+ * When typing lili, people whose name contains lili rank ahead of those whose email merely happens to contain lili.
  */
 function contactScore(c, q) {
   const name = String(c.name || '').toLowerCase();
@@ -2189,7 +2194,7 @@ function matchContacts(query) {
   const q = query.trim().toLowerCase();
   if (!q) return [];
   const hits = [];
-  // `|| []`：联想跑在每次按键上，任何情况下都不能让输入框抛错（联系人未加载完也是合法状态）
+  // `|| []`: autocomplete runs on every keystroke, so the input must never throw (contacts not fully loaded is a valid state too)
   for (const c of state.contacts || []) {
     const score = contactScore(c, q);
     if (score < 0) continue;
@@ -2199,7 +2204,7 @@ function matchContacts(query) {
   return hits.slice(0, SUGGEST_MAX).map((h) => h.c);
 }
 
-/** 转义后再把命中的那段包 <mark>（先插标签再转义会把标签一起转掉）。 */
+/** Escape first, then wrap the matched segment in <mark> (inserting tags before escaping would escape them too). */
 function highlightMatch(text, query) {
   const t = String(text == null ? '' : text);
   const q = String(query || '');
@@ -2209,14 +2214,14 @@ function highlightMatch(text, query) {
 }
 
 /**
- * 联想下拉的几何：**宽度不跟随输入框**。
+ * Geometry of the autocomplete dropdown: **width does not follow the input**.
  *
- * 输入框在手机上只有一百多像素（收件人那行还要和别的控件分宽度），跟着它走会把
- * `zhanglili@notionmanager.com` 这类邮箱截断成看不见。改为铺满写信弹窗的**内容宽度**
- * （左边界对齐内容左边缘，右边界对齐内容右边缘），一行就够放下完整邮箱。
+ * On mobile the input is only a bit over a hundred pixels wide (the recipient row also shares width with other controls), and following it would truncate
+ * an email like `erin@example.com` out of view. Instead it spans the **content width** of the composer modal
+ * (left edge aligned with the content's left edge, right edge aligned with the content's right edge), making one line wide enough for a full email.
  *
- * 抽成纯函数（只吃数字、不读 DOM）：jsdom 没有真实布局，clientWidth 恒为 0，
- * 直接断言 positionSuggest 只能测出「设了 0px」，测不出真正的宽度策略。
+ * Extracted as a pure function (only takes numbers, reads no DOM): jsdom has no real layout and clientWidth is always 0,
+ * so asserting positionSuggest directly only proves "0px was set" and not the real width strategy.
  */
 function suggestBoxGeom({ hostWidth, padLeft, padRight, anchorTop, anchorHeight }) {
   const width = Math.max(0, hostWidth - padLeft - padRight);
@@ -2261,7 +2266,7 @@ function paintSuggest() {
     row.setAttribute('role', 'option');
     const nm = document.createElement('span');
     nm.className = 'nm';
-    // 没有姓名时用邮箱当主标签，保证每行都有可读的主字段
+    // When there is no name, use the email as the primary label so every row has a readable main field
     nm.innerHTML = highlightMatch(c.name || c.email, addrSuggest.query);
     row.appendChild(nm);
     if (c.name) {
@@ -2270,7 +2275,7 @@ function paintSuggest() {
       em.innerHTML = highlightMatch(c.email, addrSuggest.query);
       row.appendChild(em);
     }
-    // mousedown + preventDefault：点下拉项时不夺走输入框焦点（否则 blur 会先把下拉关掉）
+    // mousedown + preventDefault: clicking a dropdown item must not steal input focus (otherwise blur would close the dropdown first)
     row.addEventListener('mousedown', (e) => {
       e.preventDefault();
       applySuggest(i);
@@ -2281,14 +2286,14 @@ function paintSuggest() {
   positionSuggest(addrSuggest.field);
 }
 
-/** 把光标所在的这一段替换为联系人的纯邮箱（其余收件人原样保留）。 */
+/** Replace the segment at the cursor with the contact's plain email (other recipients preserved as-is). */
 function applySuggest(i) {
   const input = addrSuggest.field;
   const item = addrSuggest.items[i];
   if (!input || !item) return;
   const v = String(input.value || '');
   const { start, end } = addrSuggest;
-  // 在末尾选中时补一个分隔符，方便接着输下一个收件人
+  // When selecting at the end, append a separator to make it easy to type the next recipient
   const insert = end >= v.length ? `${item.email}, ` : item.email;
   input.value = v.slice(0, start) + insert + v.slice(end);
   const caret = start + insert.length;
@@ -2297,9 +2302,9 @@ function applySuggest(i) {
   try {
     input.setSelectionRange(caret, caret);
   } catch {
-    /* 老浏览器忽略 */
+    /* ignored by old browsers */
   }
-  // 不派发合成 input 事件（否则会立刻拿刚插入的邮箱再触发一次联想），只手工跑联动
+  // Do not dispatch a synthetic input event (that would immediately re-trigger autocomplete on the just-inserted email); run the chained updates manually
   updateMergeHint();
 }
 
@@ -2310,7 +2315,7 @@ function moveSuggest(step) {
   paintSuggest();
 }
 
-/** 输入变化：重算光标所在段，按需显示/更新/收起下拉。 */
+/** Input changed: recompute the segment at the cursor and show/update/hide the dropdown as needed. */
 function refreshSuggest(input) {
   const { start, end, text } = recipientToken(input);
   const items = matchContacts(text);
@@ -2322,7 +2327,7 @@ function refreshSuggest(input) {
   paintSuggest();
 }
 
-/** 收件人字段键盘导航；下拉未打开时一律放行（不干扰正常输入，也不吃掉 Esc 关弹窗）。 */
+/** Keyboard navigation for recipient fields; when the dropdown is closed, always pass through (doesn't interfere with normal typing or swallow Esc for closing the modal). */
 function onRecipientKeydown(e) {
   if (!addrSuggest.field || addrSuggest.field !== e.target || !addrSuggest.items.length) return;
   if (e.key === 'ArrowDown') {
@@ -2335,14 +2340,14 @@ function onRecipientKeydown(e) {
     e.preventDefault();
     applySuggest(addrSuggest.index);
   } else if (e.key === 'Escape') {
-    // 只收起下拉，不能顺带把整个写信弹窗关掉
+    // Only hide the dropdown; must not also close the whole composer modal
     e.preventDefault();
     e.stopPropagation();
     hideSuggest();
   }
 }
 
-/** 给三个收件人字段挂上联想：输入 / 键盘导航 / 失焦收起 / 聚焦时按需拉联系人。 */
+/** Wire up autocomplete on the three recipient fields: input / keyboard navigation / hide on blur / lazy-load contacts on focus. */
 function bindRecipientSuggest() {
   for (const sel of RECIPIENT_FIELDS) {
     const input = $(sel);
@@ -2350,7 +2355,7 @@ function bindRecipientSuggest() {
     input.addEventListener('keydown', onRecipientKeydown);
     input.addEventListener('focus', () => void loadContacts());
     input.addEventListener('blur', () => {
-      // 延迟收起：给下拉项的 mousedown 一个先手（正常点击路径下其实不会 blur）
+      // Delayed hide: give the dropdown item's mousedown a head start (in the normal click path no blur actually occurs)
       setTimeout(() => {
         if (addrSuggest.field === input) hideSuggest();
       }, 120);
@@ -2358,10 +2363,10 @@ function bindRecipientSuggest() {
   }
 }
 
-/* ---------------- 抄送 / 密送展开 ---------------- */
+/* ---------------- CC / BCC expansion ---------------- */
 
-// 用显式 id 而不是 querySelectorAll('.cc-field')：零依赖的 DOM 桩（test/compose-guard.test.js）
-// 只实现了 querySelector，没有 querySelectorAll，用类选择器会让那套件直接抛错。
+// Use explicit ids instead of querySelectorAll('.cc-field'): the zero-dependency DOM stub (test/compose-guard.test.js)
+// only implements querySelector, not querySelectorAll, so class selectors would make that suite throw.
 const CC_ROWS = ['#f-cc-row', '#f-bcc-row'];
 
 function recipientsExpanded() {
@@ -2374,8 +2379,8 @@ function setRecipientsExpanded(show) {
 }
 
 /**
- * 切换抄送/密送行。**已有内容时不允许收起** —— 收起后字段仍会参与发送，
- * 用户看不见却发出去，是最容易造成误抄送的一类事故。
+ * Toggle the CC/BCC rows. **Collapsing is not allowed when there is already content** — the collapsed fields still participate in sending,
+ * so sending content the user can't see is one of the easiest ways to cause an accidental CC.
  */
 function toggleRecipientsExpanded() {
   if (!recipientsExpanded()) {
@@ -2390,25 +2395,25 @@ function toggleRecipientsExpanded() {
   setRecipientsExpanded(false);
 }
 
-/** 打开弹窗时重置「合并发送」：取消勾选并清空提示。勾选不算用户输入，不进基线。 */
+/** Reset "merge send" when opening the modal: uncheck and clear the hint. The checkbox isn't user input and doesn't go into the baseline. */
 function resetMergePick() {
   $('#f-merge').checked = false;
   updateMergeHint();
 }
 
-/** 合并发送只在写信模式可用：回复模式的收件人由后端从原邮件推导，显示该控件会误导用户。 */
+/** Merge send is only available in compose mode: in reply mode the recipients are derived by the backend from the original email, so showing this control would mislead the user. */
 function setMergeRowVisible(visible) {
   $('.merge-row').classList.toggle('hidden', !visible);
 }
 
-/* ---------------- 发件人（独立一行，默认折叠） ---------------- */
+/* ---------------- Sender (own row, collapsed by default) ---------------- */
 
 /**
- * 发件人折叠态只显示一行摘要（「发件人 xxx@yyy ▾」），点开才展开下拉选择。
+ * The collapsed sender state shows only a one-line summary ("Sender xxx@yyy ▾"), and only expands the dropdown when clicked.
  *
- * 和抄送 / 密送的关键差别：收起来**不会丢内容** —— 当前发件人始终写在摘要行里，
- * 选择值也一直留在 select 上（发送时照常读取）。所以这里没有「有内容不许收起」
- * 那条限制，收起纯属省版面。
+ * Key difference from CC / BCC: collapsing **does not lose content** — the current sender is always written in the summary row,
+ * and the selected value stays on the select (read as usual when sending). So there's no "can't collapse when it has content"
+ * restriction here; collapsing is purely to save space.
  */
 function senderExpanded() {
   return !$('#f-mailbox-row').classList.contains('hidden');
@@ -2421,7 +2426,7 @@ function setSenderExpanded(show) {
   $('#f-sender-toggle').setAttribute('aria-expanded', show ? 'true' : 'false');
 }
 
-/** 摘要行始终反映 select 的当前值；只有一个可选项时藏掉箭头（点开也没有可选的）。 */
+/** The summary row always reflects the select's current value; when there's only one option, hide the arrow (expanding shows nothing). */
 function renderSenderSummary() {
   const list = composerMailboxOptions();
   const row = $('#f-sender-row');
@@ -2435,13 +2440,13 @@ function renderSenderSummary() {
 }
 
 function toggleSenderExpanded() {
-  // 只有一个发件地址时没有可选项，点开是空转
+  // With only one sender address there are no options, so expanding does nothing
   if ($('#f-sender-row').classList.contains('sender-solo')) return;
   setSenderExpanded(!senderExpanded());
 }
 
 function composerMailboxOptions() {
-  // 「(未识别)」是聚合用的展示分组，不是可发送地址，不能出现在发件人选择里。
+  // "(unrecognized)" is a display grouping used for aggregation, not a sendable address, so it must not appear in the sender picker.
   const list = state.mailboxList.map((m) => m.mailbox).filter((m) => m && m !== UNKNOWN_MAILBOX);
   if (state.fromAddress && !list.includes(state.fromAddress.toLowerCase())) list.unshift(state.fromAddress.toLowerCase());
   const def = state.composing && state.composing.mailbox ? state.composing.mailbox : '';
@@ -2467,7 +2472,7 @@ function renderMailboxPicker() {
   }
   sel.value = list.includes(cur) ? cur : list[0];
   if (state.composing) state.composing.mailbox = sel.value;
-  // 每次打开弹窗都回到折叠态：默认只占一行，要改发件人时再点开
+  // Reset to collapsed every time the modal opens: one row by default, expand only when changing the sender
   setSenderExpanded(false);
   renderSenderSummary();
 }
@@ -2487,9 +2492,9 @@ function resetComposerEditor() {
 }
 
 /**
- * 打开写信弹窗的公共收尾。三个入口（写信 / 回复 / 转发）只在「预填什么、显示哪些控件」上不同，
- * 其余（清空、渲染发件人、记录基线、显示弹窗）必须完全一致 —— 分开写迟早漂移成
- * 「回复能联想、转发不能」这类只在某个模式出现的怪问题。
+ * Common tail for opening the composer modal. The three entry points (compose / reply / forward) differ only in "what to prefill, which controls to show",
+ * while the rest (clearing, rendering the sender, recording the baseline, showing the modal) must be identical — writing them separately would eventually drift into
+ * weird mode-specific bugs like "autocomplete works in reply but not forward".
  */
 function openComposerShell(opts) {
   const {
@@ -2498,7 +2503,7 @@ function openComposerShell(opts) {
     draftId = null, bodyHtml = '', rich = false,
   } = opts;
 
-  // 草稿 id 在这里就定下来（新建或恢复草稿）：自动保存走 upsert，不必「先创建再拿 id」。
+  // The draft id is fixed here (new or restored draft): autosave uses upsert, so there's no need to "create first then get the id".
   state.composing = {
     mode,
     originalId,
@@ -2508,7 +2513,7 @@ function openComposerShell(opts) {
     mailbox,
     draftId: draftId || newDraftId(),
   };
-  draftEverSaved = Boolean(draftId); // 从草稿箱恢复的，服务端本来就有这份记录
+  draftEverSaved = Boolean(draftId); // restored from drafts, so the server already has this record
 
   $('#composer-title').textContent = title;
   $('#f-to').value = to;
@@ -2529,7 +2534,7 @@ function openComposerShell(opts) {
   resetMergePick();
   setMergeRowVisible(!!showMerge);
   composerLastFocus = null;
-  // 记录基线：预填的收件人 / 主题 / 引用正文都不算用户输入
+  // Record the baseline: prefilled recipients / subject / quoted body don't count as user input
   composerBaseline = {
     to: $('#f-to').value,
     cc: $('#f-cc').value,
@@ -2540,10 +2545,10 @@ function openComposerShell(opts) {
     mailbox: $('#f-mailbox').value,
   };
   $('#modal-mask').classList.remove('hidden');
-  // 会话内记住上次的浮动几何；移动端 / 没几何时这里会把内联值清空，回落到 CSS 布局
+  // Remember the last floating geometry within the session; on mobile / with no geometry this clears the inline values and falls back to CSS layout
   applyComposerGeom();
-  closeDrawer(); // 移动端：写信弹窗是全屏的，抽屉必须先收起
-  void loadContacts(); // 联想数据懒加载，失败不影响发信
+  closeDrawer(); // Mobile: the composer modal is full-screen, so the drawer must be closed first
+  void loadContacts(); // Lazy-load autocomplete data; failure doesn't affect sending
   $(focus).focus();
 }
 
@@ -2556,7 +2561,7 @@ function openComposer() {
     mode: 'compose',
     title: '写信',
     mailbox: state.mailbox || undefined,
-    showMerge: true, // 写信模式：显示合并发送
+    showMerge: true, // Compose mode: show merge send
     showQuote: false,
     focus: '#f-to',
   });
@@ -2578,15 +2583,15 @@ function openReplyComposer() {
     to: to || '',
     subject: /^\s*re:/i.test(m.subject || '') ? m.subject : `Re: ${m.subject || ''}`,
     mailbox: m.mailbox || undefined,
-    showMerge: false, // 回复模式：合并发送无意义，隐藏该控件避免误导
+    showMerge: false, // Reply mode: merge send is meaningless, hide the control to avoid misleading
     showQuote: true,
     focus: '#f-body',
   });
 }
 
 /**
- * 转发：**任意方向**的邮件都能转发给任意收件人。
- * 与回复不同，收件人**不预填**（转发本来就是发给新的人），正文预填原文引用块。
+ * Forward: emails of **any direction** can be forwarded to any recipient.
+ * Unlike reply, the recipients are **not prefilled** (forwarding is inherently to new people), and the body is prefilled with the original quote block.
  */
 function openForwardComposer() {
   if (!state.canSend) {
@@ -2605,18 +2610,18 @@ function openForwardComposer() {
     body: forwardQuoteText(m),
     mailbox: m.mailbox || undefined,
     showMerge: false,
-    showQuote: false, // 正文里已经带了原文引用，不再需要「引用原文」按钮
+    showQuote: false, // The body already includes the original quote, so the "quote original" button is no longer needed
     focus: '#f-to',
     forwardNote: n ? `将附带原邮件的 ${n} 个附件` : '',
   });
 }
 
-/** 转发会带上的原邮件附件数量（内联图片不算 —— 服务端也会跳过它们）。 */
+/** Number of original attachments a forward will carry (inline images excluded — the server skips them too). */
 function forwardAttachmentCount() {
   return currentAttachments.filter((a) => !a.inline).length;
 }
 
-/** 转发正文里的原文引用块（含转发头，纯文本）。 */
+/** The original quote block in the forward body (with the forward header, plain text). */
 function forwardQuoteText(m) {
   const from = m.from_name ? `${m.from_name} <${m.from_email || ''}>` : (m.from_email || '—');
   const head = [
@@ -2631,34 +2636,34 @@ function forwardQuoteText(m) {
   return `${head}\n${body || '(无内容)'}\n`;
 }
 
-/* ---------------- 草稿：自动保存 ----------------
- * 需求：写了一半的邮件自动进草稿箱，关闭弹窗不再弹「是否放弃」。
+/* ---------------- Draft: autosave ----------------
+ * Requirement: a half-written email automatically goes into drafts, and closing the modal no longer prompts "discard?".
  *
- * 草稿 id 在**打开弹窗时**就生成（`newDraftId()`），保存走 PUT upsert ——
- * 这样自动保存不需要「先创建拿到 id」的往返，也不会因为第一次保存失败而丢掉后续。
+ * The draft id is generated **when the modal opens** (`newDraftId()`), and saving uses PUT upsert —
+ * so autosave doesn't need a "create to get the id" round trip, and a first save failure won't lose later ones.
  *
- * 唯一真值：`state.composing.draftId`。所有保存/删除都经 `flushDraft()` 这一个出口。
- * ⚠️ 附件不随草稿持久化（见交付说明）：内存里的 base64 太大，落库会撑爆 D1 单行上限。
- *    恢复草稿时附件需要重新添加，弹窗里会给一句提示。
+ * Single source of truth: `state.composing.draftId`. All saves/deletes go through the one exit `flushDraft()`.
+ * ⚠️ Attachments are not persisted with the draft (see delivery notes): the in-memory base64 is too large and would blow the D1 single-row limit.
+ *    Attachments need to be re-added when restoring a draft, and the modal shows a hint about this.
  */
 
 const DRAFT_SAVE_DEBOUNCE_MS = 1200;
 
 let draftSaveTimer = null;
 /**
- * 当前这封草稿是否**已经写进过服务端**。
- * 决定「空表单关窗」要不要发 DELETE —— 从没存过的新弹窗直接不发请求，
- * 免得每次打开又关掉都在服务端留一次无意义的往返。
+ * Whether the current draft has **ever been written to the server**.
+ * Determines whether closing an empty form should send DELETE — a brand-new modal that was never saved sends no request at all,
+ * avoiding a pointless server round trip every time a modal is opened and closed.
  */
 let draftEverSaved = false;
 
-/** 新草稿 id。优先 crypto.randomUUID（安全上下文），否则退回时间戳 + 随机串。 */
+/** New draft id. Prefer crypto.randomUUID (secure context), otherwise fall back to timestamp + random string. */
 function newDraftId() {
   try {
     const c = globalThis.crypto;
     if (c && typeof c.randomUUID === 'function') return c.randomUUID();
   } catch {
-    /* 非安全上下文（file:// 等）：走下面的回退 */
+    /* Non-secure context (file:// etc.): use the fallback below */
   }
   return `d-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
@@ -2670,7 +2675,7 @@ function clearDraftTimer() {
   }
 }
 
-/** 当前表单 → 自动保存请求体。正文按当前可见的编辑器取（与发送口径一致）。 */
+/** Current form → autosave request body. The body is taken from the currently visible editor (same as the send convention). */
 function draftPayload() {
   const c = state.composing;
   if (!c) return null;
@@ -2692,29 +2697,29 @@ function draftPayload() {
 }
 
 /**
- * 是否值得存成草稿 —— 「要不要落库」的**唯一判据**。
+ * Whether it's worth saving as a draft — the **sole criterion** for "should this go to the DB".
  *
- * 口径与 `isComposerDirty()` 共用同一个内核 `contentDiffersFromBaseline()`，
- * 只差「发件人下拉」一项：
- *  - 回复/转发弹窗**预填**的收件人、主题不算「写了一半」——
- *    否则用户点开回复又关掉，草稿箱里就会多出一堆自己没写过的回信；
- *  - 只敲空格不算；只换发件人也不算（下拉位置不是邮件内容，没什么可存的）；
- *  - 加了附件算 —— 附件虽然不落库（体积超 D1 单行上限），但用户确实动过手，
- *    得让他知道东西去哪了（见 closeComposerWithDraft 的提示）。
+ * It shares the same kernel `contentDiffersFromBaseline()` with `isComposerDirty()`,
+ * differing only in the "sender dropdown" item:
+ *  - Recipients and subject **prefilled** by reply/forward modals don't count as "half-written" —
+ *    otherwise opening a reply and closing it would clutter the drafts with replies the user never wrote;
+ *  - Typing only spaces doesn't count; changing only the sender doesn't either (the dropdown position isn't email content, nothing to save);
+ *  - Adding attachments counts — although attachments aren't persisted (size exceeds the D1 single-row limit), the user did take action
+ *    and needs to know where things went (see the hint in closeComposerWithDraft).
  */
 function hasDraftContent() {
   const c = state.composing;
   if (!c) return false;
   if (c.files.length > 0) return true;
-  // 没有基线时退回「任一非空即算」（openComposerShell 正常总会建基线，这里是兜底）
+  // Without a baseline, fall back to "any non-empty counts" (openComposerShell normally always builds one; this is a safety net)
   if (!composerBaseline) return isComposerDirty();
   return contentDiffersFromBaseline();
 }
 
-/** 草稿变化后让「草稿箱」的缓存与计数失效（当前不在草稿箱时也要，否则切过去看到旧列表）。 */
+/** Invalidate the drafts cache and counts after a draft change (needed even when not currently in drafts, or switching there would show a stale list). */
 function invalidateDraftCaches() {
-  // 防御：vm 套件的 sandbox 里 state.cache 没有 folders（只桩了 countsAt），
-  // 裸访问会让异步保存路径抛 unhandledRejection、把整个套件打崩。
+  // Defensive: in the vm suite's sandbox state.cache has no folders (only countsAt is stubbed),
+  // so a bare access would make the async save path throw an unhandledRejection and crash the whole suite.
   const folders = state.cache && state.cache.folders;
   if (folders && typeof folders.keys === 'function') {
     for (const k of Array.from(folders.keys())) {
@@ -2726,16 +2731,16 @@ function invalidateDraftCaches() {
 }
 
 /**
- * 落盘一份草稿快照：有内容 → PUT upsert；无内容 → DELETE（避免草稿箱里出现空条目）。
+ * Persist a draft snapshot: has content → PUT upsert; no content → DELETE (to avoid empty entries in drafts).
  *
- * 失败策略分两种（静默失败是这个项目最危险的 bug 类，不能一律吞掉）：
- *  - 自动保存（防抖）失败**静默** —— 不该打断写信，下次输入还会再试；
- *  - 手动关窗触发的保存失败**必须出声**（`surfaceErrors`）—— 那时弹窗已经关了，
- *    再不提示，用户的内容就真的一声不响地没了。
+ * Two failure strategies (silent failures are the most dangerous bug class in this project, so they can't be swallowed uniformly):
+ *  - Autosave (debounced) failure is **silent** — it shouldn't interrupt composing, and the next input will retry;
+ *  - A save triggered by manually closing the modal **must speak up** (`surfaceErrors`) — at that point the modal is already closed,
+ *    and without a prompt the user's content would truly vanish without a sound.
  */
 async function saveDraftSnapshot(id, payload, hasContent, opts) {
   if (!id) return false;
-  // 从没存过 + 现在也没内容 → 无事可做（空弹窗开关不该产生任何请求）
+  // Never saved + no content now → nothing to do (opening/closing an empty modal shouldn't produce any request)
   if (!hasContent && !draftEverSaved) return true;
   try {
     if (!hasContent) {
@@ -2758,7 +2763,7 @@ async function saveDraftSnapshot(id, payload, hasContent, opts) {
   }
 }
 
-/** 防抖到点时的保存：从当前表单现取快照。 */
+/** Save when the debounce fires: take a fresh snapshot from the current form. */
 function flushDraft() {
   clearDraftTimer();
   const c = state.composing;
@@ -2766,7 +2771,7 @@ function flushDraft() {
   return saveDraftSnapshot(c.draftId, draftPayload(), hasDraftContent());
 }
 
-/** 输入防抖保存。 */
+/** Debounced save on input. */
 function scheduleDraftSave() {
   if (!state.composing) return;
   clearDraftTimer();
@@ -2777,9 +2782,9 @@ function scheduleDraftSave() {
 }
 
 /**
- * 从草稿箱打开写信弹窗继续编辑。
- * 先取回完整草稿（列表接口只带摘要），回复/转发草稿还要把原邮件取回来 ——
- * 「引用原文」按钮与转发附件都依赖 `original`。
+ * Open the composer modal from drafts to continue editing.
+ * First fetch the full draft (the list endpoint only carries a summary); for reply/forward drafts the original email is also fetched —
+ * the "quote original" button and forwarded attachments both depend on `original`.
  */
 async function openDraftComposer(id) {
   if (!state.canSend) {
@@ -2800,7 +2805,7 @@ async function openDraftComposer(id) {
     try {
       original = (await api(`/api/messages/${encodeURIComponent(d.source_id)}`)).message;
     } catch {
-      /* 原邮件可能已被删除：退化成普通写信，草稿内容不丢 */
+      /* The original email may have been deleted: degrade to a plain compose, draft content is not lost */
     }
   }
 
@@ -2831,36 +2836,36 @@ async function openDraftComposer(id) {
   showToast('已打开草稿');
 }
 
-/* 关闭写信弹窗的守卫（语义已从「放弃确认」改为「自动存草稿」，见 requestCloseComposer） */
+/* Guard for closing the composer modal (semantics changed from "discard confirmation" to "autosave draft", see requestCloseComposer) */
 
-let discardConfirmPending = false; // 确认框是否已弹出（防重入）
-let composerLastFocus = null; // 确认框收起后要归还焦点的元素
-let composerBaseline = null; // 打开弹窗时的表单快照，用于识别「用户实际输入」
-let sendInFlight = false; // 是否正在发送，发送中禁止放弃
+let discardConfirmPending = false; // whether the confirm box is already shown (re-entrancy guard)
+let composerLastFocus = null; // element to return focus to after the confirm box is dismissed
+let composerBaseline = null; // form snapshot when the modal was opened, used to detect "actual user input"
+let sendInFlight = false; // whether a send is in progress; discarding is forbidden while sending
 
-/** 归一化文本输入：null/undefined 视为空串，并去掉首尾空白。 */
+/** Normalize text input: null/undefined treated as an empty string, and leading/trailing whitespace trimmed. */
 function norm(v) {
   return String(v == null ? '' : v).trim();
 }
 
 /**
- * 富文本编辑器的纯文本内容（忽略标签、<br>、空 div 与 &nbsp;）。
- * 只用 textContent 而不用 innerText，原因有三：
- * 1) 不依赖渲染结果，守卫与发送校验才能对同一份内容得出同一结论；
- * 2) jsdom 等测试环境没有 innerText，用 textContent 才可被自动化真实覆盖；
- * 3) 避免 CSS 伪元素占位符（.rich-editor:empty::before）污染渲染文本。
+ * Plain-text content of the rich text editor (ignoring tags, <br>, empty divs and &nbsp;).
+ * Uses textContent rather than innerText for three reasons:
+ * 1) It doesn't depend on rendering, so the guard and the send validation reach the same conclusion on the same content;
+ * 2) Test environments like jsdom have no innerText, so only textContent can be genuinely covered by automation;
+ * 3) It avoids CSS pseudo-element placeholders (.rich-editor:empty::before) polluting the rendered text.
  */
 function richPlainText(el) {
   return String(el.textContent || '').replace(/\u00a0/g, ' ').trim();
 }
 
 /**
- * 「相对打开弹窗时的快照，内容是否真的变了」——**不含发件人下拉**。
+ * "Has the content really changed relative to the snapshot taken when the modal opened" — **excluding the sender dropdown**.
  *
- * 这是 `isComposerDirty()` 与 `hasDraftContent()` 的**共同内核**：
- * 两套口径一旦各写一遍就会漂移（判脏却没存、或没写却存了空草稿）。
- * 只敲空格不算输入（norm 去首尾空白）；正文只认当前可见的那个编辑器，
- * 避免隐藏编辑器里的残留造成「假脏」。
+ * This is the **shared kernel** of `isComposerDirty()` and `hasDraftContent()`:
+ * writing the two conventions separately would cause drift (marked dirty but not saved, or not written yet an empty draft saved).
+ * Typing only spaces doesn't count as input (norm trims leading/trailing whitespace); the body only counts the currently visible editor,
+ * avoiding residue in the hidden editor causing a "false dirty".
  */
 function contentDiffersFromBaseline() {
   const b = composerBaseline;
@@ -2874,12 +2879,12 @@ function contentDiffersFromBaseline() {
 }
 
 /**
- * 用户是否已输入任何信息（与打开弹窗时的快照比对）。
- * 收件人 / 主题 / 发件人 / 当前可见的正文编辑器与基线不同，或已添加附件，
- * 即视为「脏」。回复弹窗预填的收件人、主题属于系统行为，不算用户输入。
- * 只敲空格不算输入；切换富文本模式本身不算脏。
- * 比 `hasDraftContent()` 多算一项「发件人下拉」——换了发信身份算用户操作，
- * 但光换发件人没有可落库的内容，所以那一项不参与「要不要存草稿」。
+ * Whether the user has entered any information (compared against the snapshot taken when the modal opened).
+ * If the recipients / subject / sender / currently visible body editor differ from the baseline, or attachments were added,
+ * it's considered "dirty". Recipients and subject prefilled by the reply modal are system behavior and don't count as user input.
+ * Typing only spaces doesn't count as input; toggling rich text mode itself doesn't count as dirty.
+ * It counts one extra item, the "sender dropdown", compared to `hasDraftContent()` — changing the sending identity is a user action,
+ * but changing only the sender has no content to persist, so that item doesn't participate in "should a draft be saved".
  */
 function isComposerDirty() {
   const c = state.composing;
@@ -2887,7 +2892,7 @@ function isComposerDirty() {
   if (c.files.length > 0) return true;
   const b = composerBaseline;
   if (!b) {
-    // 兜底：没有基线时退回「任一非空即脏」
+    // Safety net: without a baseline, fall back to "any non-empty is dirty"
     if (norm($('#f-to').value) !== '') return true;
     if (norm($('#f-cc').value) !== '') return true;
     if (norm($('#f-bcc').value) !== '') return true;
@@ -2900,14 +2905,14 @@ function isComposerDirty() {
 }
 
 function showDiscardConfirm() {
-  if (discardConfirmPending) return; // 已弹出则不重复弹
+  if (discardConfirmPending) return; // already shown; do not show again
   discardConfirmPending = true;
   $('#confirm-text').textContent = '这封邮件还没有发送，确定要放弃吗？已填写的内容将被丢弃。';
   $('#confirm-mask').classList.remove('hidden');
   $('#confirm-ok').focus();
 }
 
-/** 收起确认框（不关闭写信弹窗），焦点归还到用户原先编辑的位置。 */
+/** Hide the confirm dialog (without closing the composer) and restore focus to the user's previous edit position. */
 function hideDiscardConfirm(restoreFocus = true) {
   if (!discardConfirmPending && $('#confirm-mask').classList.contains('hidden')) return;
   discardConfirmPending = false;
@@ -2918,17 +2923,18 @@ function hideDiscardConfirm(restoreFocus = true) {
     try {
       el.focus();
     } catch {
-      /* 元素已不可聚焦，忽略 */
+      /* element can no longer be focused; ignore */
     }
   }
 }
 
 /**
- * 请求关闭写信弹窗：**存草稿后直接关闭，不再弹「是否放弃」**。
+ * Request closing the composer: **save the draft then close directly, no more "discard?" prompt**.
  *
- * 遮罩空白区点击、取消按钮、Esc 三个入口都走这里。既然写了一半的内容会自动落进草稿箱，
- * 「关窗」就不再是破坏性操作，也就没有需要用户确认的东西了。
- * 唯一仍然拦住的情况是「正在发送」—— 那时关窗会让用户误以为没发出去。
+ * The mask blank-area click, the cancel button, and Esc all go through here. Since half-written
+ * content automatically lands in the drafts folder, "closing the window" is no longer a destructive
+ * operation, so there is nothing left for the user to confirm. The only case still blocked is
+ * "sending" — closing then would make the user think it wasn't sent.
  */
 function requestCloseComposer() {
   if (!state.composing) return;
@@ -2939,36 +2945,36 @@ function requestCloseComposer() {
   void closeComposerWithDraft();
 }
 
-/** 落草稿 → 关窗。有内容时给一句提示，让用户知道东西去哪了。 */
+/** Save draft → close window. When there is content, show a hint so the user knows where it went. */
 function closeComposerWithDraft() {
   const c = state.composing;
   if (!c) return;
-  // 快照必须在 closeComposer() **之前**取：关窗会清掉 state.composing 与表单状态。
+  // The snapshot must be taken **before** closeComposer(): closing clears state.composing and the form state.
   const id = c.draftId;
   const hasContent = hasDraftContent();
   const payload = draftPayload();
   const inDraftsFolder = state.folder === 'drafts';
-  // 同步关窗：点一下要立刻见效，不能等一次网络往返
+  // Close synchronously: a click must take effect immediately, not after a network round trip
   closeComposer();
   if (hasContent) showToast('已存入草稿');
-  // 正停在草稿箱就刷新，让刚存下的草稿立刻出现
+  // If currently in the drafts folder, refresh so the just-saved draft appears immediately
   if (inDraftsFolder) void loadFolder(false, true);
-  // 手动关窗触发的保存：失败必须出声（此时弹窗已关，静默 = 内容无声消失）
+  // Save triggered by manual close: failures must be surfaced (the modal is already closed, so silent = content disappears without a sound)
   void saveDraftSnapshot(id, payload, hasContent, { surfaceErrors: true });
 }
 
 function closeComposer() {
-  clearDraftTimer(); // 关窗后不许再有在途的自动保存定时器
+  clearDraftTimer(); // no in-flight autosave timer may remain after closing
   hideDiscardConfirm(false);
   hideSuggest();
-  endComposerDrag(); // 关窗时若正拖着，把拖动状态一起收掉（否则 body 的类会残留）
+  endComposerDrag(); // if still dragging when closing, clear the drag state too (otherwise the body class lingers)
   composerLastFocus = null;
   composerBaseline = null;
   state.composing = null;
   $('#modal-mask').classList.add('hidden');
 }
 
-/* 附件 */
+/* Attachments */
 
 function readFileAsBase64(file) {
   return new Promise((resolve, reject) => {
@@ -3033,7 +3039,7 @@ function renderAttachChips() {
   }
 }
 
-/* 富文本 */
+/* Rich text */
 
 function quoteHtml() {
   const m = state.composing && state.composing.original;
@@ -3047,7 +3053,7 @@ function quoteHtml() {
   return `<blockquote>${esc(who)} ${esc(date)} 写道：<br>${text || '(无内容)'}</blockquote><br>`;
 }
 
-/** 回复引用的纯文本块（富文本模式下走 quoteHtml，两者内容口径保持一致）。 */
+/** Plain-text quoted block for replies (rich text mode uses quoteHtml; both keep the same content). */
 function quoteText() {
   const m = state.composing && state.composing.original;
   const who = (m && (m.from_name || m.from_email)) || '';
@@ -3110,7 +3116,7 @@ async function sendCompose() {
   const cc = parseRecipients($('#f-cc').value);
   const bcc = parseRecipients($('#f-bcc').value);
   const subject = $('#f-subject').value.trim();
-  // to / cc / bcc 任一非空即可发（只密送的邮件是合法的）
+  // any of to / cc / bcc non-empty is enough to send (a BCC-only email is legal)
   if (!to.length && !cc.length && !bcc.length) return showToast('请填写收件人', true);
 
   let body = $('#f-body').value;
@@ -3120,17 +3126,18 @@ async function sendCompose() {
     const ed = $('#f-body-rich');
     html = ed.innerHTML;
     body = ed.innerText || '';
-    // 与 isComposerDirty() 共用同一个「有内容」定义，避免两套口径漂移
+    // share the same "has content" definition as isComposerDirty(), to avoid two definitions drifting apart
     htmlHasText = richPlainText(ed) !== '';
   }
   if (!body.trim() && !htmlHasText) return showToast('请填写邮件内容', true);
 
-  // 判据是「有没有可选的发件地址」，不是「那一行有没有展开」：折叠只是收起 UI，
-  // 选择值一直有效，必须照常进请求体（否则改选发件人会静默失效）。
+  // The criterion is "is there a selectable sender address", not "is that row expanded": collapsing
+  // just hides the UI, the selected value stays valid and must go into the request body as usual
+  // (otherwise changing the sender silently fails).
   const mailbox = composerMailboxOptions().length ? $('#f-mailbox').value : undefined;
-  // 硬防御：合并发送只对写信接口生效，绝不向 /reply 或 /forward 发 merge
+  // Hard guard: mail merge only applies to the compose endpoint; never send merge to /reply or /forward
   const merge = c.mode === 'compose' && $('#f-merge').checked;
-  // 合并发送是「每人单独一封」，密送会让被密送者收到 N 封重复邮件 → 前端先拦，后端也会拒
+  // Merge sends one email per recipient; BCC would make each BCC'd recipient get N duplicates → block on the frontend, and the backend rejects it too
   if (merge && bcc.length) return showToast('合并发送不支持密送（BCC），请取消其中一个', true);
 
   const payload = {
@@ -3144,14 +3151,14 @@ async function sendCompose() {
   if (bcc.length) payload.bcc = bcc;
   if (mailbox) payload.mailbox = mailbox;
   if (merge) payload.merge = true;
-  // 带上草稿 id：服务端发送成功后会删掉对应草稿（全成功才删，合并发送部分失败时保留）
+  // Include the draft id: the server deletes the matching draft after a successful send (only on full success; kept when merge partially fails)
   if (c.draftId) payload.draft_id = c.draftId;
-  // 转发：原邮件附件由服务端从 R2 复制，前端不需要把它们下载再上传一遍
+  // Forward: the server copies the original attachments from R2; the frontend need not download and re-upload them
   if (c.mode === 'forward') payload.include_original_attachments = true;
 
   const sendBtn = $('#composer-send');
   sendBtn.disabled = true;
-  sendInFlight = true; // 发送中禁止放弃，避免失败时内容丢失
+  sendInFlight = true; // no discarding while sending, to avoid content loss on failure
   try {
     const url = c.mode === 'reply'
       ? `/api/messages/${encodeURIComponent(c.originalId)}/reply`
@@ -3161,8 +3168,8 @@ async function sendCompose() {
     const res = await api(url, { method: 'POST', body: JSON.stringify(payload) });
 
     if (merge && res && res.merge) {
-      // 合并发送：可能部分失败。失败者写回收件人框，重试时只发给失败的人，
-      // 不会重复投递给已成功的人；弹窗保持打开，已输入内容不丢。
+      // Merge send: may partially fail. Failed recipients are written back into the recipient box so a
+      // retry only targets them, without re-delivering to those who succeeded; the modal stays open and input is kept.
       if (res.failed_count > 0) {
         const failed = res.failed || [];
         $('#f-to').value = failed.map((f) => f.to).join(', ');
@@ -3173,7 +3180,7 @@ async function sendCompose() {
       }
       showToast(`已分别发送给 ${res.sent_count} 位收件人`);
     } else if (c.mode === 'forward' && res && Array.isArray(res.skipped_attachments) && res.skipped_attachments.length) {
-      // 少发了附件必须说出来，不能让用户以为附件跟着走了
+      // Missing attachments must be reported; the user must not think the attachments went along
       showToast(`已转发，但有 ${res.skipped_attachments.length} 个原附件读取失败已跳过：${res.skipped_attachments.join('、')}`, true);
     } else {
       showToast(c.mode === 'reply' ? '回复已发送' : c.mode === 'forward' ? '邮件已转发' : '邮件已发送');
@@ -3194,42 +3201,45 @@ async function sendCompose() {
   }
 }
 
-/* ---------------- 写信弹窗：可拖动 / 可缩放 / 可最大化（仅桌面端） ----------------
+/* ---------------- Composer modal: draggable / resizable / maximizable (desktop only) ----------------
  *
- * 背景：回复 / 转发时弹窗正对着原邮件，想对照着写很别扭。这里把桌面端的写信弹窗做成
- * 一个可以随手拖走、可以放大、可以最大化的浮动窗口；移动端保持原来的全屏布局。
+ * Background: when replying / forwarding the modal sits right on top of the original email, making it
+ * awkward to write against it. Here the desktop composer becomes a floating window you can drag around,
+ * resize, and maximize; mobile keeps the original fullscreen layout.
  *
- * ⚠️ 内联 width/height 的优先级**高于**媒体查询，所以切到移动端时必须把内联几何清掉，
- * 否则会出现「手机上弹窗还是桌面尺寸」。清理由 syncLayout()（布局的唯一收敛点）驱动。
+ * ⚠️ Inline width/height outrank media queries, so when switching to mobile the inline geometry must be
+ * cleared, otherwise "the modal is still desktop-sized on the phone". Clearing is driven by syncLayout()
+ * (the single convergence point for layout).
  *
- * 几何状态只有一份真值：composerGeom。
- *   null      = 不浮动 —— 沿用 CSS 的居中 + 自适应高度，即改动前的样子；
- *   {left,top,width,height} = 浮动窗口，由内联样式驱动。
- * 任何改几何的地方都必须落到 applyComposerGeom() 这一个出口，不许自己写 style。
+ * Geometry state has exactly one source of truth: composerGeom.
+ *   null      = not floating — falls back to CSS centering + adaptive height, i.e. the pre-change look;
+ *   {left,top,width,height} = floating window, driven by inline styles.
+ * Every place that changes geometry must funnel through the single exit applyComposerGeom(); never write style directly.
  */
 
-/** 浮动窗口的最小尺寸：再小就挤不下「收件人 / 正文 / 发送」三块。 */
+/** Minimum size of the floating window: any smaller and the "recipients / body / send" blocks don't fit. */
 const COMPOSER_MIN_W = 420;
 const COMPOSER_MIN_H = 320;
-/** 最大化时四周留的边距，免得贴着屏幕边缘。 */
+/** Margin left around the edges when maximized, to avoid hugging the screen edge. */
 const COMPOSER_MAX_GAP = 12;
-/** 判定「真的在拖」的最小位移：低于它就只是点了一下标题栏。 */
+/** Minimum movement to count as "actually dragging": below it, it's just a click on the title bar. */
 const COMPOSER_DRAG_THRESHOLD = 3;
 
-let composerGeom = null;      // { left, top, width, height } | null（见上方说明）
-let composerPrevGeom = null;  // 最大化之前的几何，供「还原」用
+let composerGeom = null;      // { left, top, width, height } | null (see the note above)
+let composerPrevGeom = null;  // geometry before maximizing, used by "restore"
 let composerMaximized = false;
-let composerDrag = null;      // 进行中的拖动 / 缩放 { mode, x, y, geom, moved }
+let composerDrag = null;      // in-progress drag / resize { mode, x, y, geom, moved }
 /**
- * 最近一次 pointerdown 是否落在弹窗内部。
+ * Whether the most recent pointerdown landed inside the modal.
  *
- * 用来区分「真的点了遮罩空白」和「在弹窗里按下、把鼠标抬到遮罩上」——后者浏览器会把
- * click 派发到两者的共同祖先（也就是遮罩自己），于是 target === currentTarget 成立、
- * 弹窗被误关。拖动标题栏天然就是这种手势，所以这个区分是必需的。
+ * Used to distinguish "actually clicked the blank mask" from "pressed inside the modal and released
+ * the mouse over the mask" — for the latter the browser dispatches click to the common ancestor (the
+ * mask itself), making target === currentTarget true and wrongly closing the modal. Dragging the title
+ * bar is naturally this gesture, so the distinction is required.
  */
 let composerPressInside = false;
 
-/** 视口尺寸。与 viewportWidth() 同源；缺失时给桌面默认值，别让 NaN 传染进几何。 */
+/** Viewport size. Same source as viewportWidth(); falls back to desktop defaults so NaN doesn't infect geometry. */
 function viewportSize() {
   const w = globalThis.innerWidth;
   const h = globalThis.innerHeight;
@@ -3240,15 +3250,17 @@ function viewportSize() {
 }
 
 /**
- * 把任意几何夹进视口。纯函数（只吃数字），便于在无布局的测试环境里直接验证策略。
+ * Clamp any geometry into the viewport. Pure function (numbers only), so the strategy can be verified
+ * directly in a layout-less test environment.
  *
- * 位置夹取的目标是「**整窗**都在视口内」，而不是「标题栏露一点就行」。
- * 尺寸在上面已经夹到不超过视口，所以整窗夹进去是可行的 —— 这样标题栏和右下角
- * 缩放把手就永远都够得着。
+ * Position clamping targets "the **whole window** stays within the viewport", not "the title bar peeks
+ * out". The size is already clamped to fit the viewport above, so clamping the whole window is feasible
+ * — this keeps both the title bar and the bottom-right resize grip always reachable.
  *
- * ⚠️ 别退化成「保证标题栏留 80px」那种写法：真实 Chromium 实测过，窗口往下拖
- * 150px 后右下角就被推到屏幕外，`elementFromPoint` 返回 null，把手既点不到也拖不动 ——
- * 用户把窗口拖到某个位置后**再也调不回来**。这是浮动窗口最经典的死锁。
+ * ⚠️ Don't degrade this into a "guarantee 80px of title bar" form: measured in real Chromium, after
+ * dragging the window down 150px the bottom-right corner is pushed offscreen, `elementFromPoint`
+ * returns null, and the grip can neither be clicked nor dragged — once dragged to some position the
+ * user can **never recover it**. This is the classic floating-window deadlock.
  */
 function clampComposerGeom(g, vp) {
   const maxW = Math.max(COMPOSER_MIN_W, vp.width - COMPOSER_MAX_GAP * 2);
@@ -3268,16 +3280,16 @@ function clampComposerGeom(g, vp) {
 }
 
 /**
- * 取 #composer 的「真实元素」。
- * 两个 vm 套件（compose-guard / mail-merge）用的是极简 DOM 桩，元素没有 style；
- * 拿不到 style 就说明不是浏览器，几何相关的代码一律跳过（返回 null 由调用方早退）。
+ * Get the "real element" for #composer.
+ * The two vm suites (compose-guard / mail-merge) use minimal DOM stubs whose elements have no style;
+ * no style means it's not a browser, so all geometry-related code is skipped (returns null for callers to bail out).
  */
 function composerBox() {
   const el = $('#composer');
   return el && el.style ? el : null;
 }
 
-/** 拖动期间给 body 加类（禁掉文字选择）。桩 DOM 的 body 没有 classList，做特性检测。 */
+/** Add a class to body during dragging (disables text selection). Stub DOMs' body has no classList, so feature-detect. */
 function setComposerDragging(on) {
   const b = document.body;
   if (!b || !b.classList) return;
@@ -3296,8 +3308,8 @@ function syncComposerMaxButton() {
 }
 
 /**
- * 几何的**唯一出口**：把 composerGeom 全量对齐到内联样式 + 状态类。
- * 非浮动（移动端 / 没几何）时把内联值清空，让 CSS 重新说了算。
+ * The **sole exit** for geometry: fully align composerGeom to inline styles + state classes.
+ * When not floating (mobile / no geometry), clear the inline values so CSS takes over again.
  */
 function applyComposerGeom() {
   const el = composerBox();
@@ -3311,8 +3323,8 @@ function applyComposerGeom() {
   const grip = $('#composer-resize');
   if (grip && grip.style && grip.classList) {
     grip.classList.toggle('hidden', !floating);
-    // 把手用 fixed 定位：弹窗内部滚动时它不会被滚走（绝对定位会跟着内容跑，
-    // 窗口被压到比内容还矮时就再也点不到了）。
+    // The grip uses fixed positioning: it won't scroll away when the modal scrolls internally
+    // (absolute positioning follows the content, and once the window is shorter than the content it's unreachable).
     if (floating) {
       grip.style.left = `${composerGeom.left + composerGeom.width - 18}px`;
       grip.style.top = `${composerGeom.top + composerGeom.height - 18}px`;
@@ -3337,20 +3349,21 @@ function applyComposerGeom() {
 }
 
 /**
- * 由 syncLayout() 在断点切换 / 窗口尺寸变化时调用：
- * 重新夹取几何，并（在移动端）清掉内联值让全屏布局生效。
+ * Called by syncLayout() on breakpoint switches / window size changes:
+ * re-clamp the geometry and (on mobile) clear inline values so the fullscreen layout takes effect.
  */
 function syncComposerWindowLayout() {
   if (!composerGeom) return;
-  // 移动端只是「这份几何暂时用不上」：不夹取、也不丢弃，切回桌面端原样恢复。
-  // 若在这里夹一次，窄视口会把用户挑的尺寸**永久压小**（夹取是单向的，缩回去长不回来）。
+  // On mobile this geometry is merely "not used for now": don't clamp or discard it; restore it as-is
+  // when switching back to desktop. If clamped here, a narrow viewport would **permanently shrink** the
+  // user's chosen size (clamping is one-way; once shrunk it can't grow back).
   if (!isMobile()) composerGeom = clampComposerGeom(composerGeom, viewportSize());
   applyComposerGeom();
 }
 
-/** 开始拖动 / 缩放：先把当前（可能由 CSS 决定的）几何量出来，真正移动时才固化成浮动。 */
+/** Start drag / resize: first measure the current (possibly CSS-determined) geometry, and freeze it as floating only on real movement. */
 function startComposerDrag(mode, e) {
-  if (isMobile()) return false; // 移动端是全屏，不参与浮动
+  if (isMobile()) return false; // mobile is fullscreen and does not participate in floating
   const el = composerBox();
   if (!el || typeof el.getBoundingClientRect !== 'function') return false;
   const r = el.getBoundingClientRect();
@@ -3367,15 +3380,15 @@ function startComposerDrag(mode, e) {
   return true;
 }
 
-/** 拖动 / 缩放的位移换算。resize 只改右下角，move 只改位置。 */
+/** Drag / resize delta mapping. resize only changes the bottom-right corner; move only changes position. */
 function dragComposerTo(x, y) {
   const d = composerDrag;
   if (!d) return;
   if (!d.moved) {
-    // 只是点了一下标题栏（没真拖动）：不进浮动，免得「点一下遮罩就变淡」
+    // Just a click on the title bar (no real drag): don't enter floating, so a tap on the mask doesn't dim it
     if (Math.abs(x - d.x) + Math.abs(y - d.y) < COMPOSER_DRAG_THRESHOLD) return;
     d.moved = true;
-    composerMaximized = false; // 手动拖动即退出最大化
+    composerMaximized = false; // manual drag exits maximize
     composerPrevGeom = null;
     setComposerDragging(true);
   }
@@ -3386,10 +3399,11 @@ function dragComposerTo(x, y) {
       vp
     );
   } else {
-    // 缩放的尺寸上限 = 「当前位置到视口右下角」的可用空间。
-    // 少了这一步，放大时会先把窗口撑出屏幕、再被 clampComposerGeom 整体拽回左上角 ——
-    // 用户看到的是「我明明只往右下拖把手，窗口却自己往左上跑」（真实 Chromium 实测踩到）。
-    // 卡住尺寸、让左上角一动不动，才是符合直觉的。
+    // The resize size cap = available space from the current position to the viewport's bottom-right.
+    // Without this step, enlarging first pushes the window offscreen, then clampComposerGeom yanks the
+    // whole thing back to the top-left — the user sees "I only dragged the grip down-right, yet the window
+    // runs to the top-left by itself" (actually hit this in real Chromium). Pinning the size and keeping
+    // the top-left fixed is the intuitive behavior.
     const maxW = Math.max(COMPOSER_MIN_W, vp.width - d.geom.left);
     const maxH = Math.max(COMPOSER_MIN_H, vp.height - d.geom.top);
     composerGeom = clampComposerGeom(
@@ -3411,7 +3425,7 @@ function endComposerDrag() {
   setComposerDragging(false);
 }
 
-/** 最大化 / 还原（还原回到最大化之前的几何）。 */
+/** Maximize / restore (restore returns to the geometry before maximizing). */
 function toggleComposerMax() {
   if (isMobile()) return;
   const el = composerBox();
@@ -3436,7 +3450,7 @@ function toggleComposerMax() {
   applyComposerGeom();
 }
 
-/** 回到默认的居中自适应布局（放弃浮动几何）。 */
+/** Return to the default centered adaptive layout (discard floating geometry). */
 function resetComposerGeom() {
   composerGeom = null;
   composerPrevGeom = null;
@@ -3445,8 +3459,8 @@ function resetComposerGeom() {
 }
 
 /**
- * 拖动 / 缩放 / 最大化的接线。在 setupEvents() 里调用。
- * 用 pointer 事件统一鼠标与触摸；移动端由 isMobile() 早退，所以这里不必再分平台。
+ * Wiring for drag / resize / maximize. Called from setupEvents().
+ * Uses pointer events to unify mouse and touch; mobile bails out via isMobile(), so no platform split is needed here.
  */
 function setupComposerWindow() {
   const head = $('#composer-head');
@@ -3454,7 +3468,7 @@ function setupComposerWindow() {
   const maxBtn = $('#composer-max');
   const fitBtn = $('#composer-fit');
 
-  // 标题栏上的按钮是「点」不是「拖」，别把点击当成拖动起点
+  // Buttons on the title bar are "clicks", not "drags"; don't treat a click as a drag start
   const onButton = (e) => {
     const t = e.target;
     return !!(t && typeof t.closest === 'function' && t.closest('button'));
@@ -3486,15 +3500,15 @@ function setupComposerWindow() {
     document.addEventListener('pointermove', (e) => dragComposerTo(e.clientX, e.clientY));
     document.addEventListener('pointerup', endComposerDrag);
     document.addEventListener('pointercancel', endComposerDrag);
-    // 每次按下都重新记录「按在弹窗里还是遮罩上」，供遮罩的 click 处理器判断
+    // On every press, re-record whether it was inside the modal or on the mask, for the mask's click handler to check
     document.addEventListener('pointerdown', (e) => {
       const t = e.target;
       composerPressInside = !!(t && typeof t.closest === 'function' && t.closest('#composer'));
     }, true);
   }
 
-  // 草稿自动保存：弹窗内任何输入都触发（事件委托，一次绑定覆盖全部字段与富文本编辑器）。
-  // input + change 双事件：文本框/富文本走 input，下拉（发件人）与复选框只发 change。
+  // Draft autosave: any input inside the modal triggers it (event delegation, one binding covers all fields and the rich editor).
+  // Both input + change events: text boxes / rich text fire input, while the dropdown (sender) and checkboxes only fire change.
   const composerEl = $('#composer');
   if (composerEl && typeof composerEl.addEventListener === 'function') {
     composerEl.addEventListener('input', () => scheduleDraftSave());
@@ -3502,7 +3516,7 @@ function setupComposerWindow() {
   }
 }
 
-/* ---------------- 搜索 / 键盘 / 事件 / 同步 ---------------- */
+/* ---------------- Search / keyboard / events / sync ---------------- */
 
 function isTypingTarget(el) {
   if (!el) return false;
@@ -3539,19 +3553,20 @@ function setupEvents() {
   $('#composer-cancel').addEventListener('click', requestCloseComposer);
   $('#composer-send').addEventListener('click', () => void sendCompose());
   $('#modal-mask').addEventListener('click', (e) => {
-    // 按下点在弹窗内部、鼠标抬到遮罩上时，浏览器会把 click 派发到共同祖先（遮罩本身），
-    // 光看 target === currentTarget 会把它当成「点空白关闭」。拖动标题栏就是这个手势，
-    // 所以必须结合「按下点在哪」判断（见 composerPressInside）。
+    // When the press is inside the modal and the mouse is released over the mask, the browser dispatches
+    // click to the common ancestor (the mask itself); looking only at target === currentTarget would treat
+    // it as "click blank to close". Dragging the title bar is exactly this gesture, so the check must also
+    // consider where the press began (see composerPressInside).
     if (composerPressInside) return;
     if (e.target === e.currentTarget) requestCloseComposer();
   });
 
-  // 记录写信弹窗内最后获得焦点的元素，确认框收起后归还焦点
+  // Record the last focused element inside the composer, to return focus after the confirm dialog is hidden
   $('#composer').addEventListener('focusin', (e) => {
     composerLastFocus = e.target;
   });
 
-  // 放弃确认框：点空白区或「继续编辑」= 保留内容；点「放弃」= 真正关闭
+  // Discard confirm: clicking blank area or "continue editing" = keep content; clicking "discard" = actually close
   $('#confirm-cancel').addEventListener('click', () => hideDiscardConfirm());
   $('#confirm-ok').addEventListener('click', closeComposer);
   $('#confirm-mask').addEventListener('click', (e) => {
@@ -3581,13 +3596,13 @@ function setupEvents() {
   $('#f-mode').addEventListener('click', toggleRich);
   $('#f-quote').addEventListener('click', insertQuote);
   $('#f-cc-toggle').addEventListener('click', toggleRecipientsExpanded);
-  // 发件人：摘要行点开/收起；改选后摘要要跟着变（否则收起来会显示旧地址）
+  // Sender: click the summary row to expand/collapse; the summary must update when the selection changes (otherwise collapsing shows the old address)
   $('#f-sender-toggle').addEventListener('click', toggleSenderExpanded);
   $('#f-mailbox').addEventListener('change', renderSenderSummary);
-  // 合并发送：勾选状态与收件人数量都会影响提示文案
+  // Mail merge: the checked state and recipient count both affect the hint text
   $('#f-merge').addEventListener('change', updateMergeHint);
   $('#f-to').addEventListener('input', updateMergeHint);
-  // 收件人联想：to / cc / bcc 三个字段共用一套下拉
+  // Recipient autocomplete: the to / cc / bcc fields share one dropdown
   bindRecipientSuggest();
   bindToolbar();
 
@@ -3602,9 +3617,9 @@ function setupEvents() {
     }
   });
 
-  // Esc：确认框优先收起；否则请求关闭写信弹窗（无内容时直接关闭）
-  // 注意：不跳过输入框，写信时按 Esc 同样生效
-  // 移动端：抽屉开着时 Esc 先收抽屉（此时确认框 / 写信弹窗都还没出现，先关最外那层）
+  // Esc: the confirm dialog hides first; otherwise request closing the composer (closes directly when empty)
+  // Note: does not skip input boxes; Esc works the same while composing
+  // Mobile: when the drawer is open, Esc closes the drawer first (the confirm dialog / composer aren't up yet, close the outermost layer)
   document.addEventListener('keydown', (e) => {
     if (e.key !== 'Escape') return;
     if (drawerOpen) {
@@ -3622,47 +3637,49 @@ function setupEvents() {
     requestCloseComposer();
   });
 
-  // ---- 移动端：抽屉 + 单栏详情返回 ----
+  // ---- Mobile: drawer + single-column detail back ----
   $('#drawer-btn').addEventListener('click', () => setDrawer(!drawerOpen));
   $('#drawer-mask').addEventListener('click', closeDrawer);
-  // 返回列表：closeMessagePane() 内部会 syncLayout()
+  // Back to list: closeMessagePane() calls syncLayout() internally
   $('#read-back-btn').addEventListener('click', closeMessagePane);
-  // 移动端侧边栏收进抽屉后，顶栏需要一个直接可点的写信入口
+  // After the mobile sidebar collapses into the drawer, the top bar needs a directly clickable compose entry
   $('#topbar-compose').addEventListener('click', openComposer);
-  // 旋转 / 分屏 / 桌面端拖窗口：重新对齐布局（syncLayout 幂等）
+  // Rotation / split screen / desktop window drag: realign layout (syncLayout is idempotent)
   if (typeof globalThis.addEventListener === 'function') {
     globalThis.addEventListener('resize', syncLayout);
   }
 
   setupSearch();
-  // 写信弹窗的拖动 / 缩放 / 最大化接线。放在 setupSearch() **之后**：
-  // 上面那段事件接线会被两个 vm 套件按注释标记整段抽取执行，这里不再往里塞东西。
+  // Wiring for composer drag / resize / maximize. Placed **after** setupSearch():
+  // the event wiring above is extracted and executed whole by the two vm suites via comment markers, so nothing more is added there.
   setupComposerWindow();
-  // 列表/详情分隔条的拖动接线。同理放在抽取范围之外。
+  // Wiring for dragging the list/detail splitter. Likewise placed outside the extraction scope.
   setupSplitter();
-  // 附件预览浮层（关闭按钮 / 点空白关闭；Esc 挂在全局键盘处理器里）
+  // Attachment preview overlay (close button / click blank to close; Esc is in the global keyboard handler)
   setupAttachmentPreview();
 }
 
 /**
- * 定时后台同步：页面不可见直接跳过；只刷新「超过 TTL」的缓存，不做无条件 force；
- * 列表刷新在阅读态让路（避免打断阅读），数据没变时由指纹短路、不重建 DOM。
+ * Periodic background sync: skip entirely when the page is hidden; only refresh caches past their TTL,
+ * never force unconditionally; list refresh yields in read mode (to avoid interrupting reading), and
+ * when data is unchanged a fingerprint short-circuits, without rebuilding the DOM.
  */
 async function periodicSync() {
   if (document.hidden) return;
-  void refreshCounts(false); // 内部按 TTL.counts 判断
-  void loadMailboxes(false); // 内部按 TTL.mailboxes 判断
-  void loadInboundAlerts();  // 入站异常提示（每次同步都查，保证卡住的邮件能被看到）
-  void loadBackendStatus();  // 后端状态（CF 存储/入站 + Resend 额度；存储走 TTL 缓存，很便宜）
+  void refreshCounts(false); // internally gated by TTL.counts
+  void loadMailboxes(false); // internally gated by TTL.mailboxes
+  void loadInboundAlerts();  // inbound anomaly alerts (checked every sync so stuck emails get seen)
+  void loadBackendStatus();  // backend status (CF storage/inbound + Resend quota; storage uses a TTL cache, very cheap)
   if (isReadMode() || state.loading) return;
   const c = state.cache.folders.get(folderKey());
   if (!c || Date.now() - c.at >= TTL.folder) void loadFolder(false, false);
 }
 
-/* ---------------- 入站异常提示（CF 入向「收了但没进收件箱」） ----------------
- * CF Email Routing 不存信，收信链路是「先落 R2 + 登记，再异步解析」；一旦解析因
- * CPU/内存（免费档 10ms）、瞬时故障或大附件而没能完成，邮件就只躺在后台 —— 用户无从知晓。
- * 这里把它显式暴露成顶部提示条：显示发件人/主题/大小/原因，并给「重试 / 下载原件」两个动作。 */
+/* ---------------- Inbound anomaly alerts (CF inbound "received but not in inbox") ----------------
+ * CF Email Routing doesn't store mail; the receive pipeline is "land in R2 + register, then parse
+ * asynchronously"; if parsing fails due to CPU/memory (free tier 10ms), a transient fault, or a large
+ * attachment, the email just sits in the backend — the user has no way to know. This exposes it as a top
+ * banner: showing sender/subject/size/reason, with "retry / download original" actions. */
 
 let inboundAlertsExpanded = false;
 
@@ -3671,7 +3688,7 @@ async function loadInboundAlerts() {
   try {
     data = await api('/api/inbound/alerts');
   } catch {
-    return; // 附加能力：拉取失败静默，不打扰主流程
+    return; // bonus feature: stays silent on fetch failure, doesn't disturb the main flow
   }
   renderInboundAlerts((data && data.alerts) || []);
 }
@@ -3746,16 +3763,17 @@ async function onInboundAlertClick(e) {
   }
 }
 
-/* ---------------- 后端基础状态：CF（存储/入站队列）+ Resend（发信额度） ----------------
- * 一屏看清后端：CF 免费档 D1 500MB / R2 10GB、Resend 免费档 100 封/天 · 3000 封/月。
- * D1/R2 是后端估算并按 TTL 缓存；入站计数与发信额度实时。贴近上限 / 有异常积压时变色提醒。 */
+/* ---------------- Backend basics: CF (storage/inbound queue) + Resend (send quota) ----------------
+ * See the backend at a glance: CF free tier D1 500MB / R2 10GB, Resend free tier 100/day · 3000/month.
+ * D1/R2 are estimated by the backend and TTL-cached; inbound count and send quota are live. Turns color
+ * when near the cap / with an abnormal backlog. */
 
 async function loadBackendStatus() {
   let u;
   try {
     u = await api('/api/usage');
   } catch {
-    return; // 附加能力：拉取失败静默，不打扰主流程
+    return; // bonus feature: stays silent on fetch failure, doesn't disturb the main flow
   }
   renderBackendStatus(u);
 }
@@ -3788,7 +3806,248 @@ function renderBackendStatus(u) {
     `<span class="bs-note">${esc(u.approximate ? '存储为估算值' : '')}${u.approximate ? '·' : ''}贴近上限或积压会变色提醒</span>`;
 }
 
-/* ---------------- 初始化 ---------------- */
+/* ---------------- Setup wizard / login gate (gate) ----------------
+ * Before the app starts, ask the backend `/api/setup/status`:
+ *   mode='none'   → not initialized: show the setup wizard (first step sets the admin password).
+ *   mode='session' and not logged in → show the login box.
+ *   mode='basic'  or probe failed → fall back to the original browser Basic Auth (no gate).
+ */
+
+let gateMode = null;
+
+/** Raw fetch (bypasses api() to avoid the 401 handling logic triggering when not logged in). */
+async function probe(path, opts = {}) {
+  try {
+    const res = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...opts });
+    const ct = res.headers.get('content-type') || '';
+    const data = ct.includes('json') ? await res.json() : null;
+    return { res, data };
+  } catch {
+    return { res: null, data: null };
+  }
+}
+
+async function bootstrapGate() {
+  const { res, data } = await probe('/api/setup/status');
+  if (!res || !data || typeof data.mode !== 'string') return true; // probe failed → keep original behavior
+  gateMode = data.mode;
+  if (data.mode === 'none') {
+    showWizard(data);
+    return false;
+  }
+  if (data.mode === 'session' && !data.authenticated) {
+    showLogin();
+    return false;
+  }
+  // Logged in but domain/sending not yet configured → continue the domain wizard (the user can skip into the mailbox)
+  if (data.authenticated && !data.domain && !localStorage.getItem('setup-skip')) {
+    showDomainWizard(data);
+    return false;
+  }
+  return true;
+}
+
+function gateRoot() {
+  let root = document.getElementById('gate');
+  if (!root) {
+    root = document.createElement('div');
+    root.id = 'gate';
+    document.body.appendChild(root);
+  }
+  root.innerHTML = '';
+  root.classList.remove('hidden');
+  return root;
+}
+
+function gateField(id, label, type, value = '', placeholder = '') {
+  return `<label class="gate-field"><span>${label}</span>
+    <input id="${id}" type="${type}" value="${esc(value)}" placeholder="${esc(placeholder)}" autocomplete="off" /></label>`;
+}
+
+function showLogin() {
+  const root = gateRoot();
+  root.innerHTML = `
+    <div class="gate-card">
+      <div class="gate-title">登录</div>
+      <div class="gate-sub">输入管理员账号以进入邮箱</div>
+      ${gateField('gate-user', '用户名', 'text', 'admin', '')}
+      ${gateField('gate-pass', '密码', 'password', '', '')}
+      <div class="gate-error" id="gate-error"></div>
+      <div class="gate-actions">
+        <button class="btn btn-primary" id="gate-submit" type="button">登录</button>
+      </div>
+    </div>`;
+  const submit = async () => {
+    const username = $('#gate-user').value.trim();
+    const password = $('#gate-pass').value;
+    const err = $('#gate-error');
+    err.textContent = '';
+    if (!username || !password) {
+      err.textContent = '请输入用户名与密码';
+      return;
+    }
+    $('#gate-submit').disabled = true;
+    const r = await probe('/api/login', { method: 'POST', body: JSON.stringify({ username, password }) });
+    if (r.res && r.res.ok) {
+      location.reload();
+      return;
+    }
+    $('#gate-submit').disabled = false;
+    err.textContent = (r.data && r.data.error) || '登录失败';
+  };
+  $('#gate-submit').addEventListener('click', submit);
+  $('#gate-pass').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') submit();
+  });
+  $('#gate-user').focus();
+}
+
+function showWizard() {
+  const root = gateRoot();
+  root.innerHTML = `
+    <div class="gate-card">
+      <div class="gate-title">初始化邮箱</div>
+      <div class="gate-sub">第 1 步 · 设置管理员账号（用于登录本邮箱）</div>
+      ${gateField('gate-user', '用户名', 'text', 'admin', '')}
+      ${gateField('gate-pass', '密码', 'password', '', '至少 6 位')}
+      ${gateField('gate-pass2', '确认密码', 'password', '', '')}
+      <div class="gate-error" id="gate-error"></div>
+      <div class="gate-actions">
+        <button class="btn btn-primary" id="gate-submit" type="button">创建并继续</button>
+      </div>
+      <div class="gate-note">完成设置后即可登录。域名解析与发信配置将在下一步完成。</div>
+    </div>`;
+  const submit = async () => {
+    const username = $('#gate-user').value.trim();
+    const password = $('#gate-pass').value;
+    const password2 = $('#gate-pass2').value;
+    const err = $('#gate-error');
+    err.textContent = '';
+    if (!username) {
+      err.textContent = '请输入用户名';
+      return;
+    }
+    if (password.length < 6) {
+      err.textContent = '密码至少 6 位';
+      return;
+    }
+    if (password !== password2) {
+      err.textContent = '两次输入的密码不一致';
+      return;
+    }
+    $('#gate-submit').disabled = true;
+    const r = await probe('/api/setup/admin', { method: 'POST', body: JSON.stringify({ username, password }) });
+    if (r.res && r.res.ok) {
+      location.reload();
+      return;
+    }
+    $('#gate-submit').disabled = false;
+    err.textContent = (r.data && r.data.error) || '创建失败';
+  };
+  $('#gate-submit').addEventListener('click', submit);
+  $('#gate-pass2').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') submit();
+  });
+  $('#gate-user').focus();
+}
+
+// Infer the current Worker's script name (Deploy Button lets users rename it; catch-all must point to the real script name).
+// Only applies to *.workers.dev production domains; custom domains/preview URLs return an empty string and the server falls back to env.WORKER_NAME.
+function detectWorkerName() {
+  const parts = (location.hostname || '').toLowerCase().split('.');
+  if (parts.length < 3) return '';
+  if (parts[parts.length - 2] !== 'workers' || parts[parts.length - 1] !== 'dev') return '';
+  let name = parts[0];
+  const m = name.match(/^[0-9a-f]{8,}-(.+)$/); // preview URL prefix looks like <light-prefix>-<worker>
+  if (m) name = m[1];
+  return /^[a-z0-9][a-z0-9-]*$/.test(name) ? name : '';
+}
+
+/** Wizard steps 2/3: domain + auto DNS setup + send/receive auth. The CF Token is used once and not saved. */
+function showDomainWizard(status) {
+  const root = gateRoot();
+  root.innerHTML = `
+    <div class="gate-card gate-wide">
+      <div class="gate-title">连接你的域名</div>
+      <div class="gate-sub">第 2 步 · 输入域名并授权，自动完成收信路由与发信认证</div>
+      ${gateField('gate-domain', '域名', 'text', (status && status.domain) || '', 'example.com')}
+      ${gateField('gate-cf', 'Cloudflare API Token', 'password', '', 'Zone:Read + DNS:Edit + Email Routing')}
+      ${gateField('gate-resend', 'Resend API Key', 'password', '', 're_…（保存在你自己的数据库，用于发信）')}
+      ${gateField('gate-from', '发件地址', 'text', (status && status.from_address) || '', 'noreply@example.com')}
+      ${gateField('gate-fromname', '发件显示名（可选）', 'text', '', '')}
+      <div class="gate-error" id="gate-error"></div>
+      <div id="gate-steps" class="gate-steps"></div>
+      <div class="gate-actions">
+        <button class="btn" id="gate-skip" type="button">暂不设置</button>
+        <button class="btn btn-primary" id="gate-submit" type="button">开始配置</button>
+      </div>
+      <div class="gate-note">Cloudflare Token 仅用于本次写 DNS 与开启收信路由，<b>不会保存</b>；Resend Key 保存在你自己的 D1（发信需要）。</div>
+    </div>`;
+
+  const domainEl = $('#gate-domain');
+  const fromEl = $('#gate-from');
+  // When the domain changes, if the from address isn't customized yet, auto-fill noreply@<domain>
+  domainEl.addEventListener('blur', () => {
+    const d = domainEl.value.trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+    if (d && (!fromEl.value || /^noreply@/.test(fromEl.value))) fromEl.value = `noreply@${d}`;
+  });
+
+  const renderSteps = (steps) => {
+    const box = $('#gate-steps');
+    if (!steps || !steps.length) { box.innerHTML = ''; return; }
+    box.innerHTML = steps.map((s) => `
+      <div class="gate-step ${s.ok ? 'ok' : 'bad'}">
+        <span class="gate-step-mark">${s.ok ? '✓' : '✕'}</span>
+        <span class="gate-step-name">${esc(s.name)}</span>
+        <span class="gate-step-detail">${esc(s.detail)}</span>
+      </div>`).join('');
+  };
+
+  $('#gate-skip').addEventListener('click', () => {
+    localStorage.setItem('setup-skip', '1');
+    location.reload();
+  });
+
+  $('#gate-submit').addEventListener('click', async () => {
+    const domain = domainEl.value.trim();
+    const cf_token = $('#gate-cf').value.trim();
+    const resend_key = $('#gate-resend').value.trim();
+    const from_address = fromEl.value.trim();
+    const from_name = $('#gate-fromname').value.trim();
+    const err = $('#gate-error');
+    err.textContent = '';
+    if (!domain || !cf_token || !resend_key) {
+      err.textContent = '请填写域名、Cloudflare Token 与 Resend Key';
+      return;
+    }
+    const btn = $('#gate-submit');
+    btn.disabled = true;
+    btn.textContent = '配置中…';
+    const r = await probe('/api/setup/domain', {
+      method: 'POST',
+      body: JSON.stringify({ domain, cf_token, resend_key, from_address, from_name, worker_name: detectWorkerName() }),
+    });
+    btn.disabled = false;
+    btn.textContent = '开始配置';
+    if (!r.res) {
+      err.textContent = '网络错误，请重试';
+      return;
+    }
+    const data = r.data || {};
+    renderSteps(data.steps);
+    if (r.res.ok && data.ok) {
+      localStorage.removeItem('setup-skip');
+      err.textContent = '';
+      setTimeout(() => location.reload(), 700);
+    } else {
+      err.textContent = data.error || '配置未完全成功，请检查上面的步骤后重试';
+    }
+  });
+
+  domainEl.focus();
+}
+
+/* ---------------- Initialization ---------------- */
 
 async function loadAccount() {
   try {
@@ -3802,13 +4061,17 @@ async function loadAccount() {
 }
 
 async function init() {
-  // 1) 同步恢复本地缓存 → 首屏 0 请求即可显示列表 / 计数徽标 / 账号下拉
+  // 0) Setup wizard / login gate: not initialized → wizard; session mode not logged in → login box.
+  //    On a hit, stop here (don't load mailbox data) and wait for the user to finish, then reload into the app.
+  if (!(await bootstrapGate())) return;
+
+  // 1) Synchronously restore local cache → first paint shows the list / count badges / account dropdown with 0 requests
   const restored = restorePersisted();
   const mailboxAtStart = state.mailbox;
 
   setupEvents();
-  applyListWidth(loadListWidth()); // 恢复上次拖动设定的列表宽度（无自定义则为 null，走 CSS 默认）
-  syncLayout(); // 先把布局状态对齐（首屏就可能落在移动端断点内）
+  applyListWidth(loadListWidth()); // restore the list width set by the last drag (null if not customized, using the CSS default)
+  syncLayout(); // align layout state first (the first paint may already fall within the mobile breakpoint)
   renderNav();
   renderMailboxSelect();
   renderListTitle();
@@ -3818,7 +4081,7 @@ async function init() {
     paintList();
     syncActiveRow();
     if (state.openId && state.items.some((it) => it.id === state.openId)) {
-      state.pendingOpenId = state.openId; // 稍后按需重开（正文若已在本地快照里就直接渲染，不会发请求）
+      state.pendingOpenId = state.openId; // reopen on demand later (if the body is already in the local snapshot it renders directly, no request)
     } else {
       state.openId = null;
     }
@@ -3826,7 +4089,7 @@ async function init() {
     closeMessagePane();
   }
 
-  // 2) 四个请求并发发起，不再串行 await（loadFolder 用缓存里的 mailbox，账号列表回来后若有出入再纠正）
+  // 2) Fire the four requests concurrently, no longer serially awaited (loadFolder uses the cached mailbox; correct it if the account list comes back different)
   await Promise.all([
     loadAccount(),
     loadMailboxes(true),
@@ -3836,9 +4099,9 @@ async function init() {
     loadBackendStatus(),
   ]);
 
-  if (state.mailbox !== mailboxAtStart) void loadFolder(false, true); // 缓存里的账号已失效，按纠正后的账号重拉
+  if (state.mailbox !== mailboxAtStart) void loadFolder(false, true); // the cached account was invalid; refetch with the corrected account
 
-  // 3) 恢复上次打开的邮件（仅当它仍在当前列表里）
+  // 3) Restore the previously opened email (only if it's still in the current list)
   if (state.pendingOpenId) {
     const id = state.pendingOpenId;
     state.pendingOpenId = null;
@@ -3846,7 +4109,7 @@ async function init() {
   }
 
   setInterval(periodicSync, SYNC_MS);
-  // 页面重新可见时补一次同步（隐藏期间跳过的刷新在这里补齐），并继续未完成的正文预取
+  // On the page becoming visible again, run one more sync (catching up refreshes skipped while hidden) and continue the unfinished body prefetch
   document.addEventListener('visibilitychange', () => {
     if (!document.hidden) {
       void periodicSync();

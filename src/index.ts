@@ -1,8 +1,11 @@
 import type { Env, Folder, InboundQueueMessage } from './types';
-import { authenticate, unauthorized } from './auth';
+import { authenticate, unauthorized, authMode, isAuthenticated } from './auth';
+import { hashPassword, verifyPassword, signSession, sessionCookie, clearSessionCookie, randomHex, SESSION_TTL_SEC } from './session';
 import { handleInbound, handleEvents } from './webhook';
 import { handleInboundEmail, handleInboundQueue, replayPendingInbound } from './inbound-email';
 import * as repo from './repo';
+import { configureDomain, selfCheck, withRuntimeConfig } from './setup';
+import { ensureSchema } from './schema';
 import { resendSend, replySubject, forwardSubject, textToHtml, senderIdentity } from './send';
 import type { ResendAttachment } from './send';
 import { json, jsonArr, nowSec, parseAddress, parseAddressList, rootThreadId, isSaneThreadId, parseReferences, stripAngle, uuid, base64ToBytes, bytesToBase64, stripHtml } from './util';
@@ -17,46 +20,168 @@ export default {
       return json({ status: 'ok', timestamp: nowSec() });
     }
 
-    // Webhook 入口：仅校验签名，不走 Basic Auth
+    // A brand-new empty DB (auto-created by the Deploy Button) is idempotently initialized on first request, so "usable right after deploy". See src/schema.ts.
+    try {
+      await ensureSchema(env);
+    } catch (err) {
+      console.error('ensureSchema failed:', err);
+      return json({ error: '数据库初始化失败' }, 500);
+    }
+
+    // Webhook entry points: signature check only, no Basic Auth
     if (path === '/webhook/inbound' && method === 'POST') return handleInbound(request, env);
     if (path === '/webhook/events' && method === 'POST') return handleEvents(request, env);
 
-    // 其余一律要求认证（API + 页面资源）
-    if (!(await authenticate(request, env))) return unauthorized();
-
-    if (path.startsWith('/api/')) {
-      return routeApi(request, env, path, url);
+    // Setup wizard / login: must be publicly reachable (users need to reach it before they have credentials); each endpoint constrains itself by state.
+    if (path.startsWith('/api/setup/') || path === '/api/login' || path === '/api/logout') {
+      return routeGate(request, env, path);
     }
 
-    // SPA 静态资源（index.html / app.js / app.css）由 assets 提供
-    if ((method === 'GET' || method === 'HEAD') && env.ASSETS) {
-      return env.ASSETS.fetch(request);
+    // Everything else requires authentication (API + page assets)
+    if (!(await authenticate(request, env))) return unauthorized();
+
+    // Layer the send config written by the wizard into D1 (Resend Key / from address) on top of env,
+    // so existing send/account logic can use the wizard config without changes.
+    const runtimeEnv = await withRuntimeConfig(env);
+
+    if (path.startsWith('/api/')) {
+      return routeApi(request, runtimeEnv, path, url);
+    }
+
+    // SPA static assets (index.html / app.js / app.css) are served by assets
+    if ((method === 'GET' || method === 'HEAD') && runtimeEnv.ASSETS) {
+      return runtimeEnv.ASSETS.fetch(request);
     }
     return json({ error: 'Not Found' }, 404);
   },
 
-  // CF Email Routing 入向：把原始件落 R2 + 登记 + 入队（见 src/inbound-email.ts 的说明）。
+  // CF Email Routing inbound: write the raw message to R2 + register + enqueue (see the notes in src/inbound-email.ts).
   async email(message: ForwardableEmailMessage, env: Env): Promise<void> {
+    await ensureSchema(env);
     await handleInboundEmail(env, message);
   },
 
-  // 入向异步解析消费（never-lose 流水线第二段）。
+  // Inbound async parse consumption (stage two of the never-lose pipeline).
   async queue(batch: MessageBatch<InboundQueueMessage>, env: Env): Promise<void> {
+    await ensureSchema(env);
     await handleInboundQueue(batch, env);
   },
 
-  // 恢复 cron（never-lose 兜底）：把「已落 R2 但没解析完」的入向邮件重新入队。
-  // 见 src/inbound-email.ts 的 replayPendingInbound 与 wrangler.toml 的 [triggers]。
+  // Recovery cron (never-lose fallback): re-enqueue inbound mail that is "already in R2 but not fully parsed".
+  // See replayPendingInbound in src/inbound-email.ts and [triggers] in wrangler.toml.
   async scheduled(_event: ScheduledController, env: Env): Promise<void> {
+    await ensureSchema(env);
     const n = await replayPendingInbound(env);
     if (n) console.log(`inbound: replay enqueued ${n} pending raw message(s)`);
   },
 };
 
+/* ---------------- Setup wizard / login (public routes) ---------------- */
+
+/**
+ * Wizard and login. **None require pre-authentication**, but each endpoint constrains itself:
+ *   - `status`: tell the frontend the current mode (basic/session/none) and whether logged in.
+ *   - `admin` : only allow creating the first admin while "uninitialized" (no env auth, no admin).
+ *   - `login` / `logout`: create/clear the session cookie.
+ */
+async function routeGate(request: Request, env: Env, path: string): Promise<Response> {
+  const method = request.method;
+  if (path === '/api/setup/status' && method === 'GET') return setupStatus(request, env);
+  if (path === '/api/setup/admin' && method === 'POST') return setupAdmin(request, env);
+  // The following endpoints require being logged in (the session cookie from just creating the admin is enough)
+  if (path === '/api/setup/domain' && method === 'POST') {
+    if (!(await isAuthenticated(request, env))) return unauthorized();
+    return setupDomain(request, env);
+  }
+  if (path === '/api/setup/check' && method === 'GET') {
+    if (!(await isAuthenticated(request, env))) return unauthorized();
+    return json(await selfCheck(env));
+  }
+  if (path === '/api/login' && method === 'POST') return login(request, env);
+  if (path === '/api/logout' && method === 'POST') return logout();
+  return json({ error: 'Not Found' }, 404);
+}
+
+async function setupDomain(request: Request, env: Env): Promise<Response> {
+  const body = (await request.json().catch(() => null)) as
+    | { domain?: unknown; cf_token?: unknown; resend_key?: unknown; from_address?: unknown; from_name?: unknown; worker_name?: unknown }
+    | null;
+  if (!body) return json({ error: '参数错误' }, 400);
+  const result = await configureDomain(env, {
+    domain: body.domain,
+    cfToken: body.cf_token,
+    resendKey: body.resend_key,
+    fromAddress: body.from_address,
+    fromName: body.from_name,
+    workerName: body.worker_name,
+  });
+  return json(result, result.error && result.steps.length === 0 ? 400 : 200);
+}
+
+async function setupStatus(request: Request, env: Env): Promise<Response> {
+  const mode = await authMode(env);
+  const cfg = env.DB ? await repo.getConfigMap(env).catch(() => ({} as Record<string, string>)) : {};
+  return json({
+    configured: mode !== 'none',
+    mode,
+    authenticated: await isAuthenticated(request, env),
+    domain: cfg.domain || '',
+    from_address: cfg.from_address || env.SEND_FROM_ADDRESS || '',
+    from_name: cfg.from_name || env.SEND_FROM_NAME || '',
+    // Whether domain resolution/sending is configured (true after the wizard writes app_config)
+    complete: cfg.setup_complete === '1',
+    sending_configured: Boolean((cfg.resend_api_key || env.RESEND_API_KEY) && (cfg.from_address || env.SEND_FROM_ADDRESS)),
+  });
+}
+
+async function setupAdmin(request: Request, env: Env): Promise<Response> {
+  if (env.API_USERNAME || env.API_PASSWORD) {
+    return json({ error: '已通过环境变量配置认证，无需设置向导账号' }, 400);
+  }
+  const body = (await request.json().catch(() => null)) as { username?: unknown; password?: unknown } | null;
+  const username = typeof body?.username === 'string' ? body.username.trim() : '';
+  const password = typeof body?.password === 'string' ? body.password : '';
+  if (!username || !password) return json({ error: '用户名或密码不能为空' }, 400);
+  if (username.length > 64) return json({ error: '用户名过长' }, 400);
+  if (password.length < 6) return json({ error: '密码至少 6 位' }, 400);
+  if (await repo.hasAdminUser(env)) return json({ error: '管理员已存在，请直接登录' }, 409);
+
+  const uid = await repo.createAdmin(env, username, await hashPassword(password));
+  const secret = (await repo.getConfig(env, 'session_secret')) || randomHex(32);
+  await repo.setConfig(env, 'session_secret', secret);
+  const token = await signSession(secret, uid);
+  return withCookie(json({ ok: true, username }), sessionCookie(token, SESSION_TTL_SEC));
+}
+
+async function login(request: Request, env: Env): Promise<Response> {
+  const body = (await request.json().catch(() => null)) as { username?: unknown; password?: unknown } | null;
+  const username = typeof body?.username === 'string' ? body.username.trim() : '';
+  const password = typeof body?.password === 'string' ? body.password : '';
+  if (!username || !password) return json({ error: '用户名或密码不能为空' }, 400);
+
+  const user = await repo.getAdminByUsername(env, username);
+  if (!user || !(await verifyPassword(password, user.password_hash))) {
+    return json({ error: '用户名或密码错误' }, 401);
+  }
+  const secret = await repo.getConfig(env, 'session_secret');
+  if (!secret) return json({ error: '尚未完成初始化' }, 409);
+  const token = await signSession(secret, user.id);
+  return withCookie(json({ ok: true, username: user.username }), sessionCookie(token, SESSION_TTL_SEC));
+}
+
+function logout(): Response {
+  return withCookie(json({ ok: true }), clearSessionCookie());
+}
+
+function withCookie(resp: Response, cookie: string): Response {
+  resp.headers.append('Set-Cookie', cookie);
+  return resp;
+}
+
 async function routeApi(request: Request, env: Env, path: string, url: URL): Promise<Response> {
   const method = request.method;
 
-  // 收件箱/已发送/星标/已删除 文件夹列表（可按 mailbox 过滤）
+  // Inbox/sent/starred/trash folder list (optionally filtered by mailbox)
   const folderMatch = /^\/api\/folders\/(inbox|sent|starred|trash)$/.exec(path);
   if (folderMatch && method === 'GET') {
     const folder = folderMatch[1] as Folder;
@@ -69,9 +194,9 @@ async function routeApi(request: Request, env: Env, path: string, url: URL): Pro
     return json({ folder, items: result.items, total: result.total, limit, offset });
   }
 
-  // 草稿箱列表。草稿在独立表里（见 schema.sql 的 drafts 说明），
-  // 但**返回形状与其它文件夹完全一致**（伪装成一封 direction='draft' 的邮件），
-  // 前端因此能复用同一套列表渲染 / 缓存 / 分页 / 搜索逻辑。
+  // Draft list. Drafts live in a separate table (see the drafts notes in schema.sql),
+  // but the **returned shape is exactly the same as the other folders** (disguised as a message with direction='draft'),
+  // so the frontend can reuse the same list rendering / cache / paging / search logic.
   if (path === '/api/folders/drafts' && method === 'GET') {
     const q = url.searchParams.get('q') || null;
     const mailbox = url.searchParams.get('mailbox') || undefined;
@@ -81,7 +206,7 @@ async function routeApi(request: Request, env: Env, path: string, url: URL): Pro
     return json({ folder: 'drafts', items: result.items, total: result.total, limit, offset });
   }
 
-  // 单条草稿：GET 恢复编辑 / PUT 自动保存（upsert）/ DELETE 丢弃
+  // Single draft: GET to restore editing / PUT to autosave (upsert) / DELETE to discard
   const draftMatch = /^\/api\/drafts\/([^/]+)$/.exec(path);
   if (draftMatch) {
     const draftId = decodeURIComponent(draftMatch[1]);
@@ -104,23 +229,23 @@ async function routeApi(request: Request, env: Env, path: string, url: URL): Pro
     return json({ error: 'Method Not Allowed' }, 405);
   }
 
-  // 侧边栏计数（可按 mailbox 过滤）
+  // Sidebar counts (optionally filtered by mailbox)
   if (path === '/api/counts' && method === 'GET') {
     const mailbox = url.searchParams.get('mailbox') || undefined;
     return json(await repo.sidebarCounts(env, mailbox));
   }
 
-  // 收件地址列表（多邮箱切换）
+  // Receiving address list (multi-mailbox switching)
   if (path === '/api/mailboxes' && method === 'GET') {
     return json({ mailboxes: await repo.mailboxes(env) });
   }
 
-  // 本地联系人（写信/回复/转发的收件人输入联想）
+  // Local contacts (recipient input suggestions for compose/reply/forward)
   if (path === '/api/contacts' && method === 'GET') {
     return json({ contacts: await repo.contacts(env) });
   }
 
-  // 账户/发送能力信息（供写信界面显示发件人）
+  // Account/send capability info (for the compose UI to show the sender)
   if (path === '/api/account' && method === 'GET') {
     return json({
       can_send: Boolean(env.RESEND_API_KEY && env.SEND_FROM_ADDRESS),
@@ -129,12 +254,12 @@ async function routeApi(request: Request, env: Env, path: string, url: URL): Pro
     });
   }
 
-  // 后端状态：CF（D1/R2 占用 + 入站队列）+ Resend（发信额度）。前端一屏看清，提前知道何时该升级。?refresh=1 强制重算存储。
+  // Backend status: CF (D1/R2 usage + inbound queue) + Resend (send quota). The frontend sees it all at a glance and knows in advance when to upgrade. ?refresh=1 forces a storage recalculation.
   if (path === '/api/usage' && method === 'GET') {
     return json(await repo.getBackendStatus(env, { force: url.searchParams.get('refresh') === '1' }));
   }
 
-  // 批量操作：/api/messages/batch
+  // Batch operations: /api/messages/batch
   if (path === '/api/messages/batch' && method === 'POST') {
     const body = (await request.json().catch(() => null)) as { ids?: unknown; action?: unknown } | null;
     if (!body || !Array.isArray(body.ids) || typeof body.action !== 'string') {
@@ -145,24 +270,24 @@ async function routeApi(request: Request, env: Env, path: string, url: URL): Pro
     return json(result);
   }
 
-  // 写信：/api/messages
+  // Compose: /api/messages
   if (path === '/api/messages' && method === 'POST') {
     return compose(env, request);
   }
 
-  // 回复：/api/messages/:id/reply
+  // Reply: /api/messages/:id/reply
   const replyMatch = /^\/api\/messages\/([^/]+)\/reply$/.exec(path);
   if (replyMatch && method === 'POST') {
     return reply(env, request, decodeURIComponent(replyMatch[1]));
   }
 
-  // 转发：/api/messages/:id/forward（任意方向的邮件都可转发）
+  // Forward: /api/messages/:id/forward (a message in any direction can be forwarded)
   const forwardMatch = /^\/api\/messages\/([^/]+)\/forward$/.exec(path);
   if (forwardMatch && method === 'POST') {
     return forward(env, request, decodeURIComponent(forwardMatch[1]));
   }
 
-  // 单封邮件详情 / 更新
+  // Single message detail / update
   const messageMatch = /^\/api\/messages\/([^/]+)$/.exec(path);
   if (messageMatch) {
     const id = decodeURIComponent(messageMatch[1]);
@@ -176,7 +301,7 @@ async function routeApi(request: Request, env: Env, path: string, url: URL): Pro
     return json({ error: 'Method Not Allowed' }, 405);
   }
 
-  // 附件代理：/api/attachments/:id  （?dl=1 强制下载，不带则按类型决定是否内联预览）
+  // Attachment proxy: /api/attachments/:id  (?dl=1 forces download; without it, inline preview is decided by type)
   const attachmentMatch = /^\/api\/attachments\/([^/]+)$/.exec(path);
   if (attachmentMatch && method === 'GET') {
     const resp = await repo.proxyAttachment(env, decodeURIComponent(attachmentMatch[1]), {
@@ -186,21 +311,21 @@ async function routeApi(request: Request, env: Env, path: string, url: URL): Pro
     return resp;
   }
 
-  // 入站异常看板：CF 入向「收了但没解析进收件箱」的邮件（原始件仍安全保存在 R2）。
-  // 这是「什么都不写后台日志、用户无从知晓」的解药——把没收进箱的邮件显式暴露出来。
+  // Inbound alerts dashboard: CF inbound mail that was "received but not parsed into the inbox" (the raw message is still safely stored in R2).
+  // This is the antidote to "nothing in the backend logs and the user has no way to know" — explicitly expose mail that did not make it into the inbox.
   if (path === '/api/inbound/alerts' && method === 'GET') {
     const alerts = await repo.listInboundAlerts(env);
     return json({ alerts, count: alerts.length });
   }
 
-  // 手动重放一条入站异常
+  // Manually replay one inbound alert
   const inboundRetryMatch = /^\/api\/inbound\/alerts\/([^/]+)\/retry$/.exec(path);
   if (inboundRetryMatch && method === 'POST') {
     const ok = await repo.retryInbound(env, decodeURIComponent(inboundRetryMatch[1]));
     return ok ? json({ ok: true }) : json({ error: '未找到该入站记录' }, 404);
   }
 
-  // 下载某封入站异常的原始 .eml（收件箱里没有时的人工兜底）
+  // Download the raw .eml of an inbound alert (manual fallback for when it is not in the inbox)
   const inboundRawMatch = /^\/api\/inbound\/alerts\/([^/]+)\/raw$/.exec(path);
   if (inboundRawMatch && method === 'GET') {
     const resp = await repo.proxyInboundRaw(env, decodeURIComponent(inboundRawMatch[1]));
@@ -210,9 +335,9 @@ async function routeApi(request: Request, env: Env, path: string, url: URL): Pro
   return json({ error: 'Not Found' }, 404);
 }
 
-/* ---------------- 草稿箱辅助 ---------------- */
+/* ---------------- Draft helpers ---------------- */
 
-/** 草稿行 → 前端形状（收件人拆成数组、rich 转布尔、缺省字段补空串）。 */
+/** Draft row → frontend shape (recipients split into arrays, rich to boolean, missing fields filled with empty strings). */
 function draftJson(d: repo.DraftRow) {
   return {
     id: d.id,
@@ -231,11 +356,11 @@ function draftJson(d: repo.DraftRow) {
 }
 
 /**
- * 解析自动保存的请求体。
+ * Parse the autosave request body.
  *
- * 收件人一律走 `normalizeRecipients` 的**同源切分**（逗号 / 分号 / 空白），
- * 保证「草稿里存下的收件人」与「真正发出去时的收件人」逐字一致 ——
- * 两套口径会让用户看到草稿里写着 3 个收件人、发出去却只有 2 个。
+ * Recipients always go through the **same-source splitting** of `normalizeRecipients` (comma / semicolon / whitespace),
+ * ensuring the "recipients stored in the draft" and the "recipients actually sent out" match exactly —
+ * two different conventions would let a user see 3 recipients in a draft but only 2 get sent.
  */
 function parseDraftInput(id: string, body: unknown): repo.DraftInput | null {
   if (!body || typeof body !== 'object') return null;
@@ -257,7 +382,7 @@ function parseDraftInput(id: string, body: unknown): repo.DraftInput | null {
   };
 }
 
-/** 发信成功后丢弃对应草稿。失败**不影响**发送结果（草稿最多多留一条，用户可手动删）。 */
+/** Discard the corresponding draft after a successful send. Failure does **not affect** the send result (at worst one extra draft lingers, which the user can delete manually). */
 async function dropDraft(env: Env, draftId: string | undefined | null): Promise<void> {
   if (!draftId) return;
   try {
@@ -283,7 +408,7 @@ async function getMessageDetail(env: Env, id: string): Promise<Response> {
     message.read = 1;
   }
 
-  // 附件与会话上下文互不依赖，并行取（少一个串行 D1 往返）；markRead 必须在返回前完成，故留在上面串行。
+  // Attachments and thread context do not depend on each other, so fetch them in parallel (one fewer serial D1 round trip); markRead must complete before returning, so it stays serial above.
   const noThread: Awaited<ReturnType<typeof repo.listThread>> = [];
   const [attachmentsRaw, threadRaw] = await Promise.all([
     repo.listAttachments(env, id),
@@ -301,7 +426,7 @@ async function getMessageDetail(env: Env, id: string): Promise<Response> {
     url: `/api/attachments/${a.id}`,
   }));
 
-  // 会话上下文（同一 thread_id 内，**降序：最近在前**；回环副本已由 listThread 折叠）
+  // Thread context (within the same thread_id, **descending: most recent first**; loopback copies are already folded by listThread)
   const thread: Array<Record<string, unknown>> = threadRaw.map((t) => ({
     id: t.id,
     direction: t.direction,
@@ -314,8 +439,8 @@ async function getMessageDetail(env: Env, id: string): Promise<Response> {
     received_at: t.received_at,
     read: t.read === 1,
     deleted: t.deleted === 1,
-    // 同一封物理邮件的其它记录 id（被折叠掉的回环副本）。前端据此把「当前打开的是副本」
-    // 也认作当前行；这里顺带把 `current` 一并算对，避免两处口径不一致。
+    // Other record ids of the same physical message (the folded-away loopback copies). The frontend uses this to treat "the copy currently open"
+    // as the current row too; `current` is also computed correctly here to avoid two different conventions drifting apart.
     copy_ids: t.copy_ids ?? [],
     current: t.id === id || (t.copy_ids ?? []).includes(id),
   }));
@@ -326,8 +451,8 @@ async function getMessageDetail(env: Env, id: string): Promise<Response> {
       ...rest,
       id,
       to_emails: jsonArr(to_emails),
-      // 入站：投递地址（信封收件人）。历史行是 null —— 前端据此判定「修复前入库」，
-      // 展示收件人时把投递地址减去 cc/bcc，别把自己标成收件人。
+      // Inbound: delivery address (envelope recipient). Historical rows are null — the frontend uses that to detect "stored before the fix",
+      // and when showing recipients subtracts cc/bcc from the delivery address so it does not label itself as a recipient.
       delivered_to: delivered_to ? jsonArr(delivered_to) : null,
       cc: jsonArr(cc),
       bcc: jsonArr(bcc),
@@ -338,7 +463,7 @@ async function getMessageDetail(env: Env, id: string): Promise<Response> {
   });
 }
 
-/** 收件人按小写去重（保留首次出现的原始写法），顺带 trim 与去空。 */
+/** Dedupe recipients case-insensitively (keeping the first original spelling), trimming and dropping empties along the way. */
 function dedupeRecipients(list: string[]): string[] {
   const seen = new Set<string>();
   const out: string[] = [];
@@ -353,8 +478,8 @@ function dedupeRecipients(list: string[]): string[] {
 }
 
 /**
- * 切分多收件人字符串：逗号 / 分号（含中文全角）/ 空白均为分隔符，
- * 每段 trim 后去空，再按小写去重。与前端 parseRecipients 同一口径。
+ * Split a multi-recipient string: comma / semicolon (including the full-width Chinese forms) / whitespace are all separators,
+ * each segment is trimmed then emptied, then deduped case-insensitively. Same convention as the frontend parseRecipients.
  */
 function splitRecipients(raw: string): string[] {
   return dedupeRecipients(raw.split(/[,;，；\s]+/));
@@ -377,12 +502,12 @@ function parseRecipient(raw: unknown): string[] {
 }
 
 /**
- * 归一化 to / cc / bcc 三组收件人：
- * - **to 原样保留**（顺序与重复项都不动）—— 这是 B13 锁定的既有行为，改动会让老断言变红；
- * - cc / bcc 去重，并剔除已出现在更高优先级分组里的地址（to > cc > bcc）。
+ * Normalize the to / cc / bcc recipient groups:
+ * - **to kept as-is** (order and duplicates untouched) — this is the existing behavior locked by B13, and changing it would turn the old assertions red;
+ * - cc / bcc deduped, and addresses already present in a higher-priority group removed (to > cc > bcc).
  *
- * 剔除重复是必须的：同一地址同时出现在 to 和 cc 时，Resend 会把同一封信投两次，
- * 收件人会收到两封一模一样的邮件。
+ * Removing duplicates is required: when the same address appears in both to and cc, Resend delivers the same message twice,
+ * and the recipient receives two identical emails.
  */
 function normalizeRecipients(
   to: string[],
@@ -397,33 +522,33 @@ function normalizeRecipients(
   return { to: toClean, cc: ccClean, bcc: bccClean };
 }
 
-/** base64 长度 -> 原始字节数（仅用于「总大小是否超限」的粗略预检，不解码）。 */
+/** base64 length -> raw byte count (only for the rough pre-check of "does the total size exceed the limit", without decoding). */
 function approxBase64Bytes(b64: string): number {
   const n = b64.replace(/\s+/g, '').length;
   return Math.floor((n * 3) / 4);
 }
 
-const MAX_ATTACHMENT_BYTES = 40 * 1024 * 1024; // 对齐 Resend 附件上限
+const MAX_ATTACHMENT_BYTES = 40 * 1024 * 1024; // Align with the Resend attachment limit
 /**
- * 每位收件人在合并发送中消耗的子请求数：
- *   1 次 Resend fetch + 1 次 D1 .run()（saveOutbound）
- *   + 每个附件 1 次 R2 put + 有附件时 1 次 D1 .batch()（写附件元数据）。
+ * Subrequests each recipient consumes in a merge send:
+ *   1 Resend fetch + 1 D1 .run() (saveOutbound)
+ *   + 1 R2 put per attachment + 1 D1 .batch() when there are attachments (writing attachment metadata).
  *
- * ⚠️ Cloudflare 的子请求口径**包含对 R2 / D1 的调用**，不只是 fetch。
- * 此处假设 `DB.batch()` 计 1 次子请求（单次事务往返）。
+ * ⚠️ Cloudflare's subrequest accounting **includes calls to R2 / D1**, not just fetch.
+ * This assumes `DB.batch()` counts as 1 subrequest (a single transactional round trip).
  */
 function perRecipientSubrequests(attachmentCount: number): number {
   return 2 + attachmentCount + (attachmentCount > 0 ? 1 : 0);
 }
 
-/** 绝对上限：串行发送的兜底，防止预算被配得过大导致单请求过久。 */
+/** Absolute cap: a fallback for serial sending, preventing an over-large budget from making a single request take too long. */
 const MAX_MERGE_RECIPIENTS = 200;
 
 /**
- * 合并发送单次最多收件人数（按附件数动态计算）。
- * 预算默认 45（免费版 50 子请求留 5 余量）。触顶会在循环中途抛错 → 部分邮件已发出、
- * 用户重试可能重复投递，所以必须留余量，不能贴着 50 用。
- * 付费版可在 wrangler.toml 把 MERGE_SUBREQ_BUDGET 调大。
+ * Maximum recipients per merge send (computed dynamically from the attachment count).
+ * The default budget is 45 (Free tier's 50 subrequests with 5 to spare). Hitting the cap throws mid-loop → some emails are already sent and
+ * a user retry may duplicate delivery, so headroom is required; do not use right up to 50.
+ * Paid tiers can raise MERGE_SUBREQ_BUDGET in wrangler.toml.
  */
 function mergeRecipientCap(env: Env, attachmentCount: number): number {
   const budget = clampInt(env.MERGE_SUBREQ_BUDGET ?? null, 45, 10000);
@@ -450,7 +575,7 @@ function safeFilename(name: string): string {
   return base;
 }
 
-/** 已发送附件：base64 -> R2 + attachments 行（供「已发送」回看/下载）。 */
+/** Sent attachments: base64 -> R2 + attachments rows (for reviewing/downloading in "Sent"). */
 async function storeOutboundAttachments(env: Env, messageId: string, files: ResendAttachment[]): Promise<void> {
   const rows: Array<{ filename: string; contentType: string; size: number; r2Key: string }> = [];
   for (const f of files) {
@@ -472,7 +597,7 @@ async function storeOutboundAttachments(env: Env, messageId: string, files: Rese
   }
 }
 
-/** 写信/回复统一正文：body 纯文本 + html 可选（富文本），互推回退。 */
+/** Unified compose/reply body: body plain text + optional html (rich text), each falling back to the other. */
 function bodyFrom(b: { body?: unknown; html?: unknown }): { text: string; html: string } {
   const text = typeof b.body === 'string' ? b.body : '';
   const rawHtml = typeof b.html === 'string' ? b.html : '';
@@ -484,9 +609,9 @@ function bodyFrom(b: { body?: unknown; html?: unknown }): { text: string; html: 
 }
 
 /**
- * 决定发件人：优先请求指定 mailbox，仅当其域名属于已验证发送域名时采用。
- * 同时返回**实际使用的显示名**，供出站入库（`from_name`）使用 ——
- * 否则收件箱里所有账户发出去的信都显示成全局 `SEND_FROM_NAME`。
+ * Decide the sender: prefer the requested mailbox, but only use it when its domain belongs to a verified sending domain.
+ * Also returns the **display name actually used** for the outbound DB row (`from_name`) —
+ * otherwise every account's sent mail in the inbox would show the global `SEND_FROM_NAME`.
  */
 function resolveSender(
   env: Env,
@@ -504,17 +629,17 @@ interface MergeInput {
   content: { text: string; html: string };
   attachments: ResendAttachment[];
   sender: { from: string; mailbox: string; fromName: string | null };
-  /** 全部发送成功后要丢弃的草稿 id。 */
+  /** Draft id to discard after all sends succeed. */
   draftId?: string;
 }
 
 /**
- * 合并发送：串行地为每位收件人单独发送一封（正文/主题/附件完全相同），
- * 每人各存一条独立 outbound 记录（独立会话），单个失败不中断后续。
+ * Merge send: serially send a separate email to each recipient (body/subject/attachments identical),
+ * storing an independent outbound record per person (independent thread), with a single failure not interrupting the rest.
  *
- * 一律返回 HTTP 200：部分成功既非全对也非全错，前端据 `failed` 明细做「只重发失败者」。
- * `ok` 表示「是否**全部**成功」（`failed.length === 0`）；部分成功或全部失败都为 `false`，
- * 但状态码一律 200，调用方须看 `sent`/`failed` 明细。
+ * Always return HTTP 200: partial success is neither all-right nor all-wrong, so the frontend uses the `failed` detail to "resend only the failures".
+ * `ok` means "did **all** succeed" (`failed.length === 0`); partial success or total failure is both `false`,
+ * but the status code is always 200, so the caller must look at the `sent`/`failed` detail.
  */
 async function composeMerge(env: Env, input: MergeInput): Promise<Response> {
   const sent: Array<{ to: string; id: string; resend_id: string }> = [];
@@ -542,13 +667,13 @@ async function composeMerge(env: Env, input: MergeInput): Promise<Response> {
       continue;
     }
 
-    // 邮件已经投递出去了：存库失败不能算「未发送」，否则用户重试会重复投递
+    // The email has already been delivered: a DB write failure must not count as "not sent", otherwise a user retry would duplicate delivery
     let rowId = '';
     try {
       rowId = await repo.saveOutbound(env, {
         inReplyTo: null,
         references: null,
-        threadId: uuid(), // 每人独立会话
+        threadId: uuid(), // independent thread per person
         mailbox: input.sender.mailbox,
         fromName: input.sender.fromName,
         fromEmail: input.sender.mailbox,
@@ -569,8 +694,8 @@ async function composeMerge(env: Env, input: MergeInput): Promise<Response> {
     sent.push({ to: addr, id: rowId, resend_id: resendId });
   }
 
-  // **全部成功**才丢弃草稿：部分成功时保留，用户可以从草稿箱重发失败的那几个
-  // （删了草稿又没全发出去，等于把内容丢了）。
+  // Discard the draft only when **all succeeded**: keep it on partial success, so the user can resend the failed ones from the drafts folder
+  // (deleting the draft without sending everything would lose the content).
   if (failed.length === 0) await dropDraft(env, input.draftId);
 
   return json({
@@ -595,7 +720,7 @@ async function compose(env: Env, request: Request): Promise<Response> {
     parseRecipient(body.cc),
     parseRecipient(body.bcc)
   );
-  // to / cc / bcc 任一非空即可（只密送的邮件是合法的）
+  // Any one of to / cc / bcc non-empty is enough (a BCC-only email is legal)
   if (!to.length && !cc.length && !bcc.length) return json({ error: '缺少收件人' }, 400);
   const subject = typeof body.subject === 'string' ? body.subject.trim() : '';
   const content = bodyFrom(body);
@@ -603,13 +728,13 @@ async function compose(env: Env, request: Request): Promise<Response> {
   if (attachments === null) return json({ error: '附件格式错误' }, 400);
 
   const sender = resolveSender(env, typeof body.mailbox === 'string' ? body.mailbox : undefined);
-  // 发信成功后要丢弃的草稿（前端自动保存时用的 id）
+  // Draft to discard after a successful send (the id the frontend uses for autosave)
   const draftId = typeof body.draft_id === 'string' ? body.draft_id : '';
 
-  // 合并发送：每位收件人各发一封独立邮件（内容与主题不变）
+  // Merge send: send a separate email to each recipient (content and subject unchanged)
   if (body.merge === true) {
-    // 合并发送的语义是「给每个人单独发一封」，而密送会让被密送者收到 N 封重复邮件。
-    // 两者语义冲突 → 明确拒绝，而不是静默忽略 bcc（用户会以为密送生效了）。
+    // Merge send means "send one separately to each person", while BCC makes the BCC'd person receive N duplicate emails.
+    // The two semantics conflict → explicitly reject, rather than silently ignoring bcc (the user would think BCC took effect).
     if (bcc.length) return json({ error: '合并发送不支持密送（BCC），请取消其中一个' }, 400);
     const recipients = dedupeRecipients(to);
     if (!recipients.length) return json({ error: '缺少收件人' }, 400);
@@ -636,7 +761,7 @@ async function compose(env: Env, request: Request): Promise<Response> {
   const rowId = await repo.saveOutbound(env, {
     inReplyTo: null,
     references: null,
-    threadId: uuid(), // 独立会话
+    threadId: uuid(), // independent thread
     mailbox: sender.mailbox,
     fromName: sender.fromName,
     fromEmail: sender.mailbox,
@@ -674,12 +799,12 @@ async function reply(env: Env, request: Request, id: string): Promise<Response> 
   const replyTo = parseAddressList(original.reply_to)[0] ?? parseAddress(original.from_email);
   if (!replyTo) return json({ error: '原邮件缺少发件地址' }, 400);
 
-  // ⚠️ 曾经无条件 to: [replyTo.email] → 用户在回复框里补的收件人（逗号分隔）被**整段丢弃**：
-  // 新人收不到信，发件箱记录也只留原发件人一人。
-  // 现在以请求体的 to 为准（前端回复框预填原发件人，用户可再追加/编辑）；
-  // 仅在请求体完全没给 to（老客户端 / 直接调 API）时才回退到从原邮件推导的那一个地址。
+  // ⚠️ It once unconditionally used to: [replyTo.email] → recipients the user added in the reply box (comma-separated) were **discarded entirely**:
+  // the new people did not get the mail, and the sent record kept only the original sender.
+  // Now the request body's to takes precedence (the frontend reply box pre-fills the original sender, which the user can append to/edit);
+  // only when the request body provides no to at all (old clients / direct API calls) does it fall back to the single address derived from the original mail.
   const requestedTo = dedupeRecipients(parseRecipient(raw?.to));
-  // cc / bcc 由用户自己填（不自动「回复全部」）；归一化会剔除与 to 重复的地址，避免重复投递。
+  // cc / bcc are filled in by the user (no automatic "reply all"); normalization removes addresses duplicated with to to avoid duplicate delivery.
   const { to, cc, bcc } = normalizeRecipients(
     requestedTo.length ? requestedTo : [replyTo.email],
     parseRecipient(raw?.cc),
@@ -690,20 +815,20 @@ async function reply(env: Env, request: Request, id: string): Promise<Response> 
   if (attachments === null) return json({ error: '附件格式错误' }, 400);
 
   const origMessageId = original.message_id || original.id;
-  // References 链 = 原邮件的 References + 原邮件的 Message-ID（去重）。
-  // ⚠️ 原邮件的 references 列存的是 Resend 给的 **JSON 数组文本**（见 util.parseReferences），
-  // 旧实现把它整段拼进头部发回 Resend，导致转义层级逐轮嵌套（生产实测已到四层），
-  // 且 thread_id 随之每轮漂移 —— 必须解析成规范的 `<id>` 列表再拼。
+  // References chain = the original mail's References + the original mail's Message-ID (deduped).
+  // ⚠️ The original mail's references column stores the **JSON array text** Resend gave (see util.parseReferences);
+  // the old implementation spliced it whole into the header and sent it back to Resend, causing the escaping level to nest each round (production measured up to four levels),
+  // and thread_id drifted every round accordingly — it must be parsed into a canonical `<id>` list before joining.
   const refChain = parseReferences(original.references);
   const seenRefs = new Set(refChain.map((x) => stripAngle(x)));
   if (origMessageId && !seenRefs.has(origMessageId)) refChain.push(`<${origMessageId}>`);
   const newReferences = refChain.join(' ');
 
   const subject = replySubject(original.subject);
-  // 发件人：优先用户在「发件人」下拉里的选择（与 compose 完全同一口径），
-  // 未指定时才沿用「收到原邮件的那个信箱」。
-  // ⚠️ 曾经无条件用 original.mailbox → 回复时改选发件人完全不生效，发出的仍是原邮件的收件信箱。
-  // 域名校验由 senderFromMailbox 兜底（非默认域会回退默认发件人），此处不做额外白名单。
+  // Sender: prefer the user's choice in the "From" dropdown (exactly the same convention as compose),
+  // and only fall back to "the mailbox that received the original mail" when unspecified.
+  // ⚠️ It once unconditionally used original.mailbox → changing the sender when replying had no effect at all; it still sent from the original mail's recipient mailbox.
+  // Domain validation is covered by senderFromMailbox (non-default domains fall back to the default sender); no extra whitelist is done here.
   const requestedMailbox = typeof raw?.mailbox === 'string' ? raw.mailbox.trim() : '';
   const sender = resolveSender(env, requestedMailbox || original.mailbox || undefined);
 
@@ -723,10 +848,10 @@ async function reply(env: Env, request: Request, id: string): Promise<Response> 
   });
   if (!result.ok) return json({ error: result.error }, 400);
 
-  // 会话归属：**优先继承原邮件（干净的）thread_id**。
-  // 只按 References 推导是不够的 —— 对方客户端若只发 In-Reply-To 不发 References，
-  // 推导出的根会退化成「原邮件的 message_id」，于是每往返一轮就新开一个会话，
-  // 表现为「来回好几次却只显示两封」。原 thread_id 畸形（历史数据）时才回退推导。
+  // Thread ownership: **prefer inheriting the original mail's (clean) thread_id**.
+  // Deriving from References alone is not enough — if the other client sends only In-Reply-To and not References,
+  // the derived root degenerates to "the original mail's message_id", so a new thread is opened each round trip,
+  // showing "several back-and-forths but only two messages". Only fall back to derivation when the original thread_id is malformed (historical data).
   const derivedThread = rootThreadId({
     references: newReferences,
     inReplyTo: origMessageId,
@@ -760,10 +885,10 @@ async function reply(env: Env, request: Request, id: string): Promise<Response> 
   return json({ ok: true, id: rowId, resend_id: result.id, original_id: original.id });
 }
 
-/** 转发时原邮件附件的总大小上限（对齐 Resend 单封 40 MB）。 */
+/** Total size limit for the original mail's attachments when forwarding (aligns with Resend's 40 MB per message). */
 const MAX_FORWARD_TOTAL_BYTES = 40 * 1024 * 1024;
 
-/** 把源邮件的附件复制到目标消息名下（新 R2 key），供转发使用。 */
+/** Copy the source mail's attachments under the target message (new R2 keys), for forwarding. */
 async function copyAttachmentsToMessage(
   env: Env,
   messageId: string,
@@ -782,16 +907,16 @@ async function copyAttachmentsToMessage(
 }
 
 /**
- * 转发：**任意方向**的邮件都可以转发给任意收件人（不像回复只能回收到的邮件）。
+ * Forward: a message in **any direction** can be forwarded to any recipient (unlike reply, which only handles received mail).
  *
- * 关键语义：
- * - 主题补 `Fwd:` 前缀（已有则不重复叠加）；
- * - **不设** `In-Reply-To` / `References` —— 转发是**新会话**，带上就会串进原会话；
- * - 原邮件附件由**服务端**从 R2 读出随信发出，并复制到新 R2 key 落库
- *   （不能共用 key：`permanentDelete` 会删 R2 对象，共用会让「删除原邮件」连带删掉转发件的附件）；
- * - 内联图片（cid）不转发：正文引用走纯文本，带过去只会变成一堆无引用的图片附件；
- * - 附件读不到 / 合计超限时**不静默**：前者跳过并在响应里列出 `skipped_attachments`，
- *   后者直接 400 说明原因（宁可让用户自己删附件，也不要发出去一封少了一半附件的信）。
+ * Key semantics:
+ * - the subject gets a `Fwd:` prefix (not stacked again if already present);
+ * - `In-Reply-To` / `References` are **not set** — forwarding is a **new thread**, and including them would string it into the original thread;
+ * - the original mail's attachments are read by the **server** from R2, sent with the mail, and copied to new R2 keys for storage
+ *   (keys cannot be shared: `permanentDelete` deletes R2 objects, so sharing would make "delete the original mail" also delete the forwarded mail's attachments);
+ * - inline images (cid) are not forwarded: the body reference goes as plain text, and carrying them over would just become a pile of unreferenced image attachments;
+ * - when an attachment cannot be read / the total exceeds the limit, **do not stay silent**: the former is skipped and listed in the response as `skipped_attachments`,
+ *   the latter returns 400 with the reason (better to let the user delete attachments themselves than to send a mail missing half its attachments).
  */
 async function forward(env: Env, request: Request, id: string): Promise<Response> {
   const original = await repo.getMessage(env, id);
@@ -828,7 +953,7 @@ async function forward(env: Env, request: Request, id: string): Promise<Response
   const requestedMailbox = typeof raw?.mailbox === 'string' ? raw.mailbox.trim() : '';
   const sender = resolveSender(env, requestedMailbox || original.mailbox || undefined);
 
-  // 读原附件：内联图片（cid）跳过；单个读不到也跳过，但**记录下来告知用户**
+  // Read the original attachments: inline images (cid) are skipped; a single unreadable one is skipped too, but **recorded to inform the user**
   const sourceRows = includeOriginal
     ? (await repo.listAttachments(env, id)).filter((a) => a.inline !== 1)
     : [];
@@ -868,7 +993,7 @@ async function forward(env: Env, request: Request, id: string): Promise<Response
   const rowId = await repo.saveOutbound(env, {
     inReplyTo: null,
     references: null,
-    threadId: uuid(), // 转发开启新会话
+    threadId: uuid(), // forward opens a new thread
     mailbox: sender.mailbox,
     fromName: sender.fromName,
     fromEmail: sender.mailbox,
@@ -882,7 +1007,7 @@ async function forward(env: Env, request: Request, id: string): Promise<Response
     receivedAt: nowSec(),
   });
 
-  // 邮件已经投递出去了：附件落库失败不能当成「没发出去」（否则用户重试会重复投递）
+  // The email has already been delivered: a failed attachment store must not be treated as "not sent" (otherwise a user retry would duplicate delivery)
   await storeOutboundAttachments(env, rowId, extra).catch((err) => {
     console.error('forward: storeOutboundAttachments failed:', err);
   });

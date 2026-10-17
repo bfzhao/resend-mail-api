@@ -1,26 +1,26 @@
 'use strict';
 
 /* =============================================================================
- * 「收件人角色」与「附件预览」两类缺陷的独立回归验证
- * （真实 jsdom + 真实 DOM 事件 + 真实 index.html / app.css / app.js）
+ * Independent regression verification of two defect classes: "recipient role" and "attachment preview"
+ * (real jsdom + real DOM events + real index.html / app.css / app.js)
  *
- * 运行（本机 jsdom 装在共享 workspace 里，需 NODE_PATH）：
- *   NODE_PATH='C:\Users\Bingfeng\.workbuddy-ai\binaries\node\workspace\node_modules' \
+ * Run (jsdom is installed in a shared workspace locally, so NODE_PATH is required):
+ *   NODE_PATH='<NODE_PATH>' \
  *     node test/read-role-attachment.dom.test.js
  *
- * 退出码：0 = 全部通过；1 = 存在失败；2 = 环境缺失（找不到 jsdom）。
+ * Exit code: 0 = all passed; 1 = some failed; 2 = environment missing (jsdom not found).
  *
- * 覆盖用户报障（2026-10-08 第二轮）：
- *   P1  我是抄送收件人，详情里「收件人」却显示成我自己
- *       —— 根因：Resend 收信接口的 `to` 是**投递地址（信封收件人）**，不是 `To:` 头。
- *          后端改为「优先 headers.to，投递地址另存 delivered_to」；
- *          前端按 mailbox 落在 cc/bcc/to 的哪个位置，在默认可见的摘要行给出「你是抄送/密送」角标。
- *   P2  富文本编辑框自动增高，把「发送」按钮挤出屏幕
- *       —— 弹窗封顶 + 滚动，底部操作行 sticky 吸底。
- *   P4  附件无法预览
- *       —— 可预览类型内联 + 应用内浮层，每个附件配独立下载按钮（?dl=1）。
+ * Covers user-reported issues (2026-10-08, second round):
+ *   P1  I am a cc recipient, yet the "recipient" in the detail shows me
+ *       -- root cause: the `to` from Resend's inbound API is the **delivery address (envelope recipient)**, not the `To:` header.
+ *          The backend was changed to "prefer headers.to, store the delivery address separately as delivered_to";
+ *          the frontend determines where the mailbox falls among cc/bcc/to and shows a "you are cc/bcc" tag on the always-visible summary row.
+ *   P2  The rich text editor auto-grows and pushes the "send" button off-screen
+ *       -- cap the composer height + scroll, make the bottom action row sticky.
+ *   P4  Attachments cannot be previewed
+ *       -- inline preview for previewable types + an in-app overlay, each attachment gets its own download button (?dl=1).
  *
- * 变异验证钩子（指向仓库外人工构造的缺陷版本）：
+ * Mutation verification hooks (point to hand-crafted defective versions outside the repo):
  *   QA_APP_JS / QA_INDEX_HTML / QA_APP_CSS / QA_REPO_TS
  * ===========================================================================*/
 
@@ -34,7 +34,7 @@ try {
   ({ JSDOM } = require('jsdom'));
 } catch (e) {
   console.error('无法加载 jsdom。请用 NODE_PATH 指向 jsdom 所在 node_modules（Windows 反斜杠写法）：');
-  console.error("  NODE_PATH='C:\\Users\\Bingfeng\\.workbuddy-ai\\binaries\\node\\workspace\\node_modules' node test/read-role-attachment.dom.test.js");
+  console.error("  NODE_PATH='<NODE_PATH>' node test/read-role-attachment.dom.test.js");
   console.error(String(e && e.message));
   process.exit(2);
 }
@@ -49,7 +49,7 @@ const APP_JS = fs.readFileSync(APP_JS_PATH, 'utf8');
 const INDEX_HTML = fs.readFileSync(INDEX_PATH, 'utf8');
 const APP_CSS = fs.readFileSync(CSS_PATH, 'utf8');
 const REPO_TS = fs.readFileSync(REPO_TS_PATH, 'utf8');
-/** 去掉注释再跑「不该出现」类断言：否则会被自己注释里的示例文字命中（踩过）。 */
+/** Strip comments before running "must not appear" assertions: otherwise your own example text in a comment trips it (been there). */
 const CSS_NO_COMMENTS = APP_CSS.replace(/\/\*[\s\S]*?\*\//g, '');
 
 const FINGERPRINT = {
@@ -59,17 +59,17 @@ const FINGERPRINT = {
 };
 
 /* ---------------------------------------------------------------------------
- * 固定装置
+ * Fixtures
  * -------------------------------------------------------------------------*/
 
-const ME = 'bingfeng@notionmanager.com';
+const ME = 'dana@example.com';
 
 function listItem(id, extra = {}) {
   return Object.assign({
     id,
     direction: 'inbound',
-    from_name: 'Lara Valencia',
-    from_email: 'lara@realmarketlabs.com',
+    from_name: 'Frank Valencia',
+    from_email: 'frank@example.net',
     subject: '主题 ' + id,
     to_emails: [ME],
     received_at: 1700000000,
@@ -83,12 +83,12 @@ function listItem(id, extra = {}) {
 }
 
 /**
- * 详情响应。
+ * Detail response.
  *
- * ⚠️ 字段必须与真实接口同形：
- *  - `delivered_to` 是**显式 null 或数组**（历史行是 null，新行是投递地址数组）；
- *    前端靠 `!== null` 区分「新数据」与「修复前的旧数据」。
- *  - 收件人字段名是 `to_emails`（列表项与详情都用它）。
+ * ⚠️ Fields must match the real interface:
+ *  - `delivered_to` is **an explicit null or an array** (legacy rows are null, new rows are an array of delivery addresses);
+ *    the frontend uses `!== null` to distinguish "new data" from "old data before the fix".
+ *  - the recipient field name is `to_emails` (used by both list items and details).
  */
 function detailOf(m, extra = {}, attachments = []) {
   return {
@@ -123,12 +123,12 @@ function fixture(m, detail) {
 }
 
 /* ---------------------------------------------------------------------------
- * fetch 打桩
+ * fetch stub
  * -------------------------------------------------------------------------*/
 
 function makeStub(cfg = {}) {
   const calls = [];
-  // 这里直接吃 fixture 对象本身（fixture() 的返回值就是各接口的数据源）
+  // Here we consume the fixture object directly (fixture()'s return value is the data source for each interface)
   const store = cfg || {};
   const jsonRes = (obj, status = 200) => ({
     ok: status >= 200 && status < 300,
@@ -145,7 +145,7 @@ function makeStub(cfg = {}) {
     const pathOnly = url.split('?')[0];
 
     if (pathOnly === '/api/account') {
-      return Promise.resolve(jsonRes({ can_send: true, from_name: 'support', from_address: 'support@notionmanager.com' }));
+      return Promise.resolve(jsonRes({ can_send: true, from_name: 'support', from_address: 'support@example.com' }));
     }
     if (pathOnly === '/api/mailboxes') return Promise.resolve(jsonRes({ mailboxes: store.mailboxes || [] }));
     if (pathOnly === '/api/counts') return Promise.resolve(jsonRes(store.counts || {}));
@@ -154,7 +154,7 @@ function makeStub(cfg = {}) {
       const d = (store.folders || {})[fm[1]] || { items: [], total: 0 };
       return Promise.resolve(jsonRes({ folder: fm[1], items: d.items, total: d.total }));
     }
-    // 附件正文（文本预览走 fetch 自己渲染）
+    // Attachment body (text preview is rendered by fetch itself)
     const am = /^\/api\/attachments\/([^/]+)$/.exec(pathOnly);
     if (am) {
       const key = decodeURIComponent(am[1]);
@@ -175,7 +175,7 @@ function makeStub(cfg = {}) {
 }
 
 /* ---------------------------------------------------------------------------
- * 启动
+ * Boot
  * -------------------------------------------------------------------------*/
 
 const tick = (win) => new Promise((r) => win.setTimeout(r, 0));
@@ -184,11 +184,11 @@ async function ticks(win, n = 1) { for (let i = 0; i < n; i++) await tick(win); 
 async function boot(cfg) {
   const dom = new JSDOM(INDEX_HTML, { runScripts: 'dangerously', url: 'http://localhost/' });
   const win = dom.window;
-  // jsdom 默认 document.hidden === true → 被 `if (document.hidden) return;` 门控的代码一次都不跑
+  // jsdom defaults document.hidden === true -> code gated by `if (document.hidden) return;` never runs
   Object.defineProperty(win.document, 'visibilityState', { value: 'visible', configurable: true });
   Object.defineProperty(win.document, 'hidden', { value: false, configurable: true });
   const stub = makeStub(cfg);
-  win.fetch = stub.fetchImpl; // 必须在注入 app.js 之前
+  win.fetch = stub.fetchImpl; // must be before injecting app.js
 
   const script = win.document.createElement('script');
   script.textContent = APP_JS;
@@ -203,18 +203,18 @@ async function boot(cfg) {
     try {
       openId = win.eval('typeof state === "object" ? state.openId : null');
       pending = !!win.eval('detailPending');
-    } catch { /* 未就绪 */ }
+    } catch { /* not ready yet */ }
     if (nav && nav.children.length > 0 && list && list.children.length > 0 && openId && !pending) { ready = true; break; }
     await tick(win);
   }
   if (!ready) throw new Error('init() 未在预期时间内完成（fetch 打桩或脚本注入失败）');
   await ticks(win, 10);
-  win.eval('prefetchGen++; prefetchActive = null;'); // 作废后台预取，避免请求次数抖动
+  win.eval('prefetchGen++; prefetchActive = null;'); // invalidate background prefetch to avoid request-count jitter
   return { dom, win, doc: win.document, stub, close() { try { dom.window.close(); } catch { /* ignore */ } } };
 }
 
 /* ---------------------------------------------------------------------------
- * 断言器
+ * Assertion helpers
  * -------------------------------------------------------------------------*/
 
 const results = [];
@@ -234,8 +234,8 @@ async function test(name, fn, cfg) {
   console.log(`\n=== ${name} ===`);
   let ctx = null;
   let extra = null;
-  // 允许用例自己 boot（fixture 需要按用例内容构造）：bootTracked 的产物由 finally 统一关闭，
-  // 避免留下未关闭的 jsdom 窗口（未关闭的 window 会继续跑定时器，把套件拖成 flaky）。
+  // Allow a case to boot itself (fixtures need to be built per-case): bootTracked's product is closed uniformly in finally,
+  // to avoid leaving unclosed jsdom windows (an unclosed window keeps running timers and makes the suite flaky).
   const bootTracked = async (c) => { extra = await boot(c); return extra; };
   try {
     if (cfg) ctx = await boot(cfg);
@@ -259,7 +259,7 @@ function clickEl(ctx, node) {
 function pressEsc(ctx) {
   ctx.doc.dispatchEvent(new ctx.win.KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
 }
-/** 详情行（「查看详情」展开后的键值对）里某个键的值。 */
+/** The value of a key in a detail row (the key-value pairs after "view details" is expanded). */
 function detailLine(ctx, key) {
   const lines = el(ctx, '#read-message .env-detail-lines');
   if (!lines) return null;
@@ -274,16 +274,16 @@ const ATT = (id, filename, contentType, size = 1024, extra = {}) =>
   Object.assign({ id, message_id: 'm', filename, content_type: contentType, size, inline: false, content_id: null, url: `/api/attachments/${id}` }, extra);
 
 /* =============================================================================
- * 主流程
+ * Main flow
  * ===========================================================================*/
 (async () => {
   console.log('收件人角色 + 附件预览 —— 真实 jsdom 回归');
   console.log(`被测版本: app.js md5=${FINGERPRINT.appjs}  app.css md5=${FINGERPRINT.appcss}  index.html md5=${FINGERPRINT.index}`);
 
-  /* ======================= P1 收件人角色 ======================= */
+  /* ======================= P1 recipient role ======================= */
 
   await test('P1a 修复前的旧数据（delivered_to=null，我只是抄送）：不得把自己显示成「收件人」', async (ctx, bootTracked) => {
-    // 旧行：to_emails 存的是**投递地址**（= 我），cc 是真实抄送头（= 我）
+    // Legacy row: to_emails stores the **delivery address** (= me), cc is the real cc header (= me)
     const m = listItem('OLD', { to_emails: [ME] });
     const d = detailOf(m, { to_emails: [ME], cc: [ME], delivered_to: null });
     ctx = await bootTracked(fixture(m, d));
@@ -296,8 +296,8 @@ const ATT = (id, filename, contentType, size = 1024, extra = {}) =>
     ok(textOf(ctx, '#read-message .env-role-chip') === '你是抄送',
       '角标文案 = 你是抄送', textOf(ctx, '#read-message .env-role-chip'));
     ok(detailLine(ctx, '抄送') === ME, '详情行「抄送」仍如实列出我', detailLine(ctx, '抄送'));
-    // ⛔ 2026-10-08 第三轮：按用户要求删掉三行纯冗余的详情行。
-    //    这里用「必须不存在」把删除动作锁死 —— 否则以后有人顺手加回来不会有任何提示。
+    // ⛔ 2026-10-08 third round: three purely redundant detail rows were removed at the user's request.
+    //    Here we use "must not exist" to lock the removal -- otherwise if someone casually adds them back there's no signal.
     ok(detailLine(ctx, '你的身份') === null,
       '⭐ 详情行「你的身份」已删除（身份结论由默认可见的摘要行角标承担，不再重复）', detailLine(ctx, '你的身份'));
     ok(detailLine(ctx, '收件地址') === null,
@@ -309,18 +309,18 @@ const ATT = (id, filename, contentType, size = 1024, extra = {}) =>
   });
 
   await test('P1b 修复后的新数据（headers.to 已落库）：收件人显示真实 To，并标注我是抄送', async (ctx, bootTracked) => {
-    const m = listItem('NEW', { to_emails: ['lara@realmarketlabs.com'] });
+    const m = listItem('NEW', { to_emails: ['frank@example.net'] });
     const d = detailOf(m, {
-      to_emails: ['lara@realmarketlabs.com'],
+      to_emails: ['frank@example.net'],
       cc: [ME],
-      delivered_to: [ME], // 新行：投递地址单独存
+      delivered_to: [ME], // new row: delivery address stored separately
     });
     ctx = await bootTracked(fixture(m, d));
     const toText = textOf(ctx, '#read-message .env-details');
-    ok(toText.indexOf('lara@realmarketlabs.com') >= 0, '⭐ 摘要行显示真实 To 头', toText);
+    ok(toText.indexOf('frank@example.net') >= 0, '⭐ 摘要行显示真实 To 头', toText);
     ok(toText.indexOf(ME) < 0, '摘要行的「收件人」不包含我（我是抄送）', toText);
     ok(textOf(ctx, '#read-message .env-role-chip') === '你是抄送', '角标「你是抄送」', textOf(ctx, '#read-message .env-role-chip'));
-    ok(detailLine(ctx, '收件人') === 'lara@realmarketlabs.com', '详情行收件人 = 真实 To', detailLine(ctx, '收件人'));
+    ok(detailLine(ctx, '收件人') === 'frank@example.net', '详情行收件人 = 真实 To', detailLine(ctx, '收件人'));
     ok(detailLine(ctx, '收件地址') === null,
       '⭐ 详情行「收件地址」已删除（投递信箱改由信封卡副标题承载）', detailLine(ctx, '收件地址'));
     ok(textOf(ctx, '#read-message .env-top').indexOf(ME) >= 0,
@@ -339,8 +339,8 @@ const ATT = (id, filename, contentType, size = 1024, extra = {}) =>
   });
 
   await test('P1d 密送：cc 为空、我在 bcc 里 → 角标「你是密送」', async (ctx, bootTracked) => {
-    const m = listItem('BCC', { to_emails: ['lara@realmarketlabs.com'] });
-    const d = detailOf(m, { to_emails: ['lara@realmarketlabs.com'], cc: [], bcc: [ME], delivered_to: [ME] });
+    const m = listItem('BCC', { to_emails: ['frank@example.net'] });
+    const d = detailOf(m, { to_emails: ['frank@example.net'], cc: [], bcc: [ME], delivered_to: [ME] });
     ctx = await bootTracked(fixture(m, d));
     ok(textOf(ctx, '#read-message .env-role-chip') === '你是密送', '角标「你是密送」', textOf(ctx, '#read-message .env-role-chip'));
     ok(detailLine(ctx, '密送') === ME, '详情行「密送」= 我', detailLine(ctx, '密送'));
@@ -349,8 +349,8 @@ const ATT = (id, filename, contentType, size = 1024, extra = {}) =>
   });
 
   await test('P1e 优先级锁死：我同时在 To 与 Cc 里 → 判为「抄送」（cc 先于 to）', async (ctx, bootTracked) => {
-    // 这条规则是旧数据能否被正确识别的关键：旧行 to_emails 是投递地址，我方地址必然在里面，
-    // 若先判 to 就永远判不出「抄送」。用一个同时在两处的用例把顺序钉死。
+    // This rule is key to whether legacy data can be identified correctly: legacy rows' to_emails is the delivery address, so my address is necessarily in it,
+    // and if `to` is checked first, "cc" can never be detected. Pin the order down with a case where I'm in both.
     const m = listItem('BOTH', { to_emails: [ME] });
     const d = detailOf(m, { to_emails: [ME], cc: [ME], delivered_to: [ME] });
     ctx = await bootTracked(fixture(m, d));
@@ -362,8 +362,8 @@ const ATT = (id, filename, contentType, size = 1024, extra = {}) =>
 
   await test('P1f 出站邮件不受影响（收件人行仍是 to_emails 全量）', async (ctx, bootTracked) => {
     const m = listItem('OUT', {
-      direction: 'outbound', status: 'sent', mailbox: 'support@notionmanager.com',
-      from_name: 'support', from_email: 'support@notionmanager.com',
+      direction: 'outbound', status: 'sent', mailbox: 'support@example.com',
+      from_name: 'support', from_email: 'support@example.com',
       to_emails: ['alice@partner.com', 'bob@partner.com'],
     });
     const d = detailOf(m, { to_emails: ['alice@partner.com', 'bob@partner.com'], delivered_to: null });
@@ -372,13 +372,13 @@ const ATT = (id, filename, contentType, size = 1024, extra = {}) =>
     ok(toText.indexOf('alice@partner.com') >= 0 && toText.indexOf('bob@partner.com') >= 0,
       '出站收件人清单照常显示（口径未被入站改动带偏）', toText);
     ok(!el(ctx, '#read-message .env-role-chip'), '出站不显示「你是抄送」角标');
-    // 出站分支也必须一起去掉「时间」行 —— 否则变异验证时这条回退不会被抓到（本轮实测的覆盖缺口）
+    // The outbound branch must also drop the "time" row -- otherwise this regression isn't caught during mutation verification (a coverage gap found by actual measurement this round)
     ok(detailLine(ctx, '时间') === null,
       '⭐ 出站也不再有「时间」行（信封卡右上角 fmtDateTime 已是同一串字符）', detailLine(ctx, '时间'));
   });
 
   await test('P1g 「收件人：—」的老邮件带解释性 title（超期取不回，不是 bug）', async (ctx, bootTracked) => {
-    // 修复前入库 + 投递地址减掉 cc 后为空 → 只能显示「—」。这种行 delivered_to 仍是显式 null。
+    // Ingested before the fix + delivery address minus cc is empty -> can only show "—". Such rows still have delivered_to as an explicit null.
     const m = listItem('LEGACY', { to_emails: [ME] });
     const d = detailOf(m, { to_emails: [ME], cc: [ME], bcc: [], delivered_to: null });
     ctx = await bootTracked(fixture(m, d));
@@ -393,16 +393,16 @@ const ATT = (id, filename, contentType, size = 1024, extra = {}) =>
 
   await test('P1h 负控制：收件人正常显示时不得挂那个 title', async (ctx, bootTracked) => {
     const m = listItem('OK');
-    const d = detailOf(m, { to_emails: ['lara@realmarketlabs.com'], cc: [ME], delivered_to: [ME] });
+    const d = detailOf(m, { to_emails: ['frank@example.net'], cc: [ME], delivered_to: [ME] });
     ctx = await bootTracked(fixture(m, d));
     const line = el(ctx, '#read-message .env-details');
-    ok(textOf(ctx, '#read-message .env-details').indexOf('lara@realmarketlabs.com') >= 0,
+    ok(textOf(ctx, '#read-message .env-details').indexOf('frank@example.net') >= 0,
       '收件人正常显示真实 To', textOf(ctx, '#read-message .env-details'));
     ok(!line.title,
       '⭐ 正常情况不挂解释性 title（否则就是「无条件挂 title」的假修复）', line.title);
   });
 
-  /* ======================= P4 附件预览 ======================= */
+  /* ======================= P4 attachment preview ======================= */
 
   await test('P4a 附件 chip：文件名可点（预览）+ 独立下载按钮（带 ?dl=1）', async (ctx, bootTracked) => {
     const m = listItem('ATT1', { attachments_count: 1 });
@@ -503,7 +503,7 @@ const ATT = (id, filename, contentType, size = 1024, extra = {}) =>
     clickEl(ctx, open);
     await ticks(ctx.win, 3);
     ok(!isHidden(ctx, '#att-preview'), '前置：再次打开');
-    evalIn(ctx, 'renderRead()'); // renderRead 是详情内容的唯一出口
+    evalIn(ctx, 'renderRead()'); // renderRead is the sole outlet for detail content
     await ticks(ctx.win, 3);
     ok(isHidden(ctx, '#att-preview'), '⭐ 重新渲染详情（换邮件 / 刷新）时浮层自动收起');
   });
@@ -524,7 +524,7 @@ const ATT = (id, filename, contentType, size = 1024, extra = {}) =>
     ok(!isHidden(ctx, '#modal-mask'), '⭐ 写信弹窗仍然开着（Esc 没有穿透下去）');
   });
 
-  /* ======================= 静态层：CSS / HTML / 跨层口径 ======================= */
+  /* ======================= Static layer: CSS / HTML / cross-layer contract ======================= */
 
   await test('S1 问题 2：弹窗封顶 + 底部操作行吸底', async (ctx, bootTracked) => {
     ctx = await boot(fixture(listItem('S1'), detailOf(listItem('S1'))));
@@ -542,7 +542,7 @@ const ATT = (id, filename, contentType, size = 1024, extra = {}) =>
     ok(ruleHas('.composer-actions', /background:/), '吸底行有不透明背景（否则正文从按钮下透出来）');
     ok(ruleHas('.rich-editor', /max-height:\s*min\(45vh,\s*360px\)/),
       '.rich-editor 的 max-height 收紧到 min(45vh, 360px)（默认弹窗大多数屏幕不用滚）');
-    // 负控制：不能再出现「浮动模式下 max-height: none 却没人兜底」的组合
+    // Negative control: the combination "max-height: none in floating mode with no fallback" must not reappear
     ok(ruleHas('#composer.floating .composer-body-wrap', /flex:\s*1\s+1\s+auto/),
       '浮动模式正文区仍 flex: 1 1 auto（放大时正文吸收多余高度，未被本次改动破坏）');
   });
@@ -579,7 +579,7 @@ const ATT = (id, filename, contentType, size = 1024, extra = {}) =>
     ok(beBody.indexOf("'text/html'") < 0,
       '后端不把 text/html 列为可内联（HTML 会被当页面打开）');
 
-    // 真实函数行为抽样（不是只比字符串）
+    // Real function behavior sampling (not just string comparison)
     const kind = (t) => evalIn(ctx, `attachmentKind(${JSON.stringify({ content_type: t })})`);
     ok(kind('image/png') === 'image', 'attachmentKind(image/png) = image', kind('image/png'));
     ok(kind('image/svg+xml') === 'none', 'attachmentKind(image/svg+xml) = none', kind('image/svg+xml'));
@@ -589,7 +589,7 @@ const ATT = (id, filename, contentType, size = 1024, extra = {}) =>
     ok(kind('') === 'none', 'attachmentKind(空类型) = none');
   });
 
-  /* ---- 汇总 ---- */
+  /* ---- summary ---- */
   console.log('\n================ 失败用例清单 ================');
   const failed = results.filter((r) => !r.ok);
   if (!failed.length) console.log('（无）');

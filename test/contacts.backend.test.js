@@ -1,28 +1,28 @@
 'use strict';
 
 /* =============================================================================
- * 本地联系人（GET /api/contacts）后端验证 —— 真实 SQLite + 真实 repo.contacts()
+ * Local contacts (GET /api/contacts) backend verification -- real SQLite + real repo.contacts()
  *
- * 运行：
- *   NODE_OPTIONS="--require <仓库外垫片>.js" <node.exe> test/contacts.backend.test.js
- *   （套件内部会 spawnSync 起 tsc，本沙箱下需要垫片；垫片说明见
- *     .workbuddy-ai/memory/reference-product-and-platform.md）
+ * Run:
+ *   NODE_OPTIONS="--require <shim outside repo>.js" <node.exe> test/contacts.backend.test.js
+ *   (The suite spawns tsc internally, which needs the shim in this sandbox; shim notes are in
+ *     the documentation at the project root)
  *
- * 为什么值得单独一个套件：
- *   联系人聚合依赖三条**容易写错但不会报错**的 SQL 语义：
- *     1) `json_each('')` / 任何非法 JSON 会**直接抛 `malformed JSON`**，而 `WHERE` 里的判断
- *        **拦不住它**（表值函数在 JOIN 阶段求值，早于 WHERE）—— 写错就是接口 500；
- *     2) 「取该地址最新的姓名」靠 SQLite「裸列与 min()/max() 同取一行」的规则。实测（3.51.2）
- *        这条规则比文档宽松（多一个 COUNT(*)/SUM 也仍然成立），所以**多加聚合造不出缺陷**；
- *        真正会改坏它的是**方向**：`MIN(received_at)` 或 `MAX(from_name)` 都会静默返回错误的姓名
- *        —— 变异验证里的 M2a / M2b 分别锁这两种写法；
- *     3) 自己的收件信箱（`mailbox` 列）**也要**进联系人（2026-10-03 用户决定）。该列里既有
- *        「我自己的身份」，也可能有**同事/团队的地址**（账号给 `zhanglili@` 配了收信），
- *        早期版本按 `DISTINCT mailbox` 全排除 → 同事地址在联想里**静默消失**（用户报障）。
- *        C4 现在锁「自己的信箱**必须出现**」，并用「没有姓名往来 → name 为 null」作负控制。
- *   这三条都只能靠**真实 SQL 引擎**跑出结果来验证，桩不出来。
+ * Why this deserves its own suite:
+ *   Contact aggregation relies on three SQL semantics that are **easy to get wrong without erroring**:
+ *     1) `json_each('')` / any invalid JSON **directly throws `malformed JSON`**, and the checks in `WHERE`
+ *        **cannot stop it** (table-valued functions are evaluated during JOIN, before WHERE) -- a mistake means a 500 from the endpoint;
+ *     2) "take the latest name for that address" relies on SQLite's rule of "bare column taken from the same row as min()/max()". In testing (3.51.2)
+ *        this rule is looser than the docs (adding a COUNT(*)/SUM still holds), so **adding more aggregates does not create a defect**;
+ *        what actually breaks it is **direction**: `MIN(received_at)` or `MAX(from_name)` both silently return the wrong name
+ *        -- mutation-test cases M2a / M2b lock down those two forms respectively;
+ *     3) one's own receiving mailboxes (the `mailbox` column) must **also** go into contacts (user decision 2026-10-03). That column holds both
+ *        "my own identity" and possibly **colleague/team addresses** (the account configured erin@ to receive mail);
+ *        an early version excluded them all via `DISTINCT mailbox` -> colleague addresses **silently disappeared** from suggestions (user report).
+ *        C4 now locks down "one's own mailbox **must appear**", and uses "no name correspondence -> name is null" as a negative control.
+ *   All three can only be verified by running the **real SQL engine**; they cannot be stubbed.
  *
- * 退出码：0 = 全部通过；1 = 存在失败。
+ * Exit codes: 0 = all pass; 1 = failures.
  * ===========================================================================*/
 
 const fs = require('fs');
@@ -40,8 +40,8 @@ try {
 }
 
 const ROOT = path.join(__dirname, '..');
-// QA_REPO_TS 仅用于「变异验证」：指向一份人工构造的 repo.ts 变体（放仓库外），
-// 确认本测试确实能抓到缺陷。缺了这个钩子，变异脚本会「跑仓库原文件却以为跑的是变体」。
+// QA_REPO_TS is only for "mutation verification": point it at a hand-crafted repo.ts variant (outside the repo),
+// to confirm this test really catches the defect. Without the hook, the mutation script would "run the repo's original file while thinking it is the variant".
 const REPO_TS = process.env.QA_REPO_TS || path.join(ROOT, 'src', 'repo.ts');
 const WORK_DIR = path.join(os.tmpdir(), `contacts-qa-build-${process.pid}`);
 const SRC_COPY = path.join(WORK_DIR, 'src');
@@ -49,12 +49,12 @@ const BUILD_DIR = path.join(WORK_DIR, 'out');
 const REPO_MD5 = crypto.createHash('md5').update(fs.readFileSync(REPO_TS)).digest('hex');
 
 /* ---------------------------------------------------------------------------
- * 清理临时目录
+ * Clean up the temp dir
  *
- * WORK_DIR/node_modules 是指向**仓库 node_modules** 的 junction。实测
- * fs.rmSync(WORK_DIR, {recursive:true}) 不会穿透 junction 删目标（2026-10-03 探针验证），
- * 但删除顺序一旦出错就是「把仓库依赖删掉」这种不可逆事故，所以这里显式先卸载链接
- * 再删目录 —— 代价只有几行，收益是即使未来 Node 行为变化也不会炸仓库。
+ * WORK_DIR/node_modules is a junction pointing at the **repo node_modules**. In testing
+ * fs.rmSync(WORK_DIR, {recursive:true}) does not follow the junction to delete the target (probe-verified 2026-10-03),
+ * but if the deletion order ever goes wrong it is an irreversible "delete the repo dependencies" accident, so here we explicitly
+ * unmount the link first and then delete the dir -- costs only a few lines, and the benefit is that no repo breakage occurs even if Node's behavior changes in the future.
  * -------------------------------------------------------------------------*/
 function cleanup() {
   const link = path.join(WORK_DIR, 'node_modules');
@@ -65,22 +65,22 @@ function cleanup() {
 }
 
 /* ---------------------------------------------------------------------------
- * 1) 把整份 src/ 复制到仓库外（变体覆盖 repo.ts）后编译，拿到真实的 repo.contacts()
+ * 1) Copy the whole src/ outside the repo (variant overrides repo.ts) then compile, to get the real repo.contacts()
  *
- * 为什么复制而不是直接编译仓库里的 src/：
- *   QA_REPO_TS 的变体在仓库外，而 tsc 需要一份完整的 src/ 才能编译；
- *   复制一份再覆盖，就能在**完全不改动仓库**的前提下编译任意变体。
- *   临时 tsconfig 由仓库 tsconfig 改写而来（只换 noEmit/module/outDir/rootDir + files），
- *   避免手抄 compilerOptions 造成与仓库配置漂移。
+ * Why copy instead of compiling the repo's src/ directly:
+ *   The QA_REPO_TS variant lives outside the repo, and tsc needs a complete src/ to compile;
+ *   copy once then overwrite, and any variant can be compiled **without modifying the repo at all**.
+ *   The temp tsconfig is derived from the repo tsconfig (only swapping noEmit/module/outDir/rootDir + files),
+ *   avoiding config drift from hand-copying compilerOptions.
  *
- * ⚠️ 两个必须的配套（少了任何一个都会编译失败，且失败信息看起来与变体无关）：
- *   a) 临时目录在 os.tmpdir() 下，类型解析（types: ['@cloudflare/workers-types']）
- *      以及编译产物的裸模块解析都要靠 node_modules —— 必须在**编译之前**把
- *      WORK_DIR/node_modules 链接到仓库 node_modules，否则报
- *      TS2688 Cannot find type definition file for '@cloudflare/workers-types'；
- *   b) module 改成 commonjs 后**不要**顺手去动 moduleResolution：
- *      本机 tsc 是 TypeScript 7，`node10` 已被移除（TS5108），而仓库的 'bundler'
- *      与 commonjs 的组合是被接受的（mail-merge.backend.test.js 正是这么跑的）。
+ * ⚠️ Two required companions (missing either one makes compilation fail, and the failure message looks unrelated to the variant):
+ *   a) The temp dir is under os.tmpdir(), so type resolution (types: ['@cloudflare/workers-types'])
+ *      and bare-module resolution of the build output both depend on node_modules -- WORK_DIR/node_modules must be
+ *      linked to the repo's node_modules **before compiling**, otherwise it reports
+ *      TS2688 Cannot find type definition file for '@cloudflare/workers-types';
+ *   b) After switching module to commonjs, do **not** casually touch moduleResolution:
+ *      tsc here is TypeScript 7, `node10` has been removed (TS5108), and the repo's combination of 'bundler'
+ *      with commonjs is accepted (mail-merge.backend.test.js runs exactly this way).
  * -------------------------------------------------------------------------*/
 function build() {
   const tsc = path.join(ROOT, 'node_modules', 'typescript', 'bin', 'tsc');
@@ -88,7 +88,7 @@ function build() {
   fs.rmSync(WORK_DIR, { recursive: true, force: true });
   fs.mkdirSync(SRC_COPY, { recursive: true });
 
-  // (b) 先于编译建立 node_modules 链接（types 解析 + 产物裸模块解析都靠它）
+  // (b) establish the node_modules link before compiling (both types resolution + bare-module resolution of the output rely on it)
   try {
     fs.symlinkSync(path.join(ROOT, 'node_modules'), path.join(WORK_DIR, 'node_modules'), 'junction');
   } catch (e) {
@@ -98,7 +98,7 @@ function build() {
   for (const f of fs.readdirSync(path.join(ROOT, 'src'))) {
     if (f.endsWith('.ts')) fs.copyFileSync(path.join(ROOT, 'src', f), path.join(SRC_COPY, f));
   }
-  // 变体覆盖（同目录同名 -> 直接替换掉复制过来的那份）
+  // variant override (same dir, same name -> directly replace the copied one)
   fs.copyFileSync(REPO_TS, path.join(SRC_COPY, 'repo.ts'));
 
   const cfg = JSON.parse(fs.readFileSync(path.join(ROOT, 'tsconfig.json'), 'utf8'));
@@ -107,7 +107,7 @@ function build() {
   cfg.files = fs.readdirSync(SRC_COPY).filter((f) => f.endsWith('.ts')).map((f) => path.join(SRC_COPY, f));
   cfg.compilerOptions = Object.assign({}, cfg.compilerOptions, {
     noEmit: false,
-    module: 'commonjs', // moduleResolution 保持仓库的 'bundler'（见上方 b 注释）
+    module: 'commonjs', // moduleResolution keeps the repo's 'bundler' (see note b above)
     outDir: BUILD_DIR,
     rootDir: SRC_COPY,
   });
@@ -122,7 +122,7 @@ function build() {
 }
 
 /* ---------------------------------------------------------------------------
- * 2) 用 schema.sql 的真实 DDL 建库，并把 D1 接口最小适配到 node:sqlite
+ * 2) Create the DB with schema.sql's real DDL, and minimally adapt the D1 interface to node:sqlite
  * -------------------------------------------------------------------------*/
 function makeEnv() {
   const db = new DatabaseSync(':memory:');
@@ -154,14 +154,14 @@ function makeEnv() {
         async dump() { return new ArrayBuffer(0); },
       },
       BUCKET: { async put() { return {}; }, async get() { return null; }, async delete() { return {}; }, async list() { return { objects: [] }; } },
-      SEND_FROM_ADDRESS: 'support@notionmanager.com',
+      SEND_FROM_ADDRESS: 'support@example.com',
       SEND_FROM_NAME: 'support',
     },
   };
 }
 
 /* ---------------------------------------------------------------------------
- * 3) 用例运行器
+ * 3) Test runner
  * -------------------------------------------------------------------------*/
 const results = [];
 let currentTest = '(init)';
@@ -184,7 +184,7 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
 
   const { db, env } = makeEnv();
 
-  // 用**真实** saveInbound / saveOutbound 灌数据，而不是手写 INSERT
+  // seed data with the **real** saveInbound / saveOutbound, not hand-written INSERTs
   const inbound = (o) =>
     repo.saveInbound(env, Object.assign({
       rowId: o.rowId, resendId: o.resendId, messageId: null, inReplyTo: null, references: null,
@@ -201,7 +201,7 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
       resendId: o.resendId, receivedAt: o.receivedAt,
     });
 
-  /* ---- C1 聚合来源：入站 from_email + 出站 to/cc ---- */
+  /* ---- C1 aggregation sources: inbound from_email + outbound to/cc ---- */
   section('C1 地址来源：入站 from_email + 出站 to_emails / cc');
   await inbound({ rowId: 'm1', resendId: 'r1', mailbox: 'inbox@me.com', fromName: 'Lili Wang', fromEmail: 'lili@partner.com', to: ['inbox@me.com'], receivedAt: 100 });
   await outbound({ mailbox: 'inbox@me.com', to: ['lili@partner.com'], receivedAt: 200, resendId: 'r2' });
@@ -216,7 +216,7 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
   ok(emails.includes('lili@partner.com') && emails.includes('boss@x.com') && emails.includes('anon@x.com'),
     '入站发件人 / 出站 to / 出站 cc 三种来源都进来了', JSON.stringify(emails));
 
-  /* ---- C2 ⭐ 姓名取「最新一封**带姓名**的邮件」，出站的无姓名不能把姓名冲掉 ---- */
+  /* ---- C2 ⭐ name taken from the "latest email **with a name**"; a nameless outbound email must not clobber the name ---- */
   section('C2 ⭐ 姓名取最新一封「带姓名」的邮件（出站邮件的 NULL 姓名不得覆盖）');
   const lili = list.find((c) => c.email === 'lili@partner.com');
   ok(!!lili, 'lili@partner.com 在列表里（否则下面的断言空转）', JSON.stringify(lili));
@@ -226,27 +226,27 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
   const anon = list.find((c) => c.email === 'anon@x.com');
   ok(anon && anon.name === null, '从来没有姓名往来的地址 name 为 null（不编造）', anon && JSON.stringify(anon.name));
 
-  /* ---- C3 计数与排序 ---- */
+  /* ---- C3 counts and ordering ---- */
   section('C3 往来次数与排序');
   ok(lili && lili.count === 3, 'lili 往来 3 次（m1 from + m2 to + m3 from）', lili && lili.count);
   ok(anon && anon.count === 2, 'anon 往来 2 次（m4 from + m5 cc）', anon && anon.count);
   ok(JSON.stringify(emails) === JSON.stringify(['inbox@me.com', 'lili@partner.com', 'anon@x.com', 'boss@x.com', 'billing@me.com']),
     '按次数降序，同次数按邮箱升序', JSON.stringify(emails));
 
-  /* ---- C4 ⭐ 自己的收件信箱也要能联想（2026-10-03 行为变更）---- */
+  /* ---- C4 ⭐ one's own receiving mailboxes should also be suggestible (behavior change 2026-10-03)---- */
   section('C4 ⭐ 自己的收件信箱也进联想（用户明确要求「也可以给自己发」）');
   ok(emails.includes('inbox@me.com'), 'inbox@me.com 是自己的收件信箱 -> 仍然出现在联系人里', JSON.stringify(emails));
   ok(emails.includes('billing@me.com'), 'billing@me.com 同理不再被排除', JSON.stringify(emails));
-  // 负控制：自己的信箱只是因为「有过往来」才进来，不能凭空给它编个姓名（它从来没有过 from_name）
+  // negative control: one's own mailbox only comes in because "there was correspondence", it must not be given an invented name (it never had from_name)
   const inbox = list.find((c) => c.email === 'inbox@me.com');
   ok(inbox && inbox.name === null, '自己的信箱没有姓名往来 -> name 为 null（不编造）', inbox && JSON.stringify(inbox.name));
 
-  /* ---- C5 ⭐ 负控制：json_each(NULL) 不得造出幽灵空地址 ---- */
+  /* ---- C5 ⭐ negative control: json_each(NULL) must not produce ghost empty addresses ---- */
   section('C5 ⭐ 负控制：不得出现空地址（json_each(NULL) 返回 1 行 value=NULL）');
   ok(emails.every((e) => typeof e === 'string' && e.trim() !== ''), '没有空串 / 纯空白地址', JSON.stringify(emails));
   ok(emails.length === 5, '总数没被幽灵行撑大', emails.length);
 
-  /* ---- C6 大小写合并 + limit ---- */
+  /* ---- C6 case-insensitive merge + limit ---- */
   section('C6 大小写合并为一个联系人；limit 生效');
   ok(emails.filter((e) => e === 'lili@partner.com').length === 1,
     'LILI@partner.com 与 lili@partner.com 合并成一个小写地址（不重复出现）', JSON.stringify(emails));
@@ -255,19 +255,19 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
   ok(JSON.stringify(two.map((c) => c.email)) === JSON.stringify(['inbox@me.com', 'lili@partner.com']),
     'limit 截取的是排序后的前 2 条', JSON.stringify(two.map((c) => c.email)));
 
-  /* ---- C7 ⭐ 脏数据容错：非法 JSON 列不得让接口 500 ---- */
+  /* ---- C7 ⭐ dirty-data tolerance: invalid JSON columns must not make the endpoint 500 ---- */
   section('C7 ⭐ 脏数据容错：to_emails/cc 是空串或 NULL 时不得抛 malformed JSON');
-  // 真实成因：cc 列可空且无默认值，历史行/部分写入会留下 '' 或 NULL。
-  // json_each('') 会**直接抛 malformed JSON**，且 WHERE 拦不住（表值函数在 JOIN 阶段求值），
-  // 后果是整个 /api/contacts 返回 500 —— 前端联想功能整体不可用。
+  // real cause: the cc column is nullable with no default, so historical rows / partial writes leave '' or NULL.
+  // json_each('') **directly throws malformed JSON**, and WHERE cannot stop it (table-valued functions are evaluated during JOIN),
+  // the consequence being that the whole /api/contacts returns 500 -- the entire frontend suggestion feature is unusable.
   const ins = (id, to, cc, receivedAt) =>
     db.prepare(
       `INSERT INTO messages (id, direction, mailbox, from_name, from_email, to_emails, cc,
          subject, body_text, received_at, status, read, starred, deleted, created_at, updated_at)
        VALUES (?, 'inbound', 'inbox@me.com', NULL, 'dirty@x.com', ?, ?, 's', 't', ?, 'received', 0, 0, 0, ?, ?)`
     ).run(id, to, cc, receivedAt, receivedAt, receivedAt);
-  ins('dirty1', '', '', 600);        // 两列都是空串（非法 JSON）
-  ins('dirty2', '[]', null, 610);    // to_emails 合法但 cc 是 NULL
+  ins('dirty1', '', '', 600);        // both columns are empty strings (invalid JSON)
+  ins('dirty2', '[]', null, 610);    // to_emails valid but cc is NULL
 
   let dirty = null;
   let threw = null;
@@ -285,7 +285,7 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
     '脏行的空串 to_emails/cc 没有变成空地址联系人', JSON.stringify(dirtyEmails));
   ok(!dirtyEmails.includes('null'), 'NULL 列没有被拼成字符串 "null"', JSON.stringify(dirtyEmails));
 
-  /* ---- 汇总 ---- */
+  /* ---- summary ---- */
   console.log('\n================ 失败用例清单 ================');
   const failed = results.filter((r) => !r.ok);
   if (!failed.length) console.log('（无）');

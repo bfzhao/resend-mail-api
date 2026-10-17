@@ -1,11 +1,11 @@
 'use strict';
 
 /* =============================================================================
- * 列表按 thread 聚合回归验证 —— 真实 SQLite 当 D1 + 真实 src/ 编译产物
+ * List groups by thread regression -- real SQLite as D1 + real compiled src/ artifacts
  *
- * 运行：
+ * Run:
  *   node test/thread-list.backend.test.js
- * 退出码：0 = 全部通过；1 = 存在失败；2 = 环境缺失。
+ * Exit codes: 0 = all pass; 1 = failures; 2 = missing environment.
  * ===========================================================================*/
 
 const fs = require('fs');
@@ -14,9 +14,9 @@ const path = require('path');
 const crypto = require('crypto');
 const cp = require('child_process');
 
-// tsc 垫片（Win32 bcrypt.dll 绕法 + 沙箱 spawn 绕法）
-// 必须在解构 spawnSync 之前加载，因为垫片 monkey-patch cp.spawnSync
-const TSC_SHIM = 'C:/Users/Bingfeng/AppData/Local/Temp/mm-tsc-shim.js';
+// tsc shim (Win32 bcrypt.dll workaround + sandbox spawn workaround)
+// must be loaded before destructuring spawnSync, because the shim monkey-patches cp.spawnSync
+const TSC_SHIM = process.env.TSC_SHIM || path.join(os.tmpdir(), 'mm-tsc-shim.js');
 if (fs.existsSync(TSC_SHIM)) require(TSC_SHIM);
 
 const { spawnSync } = cp;
@@ -31,7 +31,7 @@ try {
 
 const ROOT = path.join(__dirname, '..');
 
-/* ---- 编译 repo.ts（复用 thread-grouping 的构建模式） ---- */
+/* ---- compile repo.ts (reusing thread-grouping's build pattern) ---- */
 const WORK_DIR = path.join(os.tmpdir(), `thread-list-qa-${process.pid}`);
 const SRC_COPY = path.join(WORK_DIR, 'src');
 const BUILD_DIR = path.join(WORK_DIR, 'out');
@@ -85,7 +85,7 @@ function cleanup() {
 const BUILD = build();
 const repo = require(path.join(BUILD, 'repo.js'));
 
-/* ---- 辅助 ---- */
+/* ---- helpers ---- */
 function ok(cond, msg, extra) {
   if (!cond) {
     const info = extra !== undefined ? ` (得到: ${JSON.stringify(extra)})` : '';
@@ -130,10 +130,10 @@ function seedMessages(db, rows) {
   }
 }
 
-/* ---- 跑测试 ---- */
+/* ---- run tests ---- */
 const db = new DatabaseSync(':memory:');
 
-// 建表（简化版，只含 listFolder 需要的列）
+// create tables (simplified, only the columns listFolder needs)
 db.exec(`CREATE TABLE messages (
   id TEXT PRIMARY KEY,
   direction TEXT,
@@ -165,7 +165,7 @@ function run(name, fn) {
 
 const t0 = nowSec();
 
-/* T1 同 thread 3 封邮件只显示 1 行 */
+/* T1 three emails in the same thread show up as only 1 row */
 run('T1 同 thread 聚合为 1 行', async () => {
   db.exec('DELETE FROM messages');
   seedMessages(db, [
@@ -182,7 +182,7 @@ run('T1 同 thread 聚合为 1 行', async () => {
   ok(res.items[0].read === 0, '最新一封 a3 是未读的', res.items[0].read);
 });
 
-/* T2 两个独立 thread 各 2 封 */
+/* T2 two independent threads each with 2 emails */
 run('T2 两个 thread 返回 2 行', async () => {
   db.exec('DELETE FROM messages');
   seedMessages(db, [
@@ -194,13 +194,13 @@ run('T2 两个 thread 返回 2 行', async () => {
   const res = await repo.listFolder(env, { folder: 'inbox', limit: 20, offset: 0 });
   ok(res.items.length === 2, '返回 2 行', res.items.length);
   ok(res.total === 2, 'total = 2', res.total);
-  // 按 received_at DESC，t3 的最新一封 c2 时间更晚，应在前面
+  // ordered by received_at DESC, t3's newest email c2 is later, so it should come first
   ok(res.items[0].id === 'c2', '第一行是 c2（t3 最新）', res.items[0].id);
   ok(res.items[0].thread_count === 2, 't3 有 2 封', res.items[0].thread_count);
   ok(res.items[1].thread_count === 2, 't2 有 2 封', res.items[1].thread_count);
 });
 
-/* T3 无 thread_id 的行各自独立 */
+/* T3 rows without thread_id are each independent */
 run('T3 无 thread_id 每行独立', async () => {
   db.exec('DELETE FROM messages');
   seedMessages(db, [
@@ -214,7 +214,7 @@ run('T3 无 thread_id 每行独立', async () => {
   ok(res.items[1].thread_count === 1, 'd1 thread_count = 1', res.items[1].thread_count);
 });
 
-/* T4 混合：有 thread_id 的聚合 + 无 thread_id 的独立 */
+/* T4 mixed: aggregation for rows with thread_id + independence for rows without */
 run('T4 混合场景', async () => {
   db.exec('DELETE FROM messages');
   seedMessages(db, [
@@ -233,7 +233,7 @@ run('T4 混合场景', async () => {
   ok(st.thread_count === 1, 'f1 thread_count = 1', st.thread_count);
 });
 
-/* T5 只看未读：thread 里有未读就显示，取最新一封（即使最新一封是已读的） */
+/* T5 unread-only: show if the thread has any unread, take the newest (even if the newest is read) */
 run('T5 只看未读筛选', async () => {
   db.exec('DELETE FROM messages');
   seedMessages(db, [
@@ -248,7 +248,7 @@ run('T5 只看未读筛选', async () => {
   ok(res.items[0].thread_unread === 1, 'thread_unread = 1', res.items[0].thread_unread);
 });
 
-/* T6 全部已读时 unread=true 返回空 */
+/* T6 when everything is read, unread=true returns empty */
 run('T6 全部已读时未读筛选为空', async () => {
   db.exec('DELETE FROM messages');
   seedMessages(db, [
@@ -260,7 +260,7 @@ run('T6 全部已读时未读筛选为空', async () => {
   ok(res.total === 0, 'total = 0', res.total);
 });
 
-/* T7 分页 */
+/* T7 pagination */
 run('T7 分页', async () => {
   db.exec('DELETE FROM messages');
   seedMessages(db, [
@@ -275,7 +275,7 @@ run('T7 分页', async () => {
   ok(r2.items.length === 1, '第 2 页 1 行', r2.items.length);
 });
 
-/* T8 搜索不破坏聚合 */
+/* T8 search does not break aggregation */
 run('T8 搜索不破坏聚合', async () => {
   db.exec('DELETE FROM messages');
   seedMessages(db, [
@@ -287,7 +287,7 @@ run('T8 搜索不破坏聚合', async () => {
   ok(res.items[0].thread_count === 2, 'thread_count = 2', res.items[0].thread_count);
 });
 
-/* T9 已发送也聚合 */
+/* T9 sent folder aggregates too */
 run('T9 已发送文件夹也聚合', async () => {
   db.exec('DELETE FROM messages');
   seedMessages(db, [
@@ -299,15 +299,15 @@ run('T9 已发送文件夹也聚合', async () => {
   ok(res.items[0].thread_count === 2, 'thread_count = 2', res.items[0].thread_count);
 });
 
-/* T10 thread_count 与会话面板口径一致（折叠回环副本） */
+/* T10 thread_count matches the conversation panel's convention (folding loopback copies) */
 run('T10 徽标封数折叠回环副本后与面板一致', async () => {
   db.exec('DELETE FROM messages');
-  // 线上真实形态：我（bingfeng@）回信给 lara@ 并抄送本账号另一个信箱 zhanglili@，
-  // Resend 把同一封投递回 zhanglili@ → 库里留下「出站 + 入站回环副本」两条。
+  // real production shape: I (dana@) replied to frank@ and cc'd another mailbox of this account erin@,
+  // Resend delivers the same email back to erin@ -> two rows left in the DB: "outbound + inbound loopback copy".
   seedMessages(db, [
-    { id: 'p1', direction: 'inbound', mailbox: 'bingfeng@x.com', from_email: 'lara@x.com', to: ['bingfeng@x.com'], subject: 'Q', body_text: 'q', received_at: t0 - 300, read: 1, thread_id: 'tlp' },
-    { id: 'p2', direction: 'outbound', mailbox: 'bingfeng@x.com', from_email: 'bingfeng@x.com', to: ['lara@x.com'], cc: ['zhanglili@x.com'], subject: 'Re: Q', body_text: 'a', received_at: t0 - 200, read: 1, thread_id: 'tlp' },
-    { id: 'p3', direction: 'inbound', mailbox: 'zhanglili@x.com', from_email: 'bingfeng@x.com', to: ['lara@x.com'], cc: ['zhanglili@x.com'], subject: 'Re: Q', body_text: 'a', received_at: t0 - 199, read: 0, thread_id: 'tlp' },
+    { id: 'p1', direction: 'inbound', mailbox: 'dana@x.com', from_email: 'frank@x.com', to: ['dana@x.com'], subject: 'Q', body_text: 'q', received_at: t0 - 300, read: 1, thread_id: 'tlp' },
+    { id: 'p2', direction: 'outbound', mailbox: 'dana@x.com', from_email: 'dana@x.com', to: ['frank@x.com'], cc: ['erin@x.com'], subject: 'Re: Q', body_text: 'a', received_at: t0 - 200, read: 1, thread_id: 'tlp' },
+    { id: 'p3', direction: 'inbound', mailbox: 'erin@x.com', from_email: 'dana@x.com', to: ['frank@x.com'], cc: ['erin@x.com'], subject: 'Re: Q', body_text: 'a', received_at: t0 - 199, read: 0, thread_id: 'tlp' },
   ]);
   const res = await repo.listFolder(env, { folder: 'inbox', limit: 20, offset: 0 });
   ok(res.items.length === 1, 'tlp 聚合为 1 行', res.items.length);
@@ -317,18 +317,18 @@ run('T10 徽标封数折叠回环副本后与面板一致', async () => {
   ok(res.items[0].thread_count !== 3,
     '负控制：不能是原始行数 3（旧实现会返回 3，正是用户报的「左 3 右 2」）', res.items[0].thread_count);
 
-  // 负控制：无回环副本的普通多封会话不得被改动
+  // negative control: an ordinary multi-email thread with no loopback copy must not be altered
   seedMessages(db, [
-    { id: 'q1', direction: 'inbound', mailbox: 'bingfeng@x.com', from_email: 'bob@x.com', to: ['bingfeng@x.com'], subject: 'N', body_text: 'n', received_at: t0 - 500, read: 1, thread_id: 'tln' },
-    { id: 'q2', direction: 'outbound', mailbox: 'bingfeng@x.com', from_email: 'bingfeng@x.com', to: ['bob@x.com'], subject: 'Re: N', body_text: 'r', received_at: t0 - 400, read: 1, thread_id: 'tln' },
-    { id: 'q3', direction: 'inbound', mailbox: 'bingfeng@x.com', from_email: 'bob@x.com', to: ['bingfeng@x.com'], subject: 'Re: Re: N', body_text: 'r', received_at: t0 - 100, read: 0, thread_id: 'tln' },
+    { id: 'q1', direction: 'inbound', mailbox: 'dana@x.com', from_email: 'bob@x.com', to: ['dana@x.com'], subject: 'N', body_text: 'n', received_at: t0 - 500, read: 1, thread_id: 'tln' },
+    { id: 'q2', direction: 'outbound', mailbox: 'dana@x.com', from_email: 'dana@x.com', to: ['bob@x.com'], subject: 'Re: N', body_text: 'r', received_at: t0 - 400, read: 1, thread_id: 'tln' },
+    { id: 'q3', direction: 'inbound', mailbox: 'dana@x.com', from_email: 'bob@x.com', to: ['dana@x.com'], subject: 'Re: Re: N', body_text: 'r', received_at: t0 - 100, read: 0, thread_id: 'tln' },
   ]);
   const res2 = await repo.listFolder(env, { folder: 'inbox', limit: 20, offset: 0 });
   const tln = res2.items.find((i) => i.id === 'q3');
   ok(tln && tln.thread_count === 3, '普通 3 封会话原样保留 thread_count = 3', tln && tln.thread_count);
 });
 
-/* 汇总 */
+/* summary */
 (async () => {
   for (const t of tests) {
     try {

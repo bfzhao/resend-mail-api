@@ -1,3 +1,3 @@
--- 出站发信额度统计（/api/usage 的 resend.day / resend.month）：按 received_at 统计「经本服务发出」
--- （resend_id 非空）的封数。走这个偏索引可避免全表扫描。见 src/repo.ts 的 resendUsage。
+-- Outbound send quota statistics (/api/usage's resend.day / resend.month): counts by received_at the number of messages "sent through this service"
+-- (resend_id non-null). This partial index avoids a full-table scan. See resendUsage in src/repo.ts.
 CREATE INDEX IF NOT EXISTS idx_messages_outbound_sent ON messages(received_at) WHERE direction='outbound' AND resend_id IS NOT NULL;

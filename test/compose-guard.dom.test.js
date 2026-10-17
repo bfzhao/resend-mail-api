@@ -1,19 +1,22 @@
 'use strict';
 
 /* =============================================================================
- * 独立验证：写信弹窗「关窗守卫」（真实 jsdom + 真实 DOM 事件派发）
+ * Standalone verification: compose window "close guard" (real jsdom + real DOM event dispatch)
  *
- * 语义已于本轮从「弹『是否放弃』确认框」改为「自动存草稿后直接关闭」：
- * 遮罩空白区 / 取消按钮 / Esc 三个入口都走「落草稿 → 关窗」，
- * 唯一仍然拦住的情况是「正在发送」（那时关窗会让用户以为没发出去）。
- * 因此本套件的核心断言是：**任何关窗路径都不得弹出确认框**（confirmShown 恒为 false）。
+ * The semantics were changed this round from "show a 'discard?' confirm dialog" to
+ * "auto-save draft then close directly": the mask blank area / cancel button / Esc
+ * all go through "save draft -> close window"; the only case still blocked is
+ * "sending in progress" (closing then would make the user think it wasn't sent).
+ * So the core assertion of this suite is: **no close path may pop a confirm dialog**
+ * (confirmShown is always false).
  *
- * 运行：
- *   NODE_PATH=C:\Users\Bingfeng\.workbuddy-ai\binaries\node\workspace\node_modules \
+ * Run:
+ *   NODE_PATH=<NODE_PATH> \
  *     <node.exe> test/compose-guard.dom.test.js
  *
- * 退出码：0 = 全部通过；1 = 存在失败。
- * 本文件不修改 public/ 下任何源码，只读 index.html + app.js 并在 jsdom 中执行。
+ * Exit code: 0 = all passed; 1 = some failed.
+ * This file does not modify any source under public/; it only reads index.html + app.js
+ * and executes them in jsdom.
  * ===========================================================================*/
 
 const fs = require('fs');
@@ -22,11 +25,11 @@ const crypto = require('crypto');
 const { JSDOM } = require('jsdom');
 
 const ROOT = path.join(__dirname, '..');
-// QA_APP_JS 仅用于「变异验证」：指向一份人工构造的缺陷版 app.js，确认本测试确实能抓到缺陷。
-// 没有这个钩子时，变异脚本会「跑的是仓库原文件却以为跑的是变体」→ 变体恒不被抓（假阴性）。
+// QA_APP_JS is only for "mutation verification": points to a hand-crafted defective app.js, confirming this test really catches the defect.
+// Without this hook, the mutation script would "run the repo's original file while thinking it ran the variant" -> the variant is never caught (false negative).
 const APP_JS_PATH = process.env.QA_APP_JS || path.join(ROOT, 'public', 'app.js');
-// QA_INDEX_HTML 仅用于「变异验证」：指向一份人工构造的缺陷版 index.html（变体放仓库外）。
-// 缺了这个钩子，HTML 变体会「跑仓库原文件却以为跑的是变体」→ 变体恒不被抓（假阴性）。
+// QA_INDEX_HTML is only for "mutation verification": points to a hand-crafted defective index.html (the variant lives outside the repo).
+// Without this hook, the HTML variant would "run the repo's original file while thinking it ran the variant" -> the variant is never caught (false negative).
 const INDEX_PATH = process.env.QA_INDEX_HTML || path.join(ROOT, 'public', 'index.html');
 const APP_CSS_PATH = path.join(ROOT, 'public', 'app.css');
 const APP_JS = fs.readFileSync(APP_JS_PATH, 'utf8');
@@ -41,7 +44,7 @@ const FINGERPRINT = {
 };
 
 /* ---------------------------------------------------------------------------
- * fetch 打桩：只在注入 app.js 之前安装到 window，避免 init() 抛错
+ * fetch stub: installed on window only before injecting app.js, so init() doesn't throw
  * -------------------------------------------------------------------------*/
 
 function makeFetchStub(opts = {}) {
@@ -71,7 +74,7 @@ function makeFetchStub(opts = {}) {
     }
     if (url.startsWith('/api/folders/')) return Promise.resolve(jsonRes({ items: [], total: 0 }));
     if (url.startsWith('/api/messages') && method === 'POST') {
-      // 发送请求：挂起，由测试决定何时成功 / 失败
+      // Send request: held pending; the test decides when it succeeds / fails
       return new Promise((resolve) => { pendingSend = { resolve, url }; });
     }
     if (url.startsWith('/api/messages')) return Promise.resolve(jsonRes({ message: null, items: [], total: 0 }));
@@ -93,7 +96,7 @@ function makeFetchStub(opts = {}) {
 }
 
 /* ---------------------------------------------------------------------------
- * 启动一个「已跑完 init()」的应用实例
+ * Boot an application instance that has finished running init()
  * -------------------------------------------------------------------------*/
 
 const tick = (win) => new Promise((r) => win.setTimeout(r, 0));
@@ -103,13 +106,13 @@ async function boot(bootOpts = {}) {
   const dom = new JSDOM(INDEX_HTML, { runScripts: 'dangerously', url: 'http://localhost/' });
   const win = dom.window;
   const stub = makeFetchStub(bootOpts);
-  win.fetch = stub.fetchImpl; // 必须在注入 app.js 之前
+  win.fetch = stub.fetchImpl; // must be before injecting app.js
 
   const script = win.document.createElement('script');
   script.textContent = APP_JS;
   win.document.body.appendChild(script);
 
-  // renderNav() 在 setupEvents() 前一行同步执行 -> 有子节点即代表 setupEvents 已跑完
+  // renderNav() runs synchronously one line before setupEvents() -> having child nodes means setupEvents has finished
   let ready = false;
   for (let i = 0; i < 400; i++) {
     const nav = win.document.querySelector('#folder-nav');
@@ -126,16 +129,16 @@ async function boot(bootOpts = {}) {
 }
 
 /* ---------------------------------------------------------------------------
- * 事件 / 断言辅助
+ * Event / assertion helpers
  * -------------------------------------------------------------------------*/
 
 const clickEvt = (win) => new win.MouseEvent('click', { bubbles: true, cancelable: true });
 
 function el(ctx, sel) { return ctx.doc.querySelector(sel); }
 function clickEl(ctx, sel) { el(ctx, sel).dispatchEvent(clickEvt(ctx.win)); }
-/** 点在遮罩空白区：target === currentTarget */
+/** Click the mask blank area: target === currentTarget */
 function clickMaskBlank(ctx) { el(ctx, '#modal-mask').dispatchEvent(clickEvt(ctx.win)); }
-/** 点弹窗内部：从子元素冒泡到遮罩（target !== currentTarget） */
+/** Click inside the composer: bubbles from a child to the mask (target !== currentTarget) */
 function clickComposerInside(ctx) { el(ctx, '#composer').dispatchEvent(clickEvt(ctx.win)); }
 
 function pressEsc(ctx, targetSel) {
@@ -160,7 +163,7 @@ const sendFlag = (ctx) => evalIn(ctx, 'sendInFlight');
 const confirmBoxCount = (ctx) => ctx.doc.querySelectorAll('#confirm-box').length;
 const confirmMaskCount = (ctx) => ctx.doc.querySelectorAll('#confirm-mask').length;
 
-/** 最近一次草稿写请求（PUT / DELETE /api/drafts/...）；没有则 null。 */
+/** Most recent draft write request (PUT / DELETE /api/drafts/...); null if none. */
 function lastDraftCall(ctx) {
   const hits = ctx.stub.calls.filter((c) => c.url.startsWith('/api/drafts/'));
   return hits.length ? hits[hits.length - 1] : null;
@@ -201,7 +204,7 @@ async function addAttachment(ctx, name = 'a.txt', content = 'hello') {
   return { ok: n === 1, count: n, reason: n === 1 ? '' : `附件数量=${n}` };
 }
 
-/** 把写信弹窗切到 HTML 富文本模式 */
+/** Switch the compose window to HTML rich text mode */
 async function toRich(ctx) {
   clickEl(ctx, '#f-mode');
   await ticks(ctx.win, 2);
@@ -211,7 +214,7 @@ async function toRich(ctx) {
 }
 
 /* ---------------------------------------------------------------------------
- * 用例运行器
+ * Test case runner
  * -------------------------------------------------------------------------*/
 
 const results = [];
@@ -243,7 +246,7 @@ async function test(name, fn, bootOpts) {
 }
 
 /* ===========================================================================
- * 用例
+ * Test cases
  * ===========================================================================*/
 
 (async function main() {
@@ -251,7 +254,7 @@ async function test(name, fn, bootOpts) {
   console.log(`被测版本: md5=${FINGERPRINT.md5}  mtime=${FINGERPRINT.mtime}  bytes=${FINGERPRINT.bytes}`);
   console.log(`被测文件: ${FINGERPRINT.path}${process.env.QA_APP_JS ? '  ← QA_APP_JS 变异体' : ''}`);
 
-  /* ---- T0 环境自检 ---- */
+  /* ---- T0 environment self-check ---- */
   await test('T0 测试环境自检（harness 可信度）', async (ctx) => {
     ok(typeof ctx.win.openComposer === 'function', 'app.js 已注入且 openComposer 为全局函数');
     ok(el(ctx, '#folder-nav').children.length === 5, 'renderNav 已执行（folder-nav 有 5 项：收件箱/草稿/星标/已发送/已删除）', el(ctx, '#folder-nav').children.length);
@@ -264,7 +267,7 @@ async function test(name, fn, bootOpts) {
     info(`jsdom #f-body-rich.innerText = ${String(evalIn(ctx, 'typeof document.querySelector("#f-body-rich").innerText'))}`);
   });
 
-  /* ---- T1 无用户输入 -> 直接关闭，不弹确认 ---- */
+  /* ---- T1 no user input -> close directly, no confirm ---- */
   await test('T1 无输入：点遮罩空白区直接关闭', async (ctx) => {
     await openCompose(ctx);
     ok(composerOpen(ctx), '写信弹窗已打开');
@@ -303,7 +306,7 @@ async function test(name, fn, bootOpts) {
     ok(!confirmShown(ctx), '点 #composer 内部 -> 不弹确认框');
   });
 
-  /* ---- T2 有输入 -> 三入口都「存草稿并关闭」（不再弹确认） ---- */
+  /* ---- T2 has input -> all three entries "save draft and close" (no more confirm) ---- */
   const dirtyCases = [
     ['收件人', async (ctx) => setValue(ctx, '#f-to', 'a@b.com'), 'mask'],
     ['主题', async (ctx) => setValue(ctx, '#f-subject', 'hi'), 'cancel'],
@@ -318,7 +321,7 @@ async function test(name, fn, bootOpts) {
       await makeDirty(ctx);
       ok(evalIn(ctx, 'isComposerDirty()') === true, `脏检测：${label} 改动后 isComposerDirty()=true`);
       const draftId = evalIn(ctx, 'state.composing.draftId');
-      ctx.stub.calls.length = 0; // 只看本次关闭产生的请求
+      ctx.stub.calls.length = 0; // only look at the requests generated by this close
 
       if (entry === 'mask') clickMaskBlank(ctx);
       else if (entry === 'cancel') clickEl(ctx, '#composer-cancel');
@@ -350,7 +353,7 @@ async function test(name, fn, bootOpts) {
     const put = lastDraftCall(ctx);
     ok(put !== null && put.method === 'PUT', '发出了草稿写请求', put && put.method);
     let body = null;
-    try { body = JSON.parse(put.body); } catch { /* 交给下面的断言报错 */ }
+    try { body = JSON.parse(put.body); } catch { /* let the assertion below report the error */ }
     ok(body !== null && body.subject === '主题A', '主题随草稿保存');
     ok(body !== null && body.body === '正文B', '正文随草稿保存');
     ok(body !== null && body.to === 'a@b.com', '收件人随草稿保存');
@@ -370,7 +373,7 @@ async function test(name, fn, bootOpts) {
     ok(ctx.stub.calls.filter((c) => c.url.startsWith('/api/drafts/')).length === 0, '空表单 -> 一条草稿请求都不发', String(ctx.stub.calls.length));
   });
 
-  /* ---- T3 发送路径 ---- */
+  /* ---- T3 send path ---- */
   await test('T3a 发送成功 -> 直接关闭、不弹确认', async (ctx) => {
     await openCompose(ctx);
     setValue(ctx, '#f-to', 'a@b.com');
@@ -405,7 +408,7 @@ async function test(name, fn, bootOpts) {
     ok(toastText(ctx).includes('发送失败') && toastText(ctx).includes('boom'), '发送失败 toast 含原因', toastText(ctx));
     ok(sendFlag(ctx) === false, '发送失败 -> sendInFlight 已复位', String(sendFlag(ctx)));
 
-    // 失败后内容仍在：点外部 -> 存草稿并关闭（内容转存草稿，不静默丢弃）
+    // Content is still there after failure: click outside -> save draft and close (content carried into the draft, not silently dropped)
     const draftId = evalIn(ctx, 'state.composing.draftId');
     ctx.stub.calls.length = 0;
     clickMaskBlank(ctx);
@@ -414,7 +417,7 @@ async function test(name, fn, bootOpts) {
     await ticks(ctx.win, 3);
     const put = lastDraftCall(ctx);
     let db = null;
-    try { db = JSON.parse(put.body); } catch { /* 交给下面的断言报错 */ }
+    try { db = JSON.parse(put.body); } catch { /* let the assertion below report the error */ }
     ok(put !== null && put.method === 'PUT' && put.url === `/api/drafts/${draftId}`, '失败的内容写入打开时那个草稿 id', put && `${put.method} ${put.url}`);
     ok(db !== null && db.body === 'body', '草稿正文与失败前一致（内容未丢）', db && db.body);
   });
@@ -451,7 +454,7 @@ async function test(name, fn, bootOpts) {
     setValue(ctx, '#f-to', 'a@b.com');
     setValue(ctx, '#f-body', 'body');
     clickEl(ctx, '#composer-send');
-    clickMaskBlank(ctx); // 发送中被拦
+    clickMaskBlank(ctx); // blocked while sending
     ok(composerOpen(ctx), '发送中遮罩点击被拦下');
     ctx.stub.settleSend(500, { error: 'network' });
     await ticks(ctx.win, 20);
@@ -460,7 +463,7 @@ async function test(name, fn, bootOpts) {
     ok(evalIn(ctx, 'isComposerDirty()') === true, '失败后仍判脏');
   });
 
-  /* ---- T4 回复弹窗基线 ---- */
+  /* ---- T4 reply composer baseline ---- */
   await test('T4a 回复预填不算「写了一半」：点外部直接关闭、且不产生草稿', async (ctx) => {
     openReply(ctx);
     ok(composerOpen(ctx), '回复弹窗已打开');
@@ -491,7 +494,7 @@ async function test(name, fn, bootOpts) {
     const put = lastDraftCall(ctx);
     ok(put !== null && put.method === 'PUT', '引用内容已写入草稿', put && put.method);
     let body = null;
-    try { body = JSON.parse(put.body); } catch { /* 交给下面的断言报错 */ }
+    try { body = JSON.parse(put.body); } catch { /* let the assertion below report the error */ }
     ok(body !== null && String(body.body).includes('line1'), '草稿正文含引用内容');
     ok(body !== null && body.mode === 'reply', '草稿记录了「回复」模式');
   });
@@ -506,7 +509,7 @@ async function test(name, fn, bootOpts) {
     await ticks(ctx.win, 3);
     const put = lastDraftCall(ctx);
     let body = null;
-    try { body = JSON.parse(put.body); } catch { /* 交给下面的断言报错 */ }
+    try { body = JSON.parse(put.body); } catch { /* let the assertion below report the error */ }
     ok(body !== null && body.subject === 'Re: Hello!', '改过的主题随草稿保存');
   });
 
@@ -522,7 +525,7 @@ async function test(name, fn, bootOpts) {
     ok(lastDraftCall(ctx) !== null, '产生了草稿写请求');
   });
 
-  /* ---- T5 打开/关闭的状态重置 ---- */
+  /* ---- T5 open/close state reset ---- */
   await test('T5a 存草稿关闭后重开：状态全部复位、草稿 id 换新', async (ctx) => {
     await openCompose(ctx);
     const firstId = evalIn(ctx, 'state.composing.draftId');
@@ -547,14 +550,14 @@ async function test(name, fn, bootOpts) {
     setValue(ctx, '#f-subject', '草稿');
     clickMaskBlank(ctx);
     ok(!confirmShown(ctx), '关窗后确认框始终隐藏');
-    evalIn(ctx, 'openComposer()'); // 等价于再次点「写信」
+    evalIn(ctx, 'openComposer()'); // equivalent to clicking "compose" again
     ok(!confirmShown(ctx), 'openComposer 后确认框保持隐藏');
     ok(pendingFlag(ctx) === false, 'openComposer 后 pending=false');
     ok(evalIn(ctx, 'isComposerDirty()') === false, 'openComposer 后不脏（新基线）');
     ok(confirmMaskCount(ctx) === 1, '未产生重复确认框 DOM', confirmMaskCount(ctx));
   });
 
-  /* ---- T6 富文本 ---- */
+  /* ---- T6 rich text ---- */
   await test('T6a 仅切换富文本按钮不弄脏表单', async (ctx) => {
     await openCompose(ctx);
     await toRich(ctx);
@@ -602,7 +605,7 @@ async function test(name, fn, bootOpts) {
     ok(!confirmShown(ctx) && !composerOpen(ctx), '富文本有文字点外部 -> 存草稿并关闭');
   });
 
-  /* ---- T7 草稿自动保存（防抖）---- */
+  /* ---- T7 draft auto-save (debounced) ---- */
   const wait = (ctx, ms) => new Promise((r) => ctx.win.setTimeout(r, ms));
   const draftCalls = (ctx) => ctx.stub.calls.filter((c) => c.url.startsWith('/api/drafts/'));
 
@@ -617,7 +620,7 @@ async function test(name, fn, bootOpts) {
     const puts = draftCalls(ctx).filter((c) => c.method === 'PUT');
     ok(puts.length === 1, '防抖到点只发一次 PUT', `puts=${puts.length}`);
     let body = null;
-    try { body = JSON.parse(puts[0].body); } catch { /* 交给下面的断言报错 */ }
+    try { body = JSON.parse(puts[0].body); } catch { /* let the assertion below report the error */ }
     ok(body !== null && body.subject === '草稿A', '提交的是最新内容');
     ok(composerOpen(ctx), '自动保存不关窗');
   });
@@ -658,7 +661,7 @@ async function test(name, fn, bootOpts) {
     ok(!confirmShown(ctx), '确认框全程隐藏');
   });
 
-  /* ---- T8 边界用例 ---- */
+  /* ---- T8 edge cases ---- */
   await test('T8a 只输入一个空格（纯文本正文）-> 不脏、直接关闭', async (ctx) => {
     await openCompose(ctx);
     setValue(ctx, '#f-body', ' ');
@@ -703,7 +706,7 @@ async function test(name, fn, bootOpts) {
     await ticks(ctx.win, 3);
     const put = lastDraftCall(ctx);
     let body = null;
-    try { body = JSON.parse(put.body); } catch { /* 交给下面的断言报错 */ }
+    try { body = JSON.parse(put.body); } catch { /* let the assertion below report the error */ }
     ok(put !== null && put.url === `/api/drafts/${draftId}`, '写入打开时生成的那个草稿 id', put && put.url);
     ok(body !== null && body.body === 'hi', '草稿正文 = "hi"（内容未丢）', body && body.body);
   });
@@ -737,8 +740,8 @@ async function test(name, fn, bootOpts) {
     await ticks(ctx.win, 3);
     const put = lastDraftCall(ctx);
     ok(put !== null && put.method === 'PUT' && put.url === `/api/drafts/${draftId}`, '仍然落一份草稿（让用户知道东西去哪了）', put && `${put.method} ${put.url}`);
-    // 已知限制：附件是内存里的 base64，体积远超 D1 单行上限，不随草稿落库。
-    // 恢复草稿时附件需要重新添加 —— 该限制记录在交付说明里，不在此断言（避免把限制写成期望）。
+    // Known limitation: attachments are in-memory base64, far exceeding D1's per-row limit, so they are not persisted with the draft.
+    // Attachments must be re-added when restoring a draft -- this limitation is documented in the handoff notes, not asserted here (to avoid turning a limitation into an expectation).
     info('已知限制：附件不随草稿持久化（D1 单行上限），恢复草稿后需重新添加');
   });
 
@@ -760,7 +763,7 @@ async function test(name, fn, bootOpts) {
     await openCompose(ctx);
     setValue(ctx, '#f-body', 'hi');
     await toRich(ctx);
-    // 切到富文本后可见内容 = hi；此处模拟用户在富文本里把可见内容删光
+    // After switching to rich text the visible content = hi; here we simulate the user deleting all visible content in the rich text editor
     evalIn(ctx, 'document.querySelector("#f-body-rich").innerHTML = ""');
     const visible = evalIn(ctx, 'richPlainText(document.querySelector("#f-body-rich"))');
     const bodyStill = val(ctx, '#f-body');
@@ -774,7 +777,7 @@ async function test(name, fn, bootOpts) {
     ok(!composerOpen(ctx), '该情形点外部 -> 直接关闭');
   });
 
-  /* ---- T9 补充：失败后 sendInFlight 必须复位，否则关窗会被「发送中」永久拦住 ---- */
+  /* ---- T9 addendum: after failure sendInFlight must reset, otherwise closing would be permanently blocked by "sending" ---- */
   await test('T9 发送失败后 sendInFlight 复位，后续点外部不再被「发送中」拦截', async (ctx) => {
     await openCompose(ctx);
     setValue(ctx, '#f-to', 'a@b.com');
@@ -788,7 +791,7 @@ async function test(name, fn, bootOpts) {
     ok(!toastText(ctx).includes('正在发送中'), 'toast 不再是「发送中」文案', toastText(ctx));
   });
 
-  /* ---- T10 覆盖层 CSS 契约 +「放弃确认」已彻底退役（无触发路径） ---- */
+  /* ---- T10 overlay CSS contract + "discard confirm" fully retired (no trigger path) ---- */
   await test('T10 覆盖层 CSS 契约 +「放弃确认」已无调用点', async (ctx) => {
     const block = (sel) => {
       const i = APP_CSS.indexOf(`${sel} {`);
@@ -806,16 +809,16 @@ async function test(name, fn, bootOpts) {
     ok(!!preview && /position:\s*fixed/.test(preview) && /inset:\s*0/.test(preview), '#att-preview 为全屏 fixed 遮罩');
     ok(z(preview) > z(modal), `#att-preview z-index(${z(preview)}) > #modal-mask z-index(${z(modal)}) -> 附件预览盖在写信弹窗之上`);
 
-    // 「关窗弹放弃确认」这条路径必须彻底消失。showDiscardConfirm 仍留在源码里
-    // （本套件用它作「绝不出现」的回归锚点），但不得再有任何调用点 ——
-    // 一旦有人把它接回去，这条断言会立刻挂，提醒「自动存草稿」被改回了旧语义。
+    // The "pop a discard confirm when closing" path must disappear completely. showDiscardConfirm still remains in the source
+    // (this suite uses it as a "never appears" regression anchor), but it must have no call sites --
+    // if anyone wires it back, this assertion fails immediately, reminding that "auto-save draft" was reverted to the old semantics.
     const callSites = APP_JS.split('\n')
       .filter((l) => /showDiscardConfirm\s*\(/.test(l) && !/^\s*function\s+showDiscardConfirm\s*\(/.test(l));
     ok(callSites.length === 0, '⭐ showDiscardConfirm 已无任何调用点：关窗不再弹「是否放弃」', callSites.join(' | ') || '（无）');
     info(`modal z=${z(modal)} preview z=${z(preview)}`);
   });
 
-  /* ---- T11 发送人下拉（发件邮箱）变更是否算脏 ---- */
+  /* ---- T11 whether changing the sender dropdown (from mailbox) counts as dirty ---- */
   await test('T11 Fix3：只切换发件邮箱 -> 判脏，但没什么可存（不发草稿请求）', async (ctx) => {
     await openCompose(ctx);
     const sel = el(ctx, '#f-mailbox');
@@ -856,7 +859,7 @@ async function test(name, fn, bootOpts) {
     ok(!confirmShown(ctx) && !composerOpen(ctx), '改回原值点外部 -> 直接关闭');
   }, { mailboxes: [{ mailbox: 'me@example.com' }, { mailbox: 'alias@example.com' }] });
 
-  /* ---- T11g 有正文时改发件人：草稿必须记住改选后的地址（不能退回默认） ---- */
+  /* ---- T11g change sender with body present: the draft must remember the changed address (not fall back to the default) ---- */
   await test('T11g 改发件人 + 写正文 -> 草稿里的 mailbox 是改选后的地址', async (ctx) => {
     await openCompose(ctx);
     const draftId = evalIn(ctx, 'state.composing.draftId');
@@ -871,12 +874,12 @@ async function test(name, fn, bootOpts) {
     await ticks(ctx.win, 3);
     const put = lastDraftCall(ctx);
     let body = null;
-    try { body = JSON.parse(put.body); } catch { /* 交给下面的断言报错 */ }
+    try { body = JSON.parse(put.body); } catch { /* let the assertion below report the error */ }
     ok(put !== null && put.url === `/api/drafts/${draftId}`, 'PUT 到打开时那个草稿 id', put && put.url);
     ok(body !== null && body.mailbox === other, '⭐ 草稿记住改选后的发件人（否则恢复草稿时会用错地址发信）', body && JSON.stringify(body.mailbox));
   }, { mailboxes: [{ mailbox: 'me@example.com' }, { mailbox: 'alias@example.com' }] });
 
-  /* ---- T11c 回信：改选发件人必须进入请求体（后端曾完全忽略它） ---- */
+  /* ---- T11c reply: changing the sender must go into the request body (the backend once ignored it entirely) ---- */
   await test('T11c 回信时改选发件人 -> 请求体必须带上所选 mailbox', async (ctx) => {
     const orig = 'me@example.com';
     const other = 'alias@example.com';
@@ -908,7 +911,7 @@ async function test(name, fn, bootOpts) {
     await ticks(ctx.win, 15);
   }, { mailboxes: [{ mailbox: 'me@example.com' }, { mailbox: 'alias@example.com' }] });
 
-  /* ---- T11d 发件人：独立一行 + 默认折叠，摘要始终同步 ---- */
+  /* ---- T11d sender: its own row + collapsed by default, summary always in sync ---- */
   await test('T11d 发件人独立一行：默认折叠、点开可选、摘要跟着选择走', async (ctx) => {
     await openCompose(ctx);
     const hid = (sel) => el(ctx, sel).classList.contains('hidden');
@@ -949,7 +952,7 @@ async function test(name, fn, bootOpts) {
     await ticks(ctx.win, 15);
   }, { mailboxes: [{ mailbox: 'me@example.com' }, { mailbox: 'alias@example.com' }] });
 
-  /* ---- T11e 只有一个发件地址：不给「可展开」的假象 ---- */
+  /* ---- T11e only one sender address: don't give the illusion of "expandable" ---- */
   await test('T11e 只有一个发件地址：摘要行不显示箭头，点了也不展开', async (ctx) => {
     await openCompose(ctx);
     const hid = (sel) => el(ctx, sel).classList.contains('hidden');
@@ -961,7 +964,7 @@ async function test(name, fn, bootOpts) {
       '摘要就是那唯一的地址', el(ctx, '#f-sender-current').textContent);
   }, { mailboxes: [{ mailbox: 'me@example.com' }] });
 
-  /* ---- T11f 发信身份只在顶部显示一次（底部那个重复且会拼错名字的提示已删除） ---- */
+  /* ---- T11f the sending identity is shown only once at the top (the duplicate, misnamed hint at the bottom was removed) ---- */
   await test('T11f 写信弹窗的操作行里不得再挂「发信身份」文字', async (ctx) => {
     await openCompose(ctx);
     ok(composerOpen(ctx), '前置：写信弹窗已打开（否则下面的断言空转）');
@@ -978,7 +981,7 @@ async function test(name, fn, bootOpts) {
     ok(labels.join(',') === '取消,发送', '操作行就是「取消 / 发送」两个按钮', labels.join(','));
   }, { mailboxes: [{ mailbox: 'me@example.com' }] });
 
-  /* ---- T13 norm() 归一化边界 ---- */
+  /* ---- T13 norm() normalization edges ---- */
   await test('T13 norm() 边界：null/undefined/各类空白', async (ctx) => {
     const probe = (expr) => evalIn(ctx, `(() => { const r = norm(${expr}); return JSON.stringify(r); })()`);
     const cases = [
@@ -1001,7 +1004,7 @@ async function test(name, fn, bootOpts) {
     info('JS trim() 的 WhiteSpace 含 U+3000 全角空格与 U+00A0 NBSP，实测已被去掉');
   });
 
-  /* ---- T14 全角空格 / 各种空白的行为一致性 ---- */
+  /* ---- T14 behavior consistency for full-width space / various whitespace ---- */
   const blankCases = [
     ['主题=全角空格', (ctx) => setValue(ctx, '#f-subject', '\u3000'), '#f-subject'],
     ['收件人=全角空格', (ctx) => setValue(ctx, '#f-to', '\u3000'), '#f-to'],
@@ -1040,7 +1043,7 @@ async function test(name, fn, bootOpts) {
   });
 
   await test('T14d 基线非空（回复预填主题）时首尾空格不改变判定', async (ctx) => {
-    openReply(ctx); // 基线 subject = "Re: Hello"
+    openReply(ctx); // baseline subject = "Re: Hello"
     ok(evalIn(ctx, 'isComposerDirty()') === false, '回复刚打开、未改动 -> 不脏');
     setValue(ctx, '#f-subject', 'Re: Hello   ');
     ok(evalIn(ctx, 'isComposerDirty()') === false, '主题尾部加空格 -> 不脏（norm 去首尾空白）');
@@ -1055,14 +1058,14 @@ async function test(name, fn, bootOpts) {
   });
 
   await test('T14e 内部空格差异仍算脏（norm 只去首尾、不折叠内部）', async (ctx) => {
-    openReply(ctx); // 基线 subject = "Re: Hello"
+    openReply(ctx); // baseline subject = "Re: Hello"
     setValue(ctx, '#f-subject', 'Re:  Hello');
     ok(evalIn(ctx, 'isComposerDirty()') === true, '主题内部多一个空格 -> 仍脏（norm 不做内部归一化）');
     clickMaskBlank(ctx);
     ok(!confirmShown(ctx) && !composerOpen(ctx), '点外部 -> 存草稿并关闭');
   });
 
-  /* ---- T14f 空基线下正文首尾带空格的真实文字 -> 仍脏 ---- */
+  /* ---- T14f real text with leading/trailing spaces in the body under an empty baseline -> still dirty ---- */
   await test('T14f 空基线下正文首尾带空格的真实文字 -> 仍脏', async (ctx) => {
     await openCompose(ctx);
     setValue(ctx, '#f-body', '  hello  ');
@@ -1071,7 +1074,7 @@ async function test(name, fn, bootOpts) {
     ok(!confirmShown(ctx) && !composerOpen(ctx), '点外部 -> 存草稿并关闭');
   });
 
-  /* ---- T16 守卫与发送校验口径一致性（复核 kou 的 N1 修复） ---- */
+  /* ---- T16 consistency between guard-empty and send-validation (re-check kou's N1 fix) ---- */
   await test('T16 守卫判空 ⟺ 发送拒绝（htmlHasText 复用 richPlainText）', async (ctx) => {
     const cases = [
       ['<div>&nbsp;</div>', '实体 &nbsp;'],
@@ -1087,7 +1090,7 @@ async function test(name, fn, bootOpts) {
         await openCompose(c);
         await toRich(c);
         evalIn(c, `document.querySelector("#f-body-rich").innerHTML = ${JSON.stringify(markup)}`);
-        const guardDirty = evalIn(c, 'isComposerDirty()'); // 收件人/主题均为空，只反映正文
+        const guardDirty = evalIn(c, 'isComposerDirty()'); // recipient/subject are both empty, so it only reflects the body
         setValue(c, '#f-to', 'a@b.com');
         clickEl(c, '#composer-send');
         const sent = c.stub.hasPendingSend();
@@ -1126,7 +1129,7 @@ async function test(name, fn, bootOpts) {
     clickMaskBlank(ctx);
     ok(!confirmShown(ctx) && !composerOpen(ctx), '仅 &nbsp; 点外部 -> 直接关闭、不提示');
 
-    // 发送侧：htmlHasText 已改为复用 richPlainText，应当同样判「无内容」
+    // Send side: htmlHasText now reuses richPlainText, so it should likewise treat this as "no content"
     await openCompose(ctx);
     await toRich(ctx);
     evalIn(ctx, 'document.querySelector("#f-body-rich").innerHTML = "&nbsp;"');
@@ -1151,13 +1154,13 @@ async function test(name, fn, bootOpts) {
     await ticks(ctx.win, 3);
     const put = lastDraftCall(ctx);
     let body = null;
-    try { body = JSON.parse(put.body); } catch { /* 交给下面的断言报错 */ }
+    try { body = JSON.parse(put.body); } catch { /* let the assertion below report the error */ }
     ok(put !== null && put.method === 'PUT', '富文本引用内容写入草稿', put && put.method);
     ok(body !== null && body.mode === 'reply' && body.rich === true, '草稿记录了「回复 + 富文本」模式', body && `mode=${body.mode} rich=${body.rich}`);
     ok(body !== null && String(body.html).includes('blockquote'), '草稿里保留的是 HTML（含引用块），不是被降级的纯文本');
   });
 
-  /* ---- T12 诊断：jsdom innerText 缺失的影响（环境局限，非实现 Bug） ---- */
+  /* ---- T12 diagnostics: impact of jsdom's missing innerText (environment limitation, not an implementation bug) ---- */
   await test('T12 诊断：jsdom 未实现 innerText 对 rich->plain 往返的影响', async (ctx) => {
     const innerTextType = evalIn(ctx, 'typeof document.querySelector("#f-body-rich").innerText');
     info(`jsdom 中 #f-body-rich.innerText 的类型 = ${innerTextType}`);
@@ -1167,7 +1170,7 @@ async function test(name, fn, bootOpts) {
     await toRich(ctx);
     evalIn(ctx, 'document.querySelector("#f-body-rich").innerHTML = "hello"');
     ok(evalIn(ctx, 'richPlainText(document.querySelector("#f-body-rich"))') === 'hello', 'richPlainText 经 textContent 兜底可正确取到 hello');
-    clickEl(ctx, '#f-mode'); // 切回纯文本
+    clickEl(ctx, '#f-mode'); // switch back to plain text
     await ticks(ctx.win, 2);
     const taValue = val(ctx, '#f-body');
     info(`切回纯文本后 #f-body.value = ${JSON.stringify(taValue)}（真浏览器应为 "hello"）`);
@@ -1175,7 +1178,7 @@ async function test(name, fn, bootOpts) {
     info('结论：rich->plain 往返路径在 jsdom 中不可信，需真浏览器人工复核；本条不计为实现 Bug。');
   });
 
-  /* ---- 汇总 ---- */
+  /* ---- summary ---- */
   console.log('\n================ 失败用例清单 ================');
   const failed = results.filter((r) => !r.ok);
   if (!failed.length) {

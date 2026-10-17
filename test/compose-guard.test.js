@@ -1,29 +1,29 @@
 'use strict';
 
 /* =========================================================
- * 写信弹窗「关窗守卫」回归测试（零依赖，node test/compose-guard.test.js）
+ * Composer "close-window guard" regression test (zero dependencies, node test/compose-guard.test.js)
  *
- * 语义已于本轮从「弹『是否放弃』确认框」改为「自动存草稿后直接关闭」。
- * 本套件因此同时守两件事：① 关窗必须落草稿（PUT 到打开时那个 draftId）；
- * ② 确认框在任何路径下都不得出现。
+ * The semantics were changed this round from "pop a 'discard?' confirm dialog" to "auto-save the draft then close directly".
+ * This suite therefore guards two things at once: ① closing must persist a draft (PUT to the draftId from when it was opened);
+ * ② the confirm dialog must not appear on any path.
  *
- * 项目前端是无构建的原生 SPA，没有 npm 测试框架。这里用 Node 内置的 vm
- * 模块把 public/app.js 中写信相关的代码原样抽取出来执行，配合一个极简
- * DOM 桩，从而在不引入任何依赖的前提下验证真实源码的行为。
+ * The project frontend is a build-less native SPA with no npm test framework. Here Node's built-in vm
+ * module is used to extract the compose-related code from public/app.js verbatim and run it, together with a minimal
+ * DOM stub, verifying the real source's behavior without introducing any dependency.
  *
- * 抽取的是真实函数（openComposer / openReplyComposer / insertQuote /
- * sendCompose / isComposerDirty ...），只把 IO 类依赖（api / showToast /
- * 列表刷新）换成桩，因此基线快照与发送中守卫都走的是生产代码路径。
+ * What is extracted are the real functions (openComposer / openReplyComposer / insertQuote /
+ * sendCompose / isComposerDirty ...), with only the IO-class dependencies (api / showToast /
+ * list refresh) replaced by stubs, so both the baseline snapshot and the in-send guard follow the production code path.
  *
- * 抽取依赖源码中的注释标记；若标记被改动，脚本会直接报错提示。
+ * Extraction relies on comment markers in the source; if a marker is changed, the script fails with a clear error.
  * ========================================================= */
 
 const fs = require('fs');
 const path = require('path');
 const vm = require('vm');
 
-// QA_APP_JS 仅用于「变异验证」：指向一份人工构造的缺陷版 app.js。
-// 缺了这个钩子，变异脚本会「跑仓库原文件却以为跑的是变体」→ 变体恒不被抓（假阴性）。
+// QA_APP_JS is only for "mutation verification": point it at a hand-crafted defective app.js.
+// Without the hook, the mutation script would "run the repo's original file while thinking it is the variant" -> the variant is never caught (false negative).
 const APP_JS_PATH = process.env.QA_APP_JS || path.join(__dirname, '..', 'public', 'app.js');
 const SRC = fs.readFileSync(APP_JS_PATH, 'utf8');
 
@@ -39,26 +39,26 @@ const pieces = [
   slice('function esc(s) {', '\n}\n', 'esc') + '\n}\n',
   slice('function timeLong(sec) {', '\n}\n', 'timeLong') + '\n}\n',
   slice('function fmtSize(n) {', '\n}\n', 'fmtSize') + '\n}\n',
-  // 写信相关全部真实实现（含 isRich / openComposer / openReplyComposer /
-  // 守卫块 / insertQuote / toggleRich / sendCompose）
+  // all the compose-related real implementations (including isRich / openComposer / openReplyComposer /
+  // guard block / insertQuote / toggleRich / sendCompose)
   slice(
     'function plainToHtmlText(text) {',
-    '\n\n/* ---------------- 搜索 / 键盘 / 事件 / 同步 ---------------- */',
+    '\n\n/* ---------------- Search / keyboard / events / sync ---------------- */',
     'compose 主体'
   ),
-  // setupEvents 中与写信弹窗相关的事件接线
+  // the event wiring in setupEvents related to the composer dialog
   slice(
     "  $('#compose-btn').addEventListener('click', openComposer);",
     '\n\n  setupSearch();',
     '事件接线'
   ),
-  // 移动端布局模块（isMobile / syncLayout / setDrawer / closeDrawer）。
-  // 上面的「事件接线」slice 里引用了 setDrawer / closeDrawer / drawerOpen，
-  // 不把这段一起抽出来会直接 ReferenceError；它自身只依赖 $ / state / globalThis，桩里都有。
-  slice('/* ---------------- 移动端布局', '/* ---------------- API ---------------- */', '移动端布局'),
+  // mobile layout module (isMobile / syncLayout / setDrawer / closeDrawer).
+  // The "event wiring" slice above references setDrawer / closeDrawer / drawerOpen,
+  // so not extracting this piece together would directly ReferenceError; it itself only depends on $ / state / globalThis, all present in the stubs.
+  slice('/* ---------------- Mobile layout', '/* ---------------- API ---------------- */', '移动端布局'),
 ];
 
-// 未被抽取、但会被引用到的符号
+// symbols that are not extracted but will be referenced
 const stubs = `
 const MAX_FILE_BYTES = 40 * 1024 * 1024;
 let currentMessage = null;
@@ -71,12 +71,12 @@ function openFolder() {}
 function loadFolder() {}
 function isTypingTarget() { return false; }
 function moveSelection() {}
-// 详情面板的关闭/渲染不在本套件的关注范围（且依赖 detailSeq / currentThread 等一整套详情态），
-// 事件接线里引用了它，故给桩。移动端行为由 test/mobile-layout.dom.test.js 用真实实现覆盖。
+// The detail pane's close/render are outside this suite's concern (and depend on a whole detail state such as detailSeq / currentThread),
+// but the event wiring references them, so a stub is given. Mobile behavior is covered by test/mobile-layout.dom.test.js with the real implementation.
 function closeMessagePane() {}
 `;
 
-// 探针：把块级 let 绑定暴露出来，便于外部观测与复位（仅测试用）
+// probe: expose the block-level let bindings for external observation and reset (test only)
 const probe = `
 globalThis.__t = {
   get pending() { return discardConfirmPending; },
@@ -86,8 +86,8 @@ globalThis.__t = {
   resetGuard() { discardConfirmPending = false; composerLastFocus = null; },
   clearBaseline() { composerBaseline = null; },
   setCurrentMessage(m) { currentMessage = m; },
-  // 把当前表单重新快照为基线（与 openComposer 内同一表达式）。
-  // 用于隔离出「正文」单一变量：先填好收件人再重新基线，之后的差异只可能来自正文。
+  // re-snapshot the current form as the baseline (same expression as inside openComposer).
+  // Used to isolate the single variable of "body": fill in the recipients first then rebaseline, so any later diff can only come from the body.
   rebaseline() {
     composerBaseline = {
       to: $('#f-to').value,
@@ -100,7 +100,7 @@ globalThis.__t = {
 };
 `;
 
-/* ---------------- 极简 DOM 桩 ---------------- */
+/* ---------------- minimal DOM stub ---------------- */
 
 const els = {};
 const listeners = {};
@@ -131,19 +131,19 @@ class El {
       toggle: (c, on2) => (on2 ? this._classes.add(c) : this._classes.delete(c)),
     };
   }
-  // 模拟浏览器：块级标签 / <br> 产生换行，&nbsp; 读作 \u00a0
+  // simulate the browser: block-level tags / <br> produce newlines, &nbsp; reads as \u00a0
   get innerText() { return this._text; }
   set innerText(v) { this._text = v; }
   get textContent() { return this._text; }
   set textContent(v) { this._text = v; }
-  // 真实浏览器里 innerHTML 变化会同步影响 innerText，这里做等价换算
+  // in a real browser an innerHTML change also updates innerText; here we do the equivalent conversion
   get innerHTML() { return this._html; }
   set innerHTML(v) {
     this._html = String(v);
     this._text = this._html
       .replace(/<br\s*\/?>/gi, '\n')
       .replace(/<[^>]*>/g, '')
-      .replace(/&nbsp;|&#160;|&#xa0;/gi, '\u00a0') // 浏览器会把实体还原成真正的 U+00A0
+      .replace(/&nbsp;|&#160;|&#xa0;/gi, '\u00a0') // the browser restores entities to a real U+00A0
       .replace(/&lt;/g, '<')
       .replace(/&gt;/g, '>')
       .replace(/&quot;/g, '"')
@@ -151,7 +151,7 @@ class El {
       .replace(/&amp;/g, '&');
   }
   focus() { this.focused++; }
-  // 生产代码会给发件人摘要行写 aria-expanded（真实浏览器里 DOM 元素本来就有这两个方法）
+  // production code writes aria-expanded on the sender summary row (in a real browser DOM elements have these two methods natively)
   setAttribute(k, v) { this._attrs[k] = String(v); }
   getAttribute(k) { return Object.prototype.hasOwnProperty.call(this._attrs, k) ? this._attrs[k] : null; }
   addEventListener(ev, fn) { on(this.id, ev, fn); }
@@ -195,10 +195,10 @@ const sandbox = {
     mailboxList: [],
     folder: 'inbox',
     cache: { countsAt: 0 },
-    // 真实 state 里也有这两个字段（收件人联想用）；补上以免桩与生产形状漂移
+    // the real state also has these two fields (used for recipient suggestions); add them so the stub does not drift from the production shape
     contacts: [],
     contactsLoaded: false,
-    // 移动端布局（syncLayout）会读它；同样是「补上以免形状漂移」
+    // mobile layout (syncLayout) reads it; likewise "add it so the shape does not drift"
     openId: null,
   },
   $: (s) => el(s),
@@ -214,7 +214,7 @@ const T = S.__t;
 const st = S.state;
 const toasts = S.__toasts;
 
-/* ---------------- 断言辅助 ---------------- */
+/* ---------------- assertion helpers ---------------- */
 
 let pass = 0;
 let fail = 0;
@@ -241,15 +241,15 @@ const REPLY_MSG = {
   body_text: '原文第一行\n原文第二行',
 };
 
-/** 走真实的 openComposer()，因此基线由生产代码记录 */
+/** Go through the real openComposer(), so the baseline is recorded by production code */
 function reset() {
   for (const e of Object.values(els)) e.focused = 0;
   toasts.length = 0;
   T.resetGuard();
   S.openComposer();
-  T.resetGuard(); // openComposer 内部也会清，这里再保证一次
+  T.resetGuard(); // openComposer also clears it internally, here to make sure once more
 }
-/** 走真实的 openReplyComposer() */
+/** Go through the real openReplyComposer() */
 function resetReply() {
   for (const e of Object.values(els)) e.focused = 0;
   toasts.length = 0;
@@ -259,7 +259,7 @@ function resetReply() {
   T.resetGuard();
 }
 
-/** 让 api 挂起，返回手动 resolve/reject 的控制器 */
+/** Make api hang, returning a controller that resolves/rejects manually */
 function deferApi() {
   let resolveFn;
   let rejectFn;
@@ -269,13 +269,13 @@ function deferApi() {
 }
 
 /**
- * 等一轮微任务 + 宏任务。
- * 关窗保存草稿是**同步关窗、异步落盘**（点击要立刻见效，不能等网络往返），
- * 所以断言「发出了哪个请求」必须等异步那一段跑完。
+ * Wait one microtask + macrotask turn.
+ * Closing to save a draft is **synchronous close, asynchronous persist** (the click must take effect immediately, cannot wait for a network round trip),
+ * so asserting "which request was sent" must wait for the async part to finish.
  */
 const tick = () => new Promise((r) => setTimeout(r, 0));
 
-/* ---------------- 用例 ---------------- */
+/* ---------------- test cases ---------------- */
 
 async function main() {
   console.log('\n[1] 空表单：不脏、不提示、直接关闭');
@@ -321,18 +321,18 @@ async function main() {
 
   console.log('\n[4] 切换富文本本身不弄脏表单（走真实 toggleRich）');
   reset();
-  S.toggleRich(); // 真实函数：空 textarea -> 富文本
+  S.toggleRich(); // real function: empty textarea -> rich text
   ok(st.composing.rich === true, '已切到富文本');
   ok(S.isComposerDirty() === false, '空表单切到富文本 -> 仍不脏');
-  // 真实顺序：先切回纯文本输入，再切富文本，内容应被搬运且不丢
-  S.toggleRich(); // 富文本 -> textarea
+  // real order: switch back to plain-text input first, then to rich text; the content should be carried over and not lost
+  S.toggleRich(); // rich text -> textarea
   ok(st.composing.rich === false, '已切回纯文本');
   el('#f-body').value = 'hello';
-  S.toggleRich(); // textarea -> 富文本
+  S.toggleRich(); // textarea -> rich text
   ok(st.composing.rich === true, '再次切到富文本');
   ok(el('#f-body-rich').innerHTML === 'hello', '内容已搬运到富文本');
   ok(S.isComposerDirty() === true, '有文字切到富文本 -> 脏');
-  S.toggleRich(); // 富文本 -> textarea
+  S.toggleRich(); // rich text -> textarea
   ok(st.composing.rich === false, '切回纯文本');
   ok(el('#f-body').value === 'hello', '来回切换未丢内容');
   ok(S.isComposerDirty() === true, '来回切换后仍脏');
@@ -496,7 +496,7 @@ async function main() {
 
   console.log('\n[17] 回复模式：点「引用原文」后关窗 -> 引用内容随草稿保存');
   resetReply();
-  S.insertQuote(); // 真实函数，改写 #f-body.value
+  S.insertQuote(); // real function, rewrites #f-body.value
   ok(el('#f-body').value.length > 0, '引用原文已写入正文');
   ok(S.isComposerDirty() === true, '点引用原文 -> 脏');
   let body17 = null;
@@ -559,26 +559,26 @@ async function main() {
   el('#f-body').value = 'body';
   const d2 = deferApi();
   const s2 = S.sendCompose();
-  S.requestCloseComposer(); // 修复前这里会关掉弹窗
+  S.requestCloseComposer(); // before the fix this would close the dialog
   ok(composerOpen() === true, '发送中无法放弃');
   d2.reject(new Error('boom'));
   await s2;
   ok(composerOpen() === true, '发送失败后弹窗仍在（内容未丢失）');
   ok(st.composing !== null && el('#f-body').value === 'body', '发送失败后内容完整保留');
   ok(T.sendInFlight === false, 'sendInFlight 已复位');
-  // 失败后应恢复正常关闭流程（此时同样走「存草稿」）
+  // after a failure the normal close flow should resume (which likewise goes through "save draft")
   S.requestCloseComposer();
   ok(composerOpen() === false, '失败后再次请求关闭 -> 存草稿并关闭');
   ok(confirmShown() === false, '不再弹放弃确认框');
 
   console.log('\n[22] Fix1：正文只认当前可见的编辑器（消除「假提示」）');
   reset();
-  el('#f-body').value = 'hi'; // 纯文本输入
+  el('#f-body').value = 'hi'; // plain-text input
   ok(S.isComposerDirty() === true, '纯文本输入 hi -> 脏');
-  S.toggleRich(); // 切到富文本，内容被搬运
+  S.toggleRich(); // switch to rich text, content is carried over
   ok(el('#f-body-rich').innerText === 'hi', '内容已搬到富文本');
   ok(S.isComposerDirty() === true, '富文本里仍可见 hi -> 脏');
-  el('#f-body-rich').innerHTML = ''; // 在富文本里把可见内容删光
+  el('#f-body-rich').innerHTML = ''; // delete all visible content inside the rich text
   ok(el('#f-body').value === 'hi', '隐藏的 #f-body 仍残留 hi');
   ok(S.isComposerDirty() === false, '富文本已删光 -> 不脏（不被隐藏残留误导）');
   S.requestCloseComposer();
@@ -613,7 +613,7 @@ async function main() {
   ok(mbEl.value === 'me@example.com', '发件人已预选');
   ok(S.isComposerDirty() === false, '未改动 -> 不脏');
   mbEl.value = 'other@example.com';
-  el('#f-subject').value = 's24'; // 草稿要有实质内容才会落盘（只改发件人不算「有内容」）
+  el('#f-subject').value = 's24'; // a draft only persists when there is real content (changing only the sender does not count as "content")
   ok(S.isComposerDirty() === true, '改了发件人 -> 脏');
   let body24 = null;
   S.__apiImpl = (url, opts) => { body24 = JSON.parse(opts.body); return Promise.resolve({}); };
@@ -626,7 +626,7 @@ async function main() {
   reset();
   el('#f-to').value = 'a@b.com';
   st.composing.rich = true;
-  T.rebaseline(); // 收件人纳入基线，隔离出正文这一个变量
+  T.rebaseline(); // bring the recipients into the baseline, isolating the single variable of the body
   el('#f-body-rich').innerHTML = '<div>&nbsp;</div>';
   ok(S.isComposerDirty() === false, '守卫判「无内容」');
   let calls25 = 0;
@@ -664,7 +664,7 @@ async function main() {
     reset();
     el('#f-to').value = 'a@b.com';
     st.composing.rich = true;
-    T.rebaseline(); // 先固定除正文外的一切，再只改正文
+    T.rebaseline(); // fix everything except the body first, then only change the body
     el('#f-body-rich').innerHTML = richHtml;
     const guardSaysContent = S.isComposerDirty();
     let called = 0;

@@ -10,26 +10,28 @@ export interface Env {
   MERGE_SUBREQ_BUDGET?: string;
   API_USERNAME?: string;
   API_PASSWORD?: string;
-  /** 存储用量「百分比」的分母（字节）。缺省按免费档：D1 500MB、R2 10GB。付费档可覆盖。 */
+  /** This Worker's script name (the setup wizard points the catch-all route at it). Defaults to 'resend-mail-api'. */
+  WORKER_NAME?: string;
+  /** The denominator for the storage usage "percentage" (bytes). Defaults to the Free tier: D1 500MB, R2 10GB. Paid tiers can override. */
   D1_LIMIT_BYTES?: string;
   R2_LIMIT_BYTES?: string;
-  /** Resend 发信额度（封/天、封/月）。缺省按免费档：100/天、3000/月。付费档可覆盖。 */
+  /** Resend send quota (messages/day, messages/month). Defaults to the Free tier: 100/day, 3000/month. Paid tiers can override. */
   RESEND_DAY_LIMIT?: string;
   RESEND_MONTH_LIMIT?: string;
   /**
-   * CF 入向异步解析队列（never-lose 流水线的第二段）。
-   * 缺省（undefined）时 `email()` 仍会把原始件落 R2 + 登记 inbound_raw，
-   * 只是没有 consumer 把它解析进 messages —— 本地 `wrangler dev` 与未建队列的部署不必因此报错。
+   * CF inbound async parse queue (stage two of the never-lose pipeline).
+   * When unset (undefined), `email()` still writes the raw message to R2 + registers inbound_raw,
+   * it just has no consumer to parse it into messages — so local `wrangler dev` and deployments without a queue do not have to error out.
    */
   INBOUND_QUEUE?: Queue<InboundQueueMessage>;
 }
 
-/** 入向队列消息：**只传 id 指针**（正文在 R2）。Queues 单条 ≤128 KB，绝不能把 MIME 塞进来。 */
+/** Inbound queue message: **only pass an id pointer** (the body is in R2). A Queue message is ≤128 KB, so the MIME must never be stuffed in here. */
 export interface InboundQueueMessage {
   rawId: string;
 }
 
-/** `inbound_raw` 表的一行。 */
+/** A row of the `inbound_raw` table. */
 export interface InboundRawRow {
   id: string;
   r2_key: string;
@@ -37,7 +39,7 @@ export interface InboundRawRow {
   to_email: string | null;
   size: number;
   message_id: string | null;
-  /** Subject 头（收信时即记下，供「入站异常」提示显示）。 */
+  /** Subject header (recorded at receive time, for the "inbound alert" notice to display). */
   subject: string | null;
   received_at: number;
   parsed_at: number | null;
@@ -61,7 +63,7 @@ export interface MessageRow {
   from_name: string | null;
   from_email: string | null;
   to_emails: string;
-  /** 入站邮件的投递地址（信封收件人）；历史行为 NULL。见 migrations/004_delivered_to.sql。 */
+  /** Delivery address (envelope recipient) of an inbound mail; historical rows are NULL. See migrations/004_delivered_to.sql. */
   delivered_to: string | null;
   cc: string | null;
   bcc: string | null;

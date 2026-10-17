@@ -1,35 +1,35 @@
 'use strict';
 
 /* =========================================================
- * 「合并发送」回归测试（零依赖，node test/mail-merge.test.js）
+ * "Merge send" regression test (zero dependencies, node test/mail-merge.test.js)
  *
- * 项目前端是无构建的原生 SPA，没有 npm 测试框架。这里沿用
- * test/compose-guard.test.js 的做法：用 Node 内置 vm 把 public/app.js
- * 中写信相关的**真实函数**原样抽出来执行，配一个极简 DOM 桩，
- * 从而在不引入任何依赖的前提下验证真实源码的行为。
+ * The project frontend is a build-less native SPA with no npm test framework. Here we follow
+ * the approach of test/compose-guard.test.js: use Node's built-in vm to extract the **real functions**
+ * related to composing from public/app.js verbatim and run them, with a minimal DOM stub,
+ * verifying the real source's behavior without introducing any dependency.
  *
- * 覆盖：
- *   1. parseRecipients 纯函数（分隔符 / trim / 去空 / 大小写去重 / 边界）
- *   2. 前端 merge 分支：全部成功 -> 关窗 + toast
- *                      部分失败 -> 弹窗不关、#f-to 只剩失败者、toast 含地址与原因
- *                      全部失败 -> 同样不关窗、#f-to 等价于原输入
- *   3. 非 merge 分支：行为与改造前一致（一次请求、to 为数组）
- *   4. checkbox 重置：每次打开弹窗都是未勾选
- *   5. 脏检测：仅勾选 / 取消 checkbox 不产生脏状态
- *   6. hint 文案：勾选且 >1 收件人时显示人数，0/1 个收件人时不显示
- *   7. 模式隔离：.merge-row 只在写信模式显示；回复模式隐藏且 payload 绝不含 merge（硬防御）
- *   8. 去重：同一地址重复 100 次仍只算 1 人，不会触发后端动态上限
+ * Covers:
+ *   1. parseRecipients pure function (separators / trim / drop empty / case-insensitive dedup / boundaries)
+ *   2. frontend merge branch: all succeed -> close + toast
+ *                      partial failure -> dialog stays open, #f-to keeps only the failed ones, toast includes address and reason
+ *                      all fail -> likewise stays open, #f-to equivalent to the original input
+ *   3. non-merge branch: behavior identical to before the change (one request, to as an array)
+ *   4. checkbox reset: every time the dialog opens it is unchecked
+ *   5. dirty detection: only checking / unchecking the checkbox does not produce a dirty state
+ *   6. hint text: when checked and >1 recipient, show the count; with 0/1 recipients, do not show
+ *   7. mode isolation: .merge-row is shown only in compose mode; in reply mode it is hidden and the payload never contains merge (hard defense)
+ *   8. dedup: the same address repeated 100 times still counts as 1 person, and does not trigger the backend's dynamic cap
  *
- * 注意：后端 merge 循环（src/index.ts）是 TS 且项目无构建步骤，
- * 零依赖脚本无法 require，故不在此覆盖，由 QA 用真实 wrangler dev 做集成验证。
+ * Note: the backend merge loop (src/index.ts) is TS and the project has no build step,
+ * so a zero-dependency script cannot require it; it is therefore not covered here, and integration verification is done by QA with a real wrangler dev.
  * ========================================================= */
 
 const fs = require('fs');
 const path = require('path');
 const vm = require('vm');
 
-// QA_APP_JS 仅用于「变异验证」：指向一份人工构造的缺陷版 app.js。
-// 缺了这个钩子，变异脚本会「跑仓库原文件却以为跑的是变体」→ 变体恒不被抓（假阴性）。
+// QA_APP_JS is only for "mutation verification": point it at a hand-crafted defective app.js.
+// Without the hook, the mutation script would "run the repo's original file while thinking it is the variant" -> the variant is never caught (false negative).
 const APP_JS_PATH = process.env.QA_APP_JS || path.join(__dirname, '..', 'public', 'app.js');
 const SRC = fs.readFileSync(APP_JS_PATH, 'utf8');
 
@@ -45,26 +45,26 @@ const pieces = [
   slice('function esc(s) {', '\n}\n', 'esc') + '\n}\n',
   slice('function timeLong(sec) {', '\n}\n', 'timeLong') + '\n}\n',
   slice('function fmtSize(n) {', '\n}\n', 'fmtSize') + '\n}\n',
-  // 写信相关全部真实实现（含 parseRecipients / updateMergeHint / resetMergePick /
-  // openComposer / openReplyComposer / 守卫块 / sendCompose）
+  // all the compose-related real implementations (including parseRecipients / updateMergeHint / resetMergePick /
+  // openComposer / openReplyComposer / guard block / sendCompose)
   slice(
     'function plainToHtmlText(text) {',
-    '\n\n/* ---------------- 搜索 / 键盘 / 事件 / 同步 ---------------- */',
+    '\n\n/* ---------------- Search / keyboard / events / sync ---------------- */',
     'compose 主体'
   ),
-  // setupEvents 中与写信弹窗相关的事件接线（含 #f-merge / #f-to 的监听）
+  // the event wiring in setupEvents related to the composer dialog (including the #f-merge / #f-to listeners)
   slice(
     "  $('#compose-btn').addEventListener('click', openComposer);",
     '\n\n  setupSearch();',
     '事件接线'
   ),
-  // 移动端布局模块（isMobile / syncLayout / setDrawer / closeDrawer）。
-  // 上面的「事件接线」slice 里引用了 setDrawer / closeDrawer / drawerOpen，
-  // 不把这段一起抽出来会直接 ReferenceError；它自身只依赖 $ / state / globalThis，桩里都有。
-  slice('/* ---------------- 移动端布局', '/* ---------------- API ---------------- */', '移动端布局'),
+  // mobile layout module (isMobile / syncLayout / setDrawer / closeDrawer).
+  // The "event wiring" slice above references setDrawer / closeDrawer / drawerOpen,
+  // so not extracting this piece together would directly ReferenceError; it itself only depends on $ / state / globalThis, all present in the stubs.
+  slice('/* ---------------- Mobile layout', '/* ---------------- API ---------------- */', '移动端布局'),
 ];
 
-// 未被抽取、但会被引用到的符号
+// symbols that are not extracted but will be referenced
 const stubs = `
 const MAX_FILE_BYTES = 40 * 1024 * 1024;
 let currentMessage = null;
@@ -77,12 +77,12 @@ function openFolder() {}
 function loadFolder() {}
 function isTypingTarget() { return false; }
 function moveSelection() {}
-// 详情面板的关闭/渲染不在本套件的关注范围（且依赖 detailSeq / currentThread 等一整套详情态），
-// 事件接线里引用了它，故给桩。移动端行为由 test/mobile-layout.dom.test.js 用真实实现覆盖。
+// The detail pane's close/render are outside this suite's concern (and depend on a whole detail state such as detailSeq / currentThread),
+// but the event wiring references them, so a stub is given. Mobile behavior is covered by test/mobile-layout.dom.test.js with the real implementation.
 function closeMessagePane() {}
 `;
 
-// 探针：把块级 let 绑定暴露出来，便于外部观测与复位（仅测试用）
+// probe: expose the block-level let bindings for external observation and reset (test only)
 const probe = `
 globalThis.__t = {
   get sendInFlight() { return sendInFlight; },
@@ -90,8 +90,8 @@ globalThis.__t = {
   resetGuard() { discardConfirmPending = false; composerLastFocus = null; },
   clearBaseline() { composerBaseline = null; },
   setCurrentMessage(m) { currentMessage = m; },
-  // 把当前表单重新快照为基线（与 openComposer 内同一表达式），
-  // 用于隔离出「勾选 checkbox」这一个变量。
+  // re-snapshot the current form as the baseline (same expression as inside openComposer),
+  // used to isolate the single variable of "checking the checkbox".
   rebaseline() {
     composerBaseline = {
       to: $('#f-to').value,
@@ -104,7 +104,7 @@ globalThis.__t = {
 };
 `;
 
-/* ---------------- 极简 DOM 桩 ---------------- */
+/* ---------------- minimal DOM stub ---------------- */
 
 const els = {};
 const listeners = {};
@@ -122,7 +122,7 @@ class El {
   constructor(id) {
     this.id = id;
     this.value = '';
-    this.checked = false; // checkbox 支持
+    this.checked = false; // checkbox support
     this.disabled = false;
     this._text = '';
     this._html = '';
@@ -155,7 +155,7 @@ class El {
       .replace(/&amp;/g, '&');
   }
   focus() { this.focused++; }
-  // 生产代码会给发件人摘要行写 aria-expanded（真实浏览器里 DOM 元素本来就有这两个方法）
+  // production code writes aria-expanded on the sender summary row (in a real browser DOM elements have these two methods natively)
   setAttribute(k, v) { this._attrs[k] = String(v); }
   getAttribute(k) { return Object.prototype.hasOwnProperty.call(this._attrs, k) ? this._attrs[k] : null; }
   addEventListener(ev, fn) { on(this.id, ev, fn); }
@@ -199,10 +199,10 @@ const sandbox = {
     mailboxList: [],
     folder: 'inbox',
     cache: { countsAt: 0 },
-    // 真实 state 里也有这两个字段（收件人联想用）；补上以免桩与生产形状漂移
+    // the real state also has these two fields (used for recipient suggestions); add them so the stub does not drift from the production shape
     contacts: [],
     contactsLoaded: false,
-    // 移动端布局（syncLayout）会读它；同样是「补上以免形状漂移」
+    // mobile layout (syncLayout) reads it; likewise "add it so the shape does not drift"
     openId: null,
   },
   $: (s) => el(s),
@@ -218,7 +218,7 @@ const T = S.__t;
 const st = S.state;
 const toasts = S.__toasts;
 
-/* ---------------- 断言辅助 ---------------- */
+/* ---------------- assertion helpers ---------------- */
 
 let pass = 0;
 let fail = 0;
@@ -246,7 +246,7 @@ const REPLY_MSG = {
   body_text: '原文第一行\n原文第二行',
 };
 
-/** 走真实的 openComposer()，因此基线/勾选重置都由生产代码执行 */
+/** Go through the real openComposer(), so the baseline / checkbox reset are performed by production code */
 function reset() {
   for (const e of Object.values(els)) e.focused = 0;
   toasts.length = 0;
@@ -254,7 +254,7 @@ function reset() {
   S.openComposer();
   T.resetGuard();
 }
-/** 走真实的 openReplyComposer() */
+/** Go through the real openReplyComposer() */
 function resetReply() {
   for (const e of Object.values(els)) e.focused = 0;
   toasts.length = 0;
@@ -264,7 +264,7 @@ function resetReply() {
   T.resetGuard();
 }
 
-/** 记录每次 api 调用的 url/opts，并返回可手动兑现的控制器 */
+/** Record each api call's url/opts, and return a controller that can be resolved manually */
 function captureApi() {
   const calls = [];
   let resolveFn;
@@ -274,7 +274,7 @@ function captureApi() {
   return { calls, resolve: resolveFn, reject: rejectFn };
 }
 
-/* ---------------- 用例 ---------------- */
+/* ---------------- test cases ---------------- */
 
 async function main() {
   console.log('\n[1] parseRecipients：分隔符 / trim / 去空 / 大小写去重 / 边界');
@@ -293,7 +293,7 @@ async function main() {
   eq(S.parseRecipients('   '), [], '仅空白 -> 空数组');
   eq(S.parseRecipients(null), [], 'null -> 空数组');
   eq(S.parseRecipients(undefined), [], 'undefined -> 空数组');
-  // 唯一调用点是 input.value（永远是字符串）；此处只确认非字符串入参不抛错
+  // the only call site is input.value (always a string); here we only confirm non-string arguments do not throw
   eq(S.parseRecipients(0), ['0'], '非字符串入参经 String() 归一化，不抛错');
 
   console.log('\n[2] hint 文案：勾选且 >1 收件人才显示人数');
@@ -343,7 +343,7 @@ async function main() {
   reset();
   el('#f-to').value = 'a@x.com, b@y.com';
   el('#f-body').value = 'body';
-  T.rebaseline(); // 把收件人/正文纳入基线，隔离出 checkbox 这一个变量
+  T.rebaseline(); // bring the recipients/body into the baseline, isolating the single variable of the checkbox
   ok(S.isComposerDirty() === false, '基线状态下 -> 不脏');
   el('#f-merge').checked = true;
   fire('#f-merge', 'change', {});
@@ -351,7 +351,7 @@ async function main() {
   el('#f-merge').checked = false;
   fire('#f-merge', 'change', {});
   ok(S.isComposerDirty() === false, '取消勾选 -> 仍不脏');
-  // 空表单上勾选后点外部：没有内容可丢，应直接关闭而不是弹「放弃确认」
+  // checking the box on an empty form then clicking outside: nothing to lose, should close directly instead of popping the "discard" confirm
   reset();
   el('#f-merge').checked = true;
   fire('#f-merge', 'change', {});
@@ -491,7 +491,7 @@ async function main() {
   fire('#f-merge', 'change', {});
   const c8 = captureApi();
   const s8 = S.sendCompose();
-  // 关键契约：HTTP 200 + ok:false + failed 明细（api() 因此不会 throw，前端拿得到 failed）
+  // key contract: HTTP 200 + ok:false + failed details (so api() does not throw and the frontend can get failed)
   c8.resolve({
     ok: false, merge: true, total: 2, sent_count: 0, failed_count: 2,
     sent: [],
@@ -506,7 +506,7 @@ async function main() {
   ok(lastToast().includes('已发送 0 封') && lastToast().includes('2 封失败'), `toast 反映全失败（实际：${lastToast()}）`);
   ok(!lastToast().includes('发送失败：'), '全失败不走「发送失败」异常分支（说明响应为 200）');
   ok(T.sendInFlight === false, '全失败 -> sendInFlight 已复位');
-  // 全失败后仍可正常关窗（本轮起语义是「存草稿并关闭」，内容确实没发出去，所以转存草稿）
+  // after all fail the dialog can still be closed normally (since this round the semantics are "save draft and close"; the content really was not sent, so it is saved as a draft)
   S.requestCloseComposer();
   ok(confirmShown() === false, '全失败后点外部 -> 不弹放弃确认');
   ok(composerOpen() === false, '全失败后点外部 -> 存草稿并关闭');
@@ -559,7 +559,7 @@ async function main() {
   ok(Array.isArray(c11.calls[0].body.to) && c11.calls[0].body.to[0] === 'alice@example.com', '回复 payload.to 也是数组');
   ok(c11.calls[0].body.merge === undefined, '回复 payload 不含 merge');
   ok(lastToast() === '回复已发送', 'toast 与改造前一致');
-  // 硬防御：即使 checkbox 被强行勾上（DOM 被改 / 残留状态），也绝不向 reply 接口发 merge
+  // hard defense: even if the checkbox is force-checked (DOM modified / stale state), never send merge to the reply endpoint
   resetReply();
   el('#f-to').value = 'alice@example.com, bob@example.com';
   el('#f-body').value = '收到';
@@ -571,7 +571,7 @@ async function main() {
   await s11b;
   ok(c11b.calls[0].body.merge === undefined, '回复模式强行勾选 -> payload 仍不含 merge（硬防御生效）');
   ok(c11b.calls[0].body.to.length === 2, '回复模式 -> payload.to 仍按输入切分为 2 个地址');
-  // 对照：写信模式同一份 DOM 状态下 merge 必须照常发出
+  // contrast: in compose mode with the same DOM state, merge must be sent as usual
   reset();
   ok(mergeRowHidden() === false, '写信模式 -> .merge-row 不带 hidden');
   el('#f-to').value = 'alice@example.com, bob@example.com';
