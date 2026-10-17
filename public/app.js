@@ -4081,8 +4081,8 @@ function showDomainWizard(status, opts = {}) {
       ${gateField('gate-domain', '域名', 'text', adding ? '' : (status && status.domain) || '', 'example.com')}
       ${gateField('gate-cf', 'Cloudflare API Token', 'password', '', 'Zone:Read + DNS:Edit + Email Routing')}
       ${gateField('gate-resend', 'Resend API Key', 'password', '', 're_…（保存在你自己的数据库，用于发信）')}
-      ${gateField('gate-from', '发件地址', 'text', adding ? '' : (status && status.from_address) || '', 'noreply@example.com')}
-      ${gateField('gate-fromname', '发件显示名（可选）', 'text', '', '')}
+      ${adding ? '' : gateField('gate-from', '发件地址', 'text', (status && status.from_address) || '', 'noreply@example.com')}
+      ${adding ? '' : gateField('gate-fromname', '发件显示名（可选）', 'text', '', '')}
       <div class="gate-error" id="gate-error"></div>
       <div id="gate-steps" class="gate-steps"></div>
       <div class="gate-actions">
@@ -4095,7 +4095,9 @@ function showDomainWizard(status, opts = {}) {
   const domainEl = $('#gate-domain');
   const fromEl = $('#gate-from');
   // When the domain changes, if the from address isn't customized yet, auto-fill noreply@<domain>
+  // (setup only; the add-domain flow has no sender fields — senders are derived in the composer).
   domainEl.addEventListener('blur', () => {
+    if (!fromEl) return;
     const d = domainEl.value.trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '');
     if (d && (!fromEl.value || /^noreply@/.test(fromEl.value))) fromEl.value = `noreply@${d}`;
   });
@@ -4121,8 +4123,8 @@ function showDomainWizard(status, opts = {}) {
     const domain = domainEl.value.trim();
     const cf_token = $('#gate-cf').value.trim();
     const resend_key = $('#gate-resend').value.trim();
-    const from_address = fromEl.value.trim();
-    const from_name = $('#gate-fromname').value.trim();
+    const from_address = fromEl ? fromEl.value.trim() : '';
+    const from_name = $('#gate-fromname') ? $('#gate-fromname').value.trim() : '';
     const err = $('#gate-error');
     err.textContent = '';
     if (!domain || !cf_token || !resend_key) {

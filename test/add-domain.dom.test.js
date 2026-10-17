@@ -186,6 +186,7 @@ async function test(name, fn) {
     ok(el(ctx, '#gate-domain').value === '', 'adding 模式下域名预填为空（不复用主域）');
     ok(!!el(ctx, '#gate-cancel'), '存在「取消」按钮');
     ok(!el(ctx, '#gate-skip'), '负控制：setup 向导专有的「暂不设置」不应出现在添加模式');
+    ok(!el(ctx, '#gate-from') && !el(ctx, '#gate-fromname'), '添加模式不再显示发件地址/显示名（发件人由 composer 派发）');
   });
 
   await test('A2 客户端守卫：缺字段不发请求', async (ctx) => {
