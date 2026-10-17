@@ -1,5 +1,5 @@
 import type { Env, SendResult } from './types';
-import { escapeHtml, parseJsonObject } from './util';
+import { escapeHtml, parseJsonObject, domainOf } from './util';
 
 /** Convert plain text into safely displayable HTML (escape + line breaks). */
 export function textToHtml(text: string): string {
@@ -46,15 +46,41 @@ export interface SenderIdentity {
 export function senderIdentity(env: Env, mailbox: string): SenderIdentity {
   const addr = (mailbox || '').trim().toLowerCase();
   const def = (env.SEND_FROM_ADDRESS || '').trim().toLowerCase();
-  const defDomain = def.split('@')[1];
-  const mboxDomain = addr.split('@')[1];
+  const domains = sendingDomains(env);
+  const mboxDomain = domainOf(addr) ?? '';
   const defaultName = (env.SEND_FROM_NAME || '').trim();
 
-  if (!addr || !defDomain || mboxDomain !== defDomain) {
-    return { from: buildFrom(env), address: def, name: defaultName };
+  // The gate is the **set of configured domains**: any local part on any of them may send (custom senders work even if they
+  // differ from the default address). Empty or cross-domain senders fall back to the default, so we never
+  // impersonate an unverified domain.
+  if (addr && mboxDomain && domains.includes(mboxDomain)) {
+    const name = addr === def ? defaultName : localPart(addr);
+    return { from: name ? `${name} <${addr}>` : addr, address: addr, name };
   }
-  const name = addr === def ? defaultName : localPart(addr);
-  return { from: name ? `${name} <${addr}>` : addr, address: addr, name };
+  return { from: buildFrom(env), address: def, name: defaultName };
+}
+
+/** All domains allowed to send: the configured set (SENDING_DOMAINS), else SENDING_DOMAIN, else the default from address's domain. */
+export function sendingDomains(env: Env): string[] {
+  const out: string[] = [];
+  for (const raw of (env.SENDING_DOMAINS || '').split(',')) {
+    const d = raw.trim().toLowerCase();
+    if (d && !out.includes(d)) out.push(d);
+  }
+  if (!out.length) {
+    const single = (env.SENDING_DOMAIN || '').trim().toLowerCase();
+    if (single) out.push(single);
+  }
+  if (!out.length) {
+    const d = domainOf((env.SEND_FROM_ADDRESS || '').trim().toLowerCase());
+    if (d) out.push(d);
+  }
+  return out;
+}
+
+/** The primary sending domain: the first of sendingDomains(). */
+export function sendingDomain(env: Env): string {
+  return sendingDomains(env)[0] || '';
 }
 
 /** Build the sender for the given mailbox; fall back to the default sender if the mailbox's domain is not the default sending domain. */

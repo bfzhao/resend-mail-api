@@ -87,6 +87,12 @@ const state = {
   canSend: false,
   fromAddress: '',
   fromName: '',
+  /** Domain filter selected in the top bar ('' = all domains). Narrows the list, counts, mailboxes and sender picker. */
+  domain: '',
+  /** All configured domains (from GET /api/account); drives the top-bar domain switcher and the custom-sender validation. */
+  domains: [],
+  /** Session-only custom sender addresses added via the composer "+" button; they become real (visible in /api/mailboxes) after the first send. */
+  customSenders: [],
   /** Local contacts (GET /api/contacts), used for recipient input autocomplete. */
   contacts: [],
   contactsLoaded: false,
@@ -355,7 +361,7 @@ async function api(path, opts = {}) {
 /* ---------------- Cache ---------------- */
 
 function folderKey() {
-  return `${state.mailbox}|${state.folder}|${state.q}`;
+  return `${state.domain}|${state.mailbox}|${state.folder}|${state.q}`;
 }
 
 /** Lightweight fingerprint: first/last id + total + per-row read/starred, used for "don't re-render if data hasn't changed". */
@@ -588,6 +594,7 @@ function writePersisted() {
     at: Date.now(),
     folderKey: folderKey(),
     mailbox: state.mailbox,
+    domain: state.domain,
     folderName: state.folder,
     q: state.q,
     folder: { items: state.items, total: state.total },
@@ -624,6 +631,7 @@ function restorePersisted() {
     if (p.counts && typeof p.counts === 'object') state.counts = { ...state.counts, ...p.counts };
     if (Array.isArray(p.mailboxes)) state.mailboxList = p.mailboxes;
     if (typeof p.mailbox === 'string') state.mailbox = p.mailbox;
+    if (typeof p.domain === 'string') state.domain = p.domain;
     if (typeof p.openId === 'string') state.openId = p.openId;
     // Persisted order is "least recently used → most recently used"; setting them in order restores the LRU order
     if (Array.isArray(p.messages)) {
@@ -846,6 +854,58 @@ function renderMailboxSelect() {
   state.mailbox = target;
 }
 
+/* ---------------- Top-bar domain switcher (multi-domain) ---------------- */
+
+/** Domain part of an address (lowercased), or '' when absent. */
+function addrDomain(addr) {
+  const s = String(addr || '').trim().toLowerCase();
+  const at = s.lastIndexOf('@');
+  return at > 0 && at < s.length - 1 ? s.slice(at + 1) : '';
+}
+
+/** Render the domain filter strip. Hidden when fewer than two domains are configured (nothing to filter). */
+function renderDomainBar() {
+  const bar = $('#domain-bar');
+  if (!bar) return;
+  const list = Array.isArray(state.domains) ? state.domains : [];
+  if (list.length < 2) {
+    bar.classList.add('hidden');
+    bar.innerHTML = '';
+    return;
+  }
+  bar.classList.remove('hidden');
+  bar.innerHTML = '';
+  const make = (value, label) => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'domain-chip' + (state.domain === value ? ' active' : '');
+    btn.dataset.domain = value;
+    btn.textContent = label;
+    btn.addEventListener('click', () => switchDomain(value));
+    return btn;
+  };
+  bar.appendChild(make('', '全部域名'));
+  for (const d of list) bar.appendChild(make(d, d));
+}
+
+/** Switch the domain filter: re-fetch the list, counts and mailbox list for the new domain. */
+function switchDomain(domain) {
+  const next = (domain || '').toLowerCase();
+  if (next === state.domain) return;
+  state.domain = next;
+  state.selected.clear();
+  state.mailbox = ''; // a mailbox from the previous domain may not exist under the new one; let renderMailboxSelect re-derive it
+  state.cache.countsAt = 0;
+  state.cache.mailboxesAt = 0;
+  closeMessagePane();
+  renderDomainBar();
+  renderMailboxSelect();
+  void loadMailboxes(true);
+  void refreshCounts(true);
+  void loadFolder();
+  persistSoon();
+}
+
 function renderNav() {
   const nav = $('#folder-nav');
   nav.innerHTML = '';
@@ -891,7 +951,11 @@ function renderTitle() {
 }
 
 function countQuery() {
-  return state.mailbox ? `?mailbox=${encodeURIComponent(state.mailbox)}` : '';
+  const params = new URLSearchParams();
+  if (state.mailbox) params.set('mailbox', state.mailbox);
+  if (state.domain) params.set('domain', state.domain);
+  const s = params.toString();
+  return s ? `?${s}` : '';
 }
 
 async function refreshCounts(force = false) {
@@ -922,7 +986,7 @@ async function loadMailboxes(force = false) {
   }
   c.mailboxesLoading = true;
   try {
-    const data = await api('/api/mailboxes');
+    const data = await api(`/api/mailboxes${state.domain ? `?domain=${encodeURIComponent(state.domain)}` : ''}`);
     state.mailboxList = data.mailboxes || [];
     c.mailboxesAt = Date.now();
     renderMailboxSelect();
@@ -1008,6 +1072,7 @@ function fetchFolderPage(offset) {
   const params = new URLSearchParams({ limit: String(PAGE_SIZE), offset: String(offset) });
   if (state.q) params.set('q', state.q);
   if (state.mailbox) params.set('mailbox', state.mailbox);
+  if (state.domain) params.set('domain', state.domain);
   return api(`/api/folders/${state.folder}?${params}`);
 }
 
@@ -2448,10 +2513,37 @@ function toggleSenderExpanded() {
 function composerMailboxOptions() {
   // "(unrecognized)" is a display grouping used for aggregation, not a sendable address, so it must not appear in the sender picker.
   const list = state.mailboxList.map((m) => m.mailbox).filter((m) => m && m !== UNKNOWN_MAILBOX);
+  const custom = Array.isArray(state.customSenders) ? state.customSenders : [];
+  for (const c of custom) if (c && !list.includes(c)) list.push(c);
   if (state.fromAddress && !list.includes(state.fromAddress.toLowerCase())) list.unshift(state.fromAddress.toLowerCase());
   const def = state.composing && state.composing.mailbox ? state.composing.mailbox : '';
   if (def && !list.includes(def)) list.unshift(def);
-  return list;
+  // When a domain filter is active, only offer senders on that domain.
+  return state.domain ? list.filter((a) => addrDomain(a) === state.domain) : list;
+}
+
+/**
+ * Add a custom sender on one of the configured domains. Session-only: it does not persist until the first send,
+ * after which the address naturally shows up in /api/mailboxes (it is now a real "mailbox").
+ */
+function addCustomSender() {
+  if (!state.composing) return;
+  const domains = Array.isArray(state.domains) ? state.domains : [];
+  const preferred = state.domain || domains[0] || '';
+  const input = prompt(
+    preferred ? `自定义发件人地址（需为 ${preferred} 下的地址）` : '自定义发件人地址',
+    preferred ? `noreply@${preferred}` : ''
+  );
+  if (input === null) return;
+  const addr = input.trim().toLowerCase();
+  if (!/^[^\s@]+@[^\s@]+$/.test(addr)) { alert('地址格式不正确'); return; }
+  const d = addrDomain(addr);
+  if (domains.length && !domains.includes(d)) { alert(`发件地址的域名必须是：${domains.join(' / ')}`); return; }
+  if (!state.customSenders.includes(addr)) state.customSenders.push(addr);
+  state.composing.mailbox = addr;
+  renderMailboxPicker();
+  setSenderExpanded(true);
+  renderSenderSummary();
 }
 
 function renderMailboxPicker() {
@@ -3599,6 +3691,7 @@ function setupEvents() {
   // Sender: click the summary row to expand/collapse; the summary must update when the selection changes (otherwise collapsing shows the old address)
   $('#f-sender-toggle').addEventListener('click', toggleSenderExpanded);
   $('#f-mailbox').addEventListener('change', renderSenderSummary);
+  $('#f-sender-add').addEventListener('click', addCustomSender);
   // Mail merge: the checked state and recipient count both affect the hint text
   $('#f-merge').addEventListener('change', updateMergeHint);
   $('#f-to').addEventListener('input', updateMergeHint);
@@ -4055,6 +4148,12 @@ async function loadAccount() {
     state.canSend = !!account.can_send;
     state.fromAddress = account.from_address;
     state.fromName = account.from_name;
+    state.domains = Array.isArray(account.domains) && account.domains.length
+      ? account.domains.map((d) => String(d).toLowerCase()).filter(Boolean)
+      : (account.domain ? [String(account.domain).toLowerCase()] : []);
+    // Drop a restored domain filter that is no longer configured.
+    if (state.domain && !state.domains.includes(state.domain)) state.domain = '';
+    renderDomainBar();
   } catch (e) {
     showToast(e.message, true);
   }
@@ -4068,12 +4167,14 @@ async function init() {
   // 1) Synchronously restore local cache → first paint shows the list / count badges / account dropdown with 0 requests
   const restored = restorePersisted();
   const mailboxAtStart = state.mailbox;
+  const domainAtStart = state.domain;
 
   setupEvents();
   applyListWidth(loadListWidth()); // restore the list width set by the last drag (null if not customized, using the CSS default)
   syncLayout(); // align layout state first (the first paint may already fall within the mobile breakpoint)
   renderNav();
   renderMailboxSelect();
+  renderDomainBar();
   renderListTitle();
 
   if (restored) {
@@ -4099,7 +4200,15 @@ async function init() {
     loadBackendStatus(),
   ]);
 
-  if (state.mailbox !== mailboxAtStart) void loadFolder(false, true); // the cached account was invalid; refetch with the corrected account
+  // The restored mailbox/domain filter may have been dropped by loadAccount (no longer configured); refresh with the corrected filter.
+  if (state.mailbox !== mailboxAtStart || state.domain !== domainAtStart) {
+    state.cache.mailboxesAt = 0;
+    state.cache.countsAt = 0;
+    renderMailboxSelect();
+    void loadMailboxes(true);
+    void refreshCounts(true);
+    void loadFolder(false, true);
+  }
 
   // 3) Restore the previously opened email (only if it's still in the current list)
   if (state.pendingOpenId) {

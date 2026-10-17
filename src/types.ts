@@ -7,6 +7,10 @@ export interface Env {
   RESEND_API_KEY?: string;
   SEND_FROM_ADDRESS?: string;
   SEND_FROM_NAME?: string;
+  /** The configured sending domain (written by the wizard into app_config). Any address on this domain may send. */
+  SENDING_DOMAIN?: string;
+  /** Comma-separated list of **all** configured domains (multi-domain). Supersedes SENDING_DOMAIN; populated by withRuntimeConfig. */
+  SENDING_DOMAINS?: string;
   MERGE_SUBREQ_BUDGET?: string;
   API_USERNAME?: string;
   API_PASSWORD?: string;

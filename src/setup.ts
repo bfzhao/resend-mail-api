@@ -55,6 +55,16 @@ export async function withRuntimeConfig(env: Env): Promise<Env> {
   if (!merged.RESEND_API_KEY && cfg.resend_api_key) merged.RESEND_API_KEY = cfg.resend_api_key;
   if (!merged.SEND_FROM_ADDRESS && cfg.from_address) merged.SEND_FROM_ADDRESS = cfg.from_address;
   if (!merged.SEND_FROM_NAME && cfg.from_name) merged.SEND_FROM_NAME = cfg.from_name;
+  if (!merged.SENDING_DOMAIN && cfg.domain) merged.SENDING_DOMAIN = cfg.domain;
+  // Multi-domain: expose every configured domain so any address on any of them may send (see sendingDomains in src/send.ts).
+  if (!merged.SENDING_DOMAINS) {
+    try {
+      const doms = await repo.listDomains(env);
+      if (doms.length) merged.SENDING_DOMAINS = doms.map((d) => d.domain).join(',');
+    } catch {
+      /* older database without the domains table: fall back to the single SENDING_DOMAIN */
+    }
+  }
   return merged;
 }
 
@@ -146,6 +156,21 @@ export async function configureDomain(
   await repo.setConfig(env, 'from_name', fromName);
   await repo.setConfig(env, 'worker_name', workerName);
   await repo.setConfig(env, 'setup_complete', '1');
+
+  // Multi-domain: also record the domain in its own table (the per-domain source of truth; app_config keeps the "primary" one).
+  try {
+    await repo.upsertDomain(env, {
+      domain,
+      zoneId,
+      resendDomainId: resendDomainId || null,
+      fromAddress,
+      fromName,
+      workerName,
+      enabled: true,
+    });
+  } catch {
+    /* older database without the domains table */
+  }
 
   return { ok: steps.every((s) => s.ok), steps };
 }

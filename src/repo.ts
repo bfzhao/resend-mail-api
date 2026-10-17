@@ -1,5 +1,5 @@
 import type { AttachmentRow, Env, Folder, InboundRawRow, MessageRow } from './types';
-import { nowSec, uuid, contentDisposition, jsonArr } from './util';
+import { nowSec, uuid, contentDisposition, jsonArr, domainOf } from './util';
 
 export interface PreparedAttachment {
   filename: string;
@@ -67,6 +67,8 @@ export interface ListOpts {
   q?: string | null;
   unread?: boolean;
   mailbox?: string;
+  /** Restrict to one domain (top-bar switcher); matches the derived `mailbox_domain` column. */
+  domain?: string;
   limit: number;
   offset: number;
 }
@@ -98,12 +100,18 @@ function mailboxCond(mailbox: string): { sql: string; params: unknown[] } {
   return { sql: 'mailbox = ?', params: [mailbox] };
 }
 
+/** domain filter condition: matches the derived mailbox_domain column (lowercased). Applies to messages and drafts alike. */
+function domainCond(domain: string): { sql: string; params: unknown[] } {
+  return { sql: 'mailbox_domain = ?', params: [domain.trim().toLowerCase()] };
+}
+
 /** The DB row params assembled after uploading stored attachments to R2 are already included in attachments[]. */
 function whereForFolder(
   folder: Folder,
   q: string | null | undefined,
   unread: boolean,
-  mailbox?: string
+  mailbox?: string,
+  domain?: string
 ): { sql: string; params: unknown[] } {
   const conds: string[] = [];
   const params: unknown[] = [];
@@ -124,6 +132,11 @@ function whereForFolder(
   }
   if (mailbox) {
     const c = mailboxCond(mailbox);
+    conds.push(c.sql);
+    params.push(...c.params);
+  }
+  if (domain) {
+    const c = domainCond(domain);
     conds.push(c.sql);
     params.push(...c.params);
   }
@@ -192,7 +205,7 @@ async function applyFoldedThreadCounts(env: Env, items: FolderRow[]): Promise<vo
 export async function listFolder(env: Env, opts: ListOpts): Promise<{ items: FolderRow[]; total: number }> {
   // unread is not handled in whereForFolder, but filtered by the thread_unread computed by an outer window function,
   // so "unread only" shows "the latest message of the whole thread containing unread mail", not just that unread message itself.
-  const w = whereForFolder(opts.folder, opts.q, false, opts.mailbox);
+  const w = whereForFolder(opts.folder, opts.q, false, opts.mailbox, opts.domain);
   const whereSql = w.sql ? `WHERE ${w.sql}` : '';
   const unreadCond = opts.unread === true ? 'AND thread_unread > 0' : '';
 
@@ -301,12 +314,17 @@ export interface DraftInput {
  */
 export async function listDrafts(
   env: Env,
-  opts: { q?: string | null; mailbox?: string; limit: number; offset: number }
+  opts: { q?: string | null; mailbox?: string; domain?: string; limit: number; offset: number }
 ): Promise<{ items: FolderRow[]; total: number }> {
   const conds: string[] = [];
   const params: unknown[] = [];
   if (opts.mailbox) {
     const c = mailboxCond(opts.mailbox);
+    conds.push(c.sql);
+    params.push(...c.params);
+  }
+  if (opts.domain) {
+    const c = domainCond(opts.domain);
     conds.push(c.sql);
     params.push(...c.params);
   }
@@ -359,10 +377,11 @@ export async function getDraft(env: Env, id: string): Promise<DraftRow | null> {
 export async function upsertDraft(env: Env, d: DraftInput): Promise<void> {
   const now = nowSec();
   await env.DB.prepare(
-    `INSERT INTO drafts (id, mailbox, mode, source_id, to_emails, cc, bcc, subject, body_html, body_text, rich, updated_at, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `INSERT INTO drafts (id, mailbox, mailbox_domain, mode, source_id, to_emails, cc, bcc, subject, body_html, body_text, rich, updated_at, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(id) DO UPDATE SET
        mailbox = excluded.mailbox,
+       mailbox_domain = excluded.mailbox_domain,
        mode = excluded.mode,
        source_id = excluded.source_id,
        to_emails = excluded.to_emails,
@@ -377,6 +396,7 @@ export async function upsertDraft(env: Env, d: DraftInput): Promise<void> {
     .bind(
       d.id,
       d.mailbox,
+      domainOf(d.mailbox),
       d.mode,
       d.sourceId,
       JSON.stringify(d.to),
@@ -396,7 +416,7 @@ export async function deleteDraft(env: Env, id: string): Promise<void> {
   await env.DB.prepare('DELETE FROM drafts WHERE id = ?').bind(id).run();
 }
 
-export async function sidebarCounts(env: Env, mailbox?: string): Promise<{
+export async function sidebarCounts(env: Env, mailbox?: string, domain?: string): Promise<{
   inbox_unread: number;
   inbox_total: number;
   sent_total: number;
@@ -408,6 +428,11 @@ export async function sidebarCounts(env: Env, mailbox?: string): Promise<{
   const params: unknown[] = [];
   if (mailbox) {
     const c = mailboxCond(mailbox);
+    conds.push(c.sql);
+    params.push(...c.params);
+  }
+  if (domain) {
+    const c = domainCond(domain);
     conds.push(c.sql);
     params.push(...c.params);
   }
@@ -448,10 +473,12 @@ export async function sidebarCounts(env: Env, mailbox?: string): Promise<{
  * by an ordered scan of the covering index, no longer producing `TEMP B-TREE FOR GROUP BY` (measured 20000 rows 100ms → 4.0ms).
  * Empty-string/NULL normalization is marked as a sentinel in the SELECT and merged by sentinel key in JS (if NULL and '' appear together they produce two rows).
  */
-export async function mailboxes(env: Env): Promise<
+export async function mailboxes(env: Env, domain?: string): Promise<
   Array<{ mailbox: string; inbox_unread: number; inbox_total: number; sent_total: number }>
 > {
   const groupExpr = "CASE WHEN mailbox IS NULL OR mailbox = '' THEN ? ELSE mailbox END";
+  const domParam = domain ? domain.trim().toLowerCase() : null;
+  const whereSql = domParam ? 'WHERE mailbox_domain = ?' : '';
   const rows = await env.DB.prepare(
     `SELECT
        ${groupExpr} AS mailbox,
@@ -459,9 +486,10 @@ export async function mailboxes(env: Env): Promise<
        SUM(CASE WHEN direction='inbound' AND deleted=0 THEN 1 ELSE 0 END) AS inbox_total,
        SUM(CASE WHEN direction='outbound' AND deleted=0 THEN 1 ELSE 0 END) AS sent_total
      FROM messages
+     ${whereSql}
      GROUP BY mailbox
      ORDER BY inbox_unread DESC, mailbox ASC`
-  ).bind(UNKNOWN_MAILBOX).all<{ mailbox: string | null; inbox_unread: number | null; inbox_total: number | null; sent_total: number | null }>();
+  ).bind(...(domParam ? [UNKNOWN_MAILBOX, domParam] : [UNKNOWN_MAILBOX])).all<{ mailbox: string | null; inbox_unread: number | null; inbox_total: number | null; sent_total: number | null }>();
 
   // Merge the '' / NULL sentinel group (with GROUP BY on the raw column the two are different groups and may each return a row).
   const merged = new Map<string, { mailbox: string; inbox_unread: number; inbox_total: number; sent_total: number }>();
@@ -485,6 +513,71 @@ export async function mailboxes(env: Env): Promise<
   // Merging disrupts the SQL ordering (unread descending), so re-sort in JS with the same convention; return an empty array when the group count is 0 (no inventing groups).
   out.sort((a, b) => (b.inbox_unread - a.inbox_unread) || (a.mailbox < b.mailbox ? -1 : a.mailbox > b.mailbox ? 1 : 0));
   return out;
+}
+
+/** A row of the `domains` table (multi-domain config; see schema.sql). */
+export interface DomainRow {
+  domain: string;
+  zone_id: string | null;
+  resend_domain_id: string | null;
+  from_address: string | null;
+  from_name: string | null;
+  worker_name: string | null;
+  enabled: number;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface DomainInput {
+  domain: string;
+  zoneId?: string | null;
+  resendDomainId?: string | null;
+  fromAddress?: string | null;
+  fromName?: string | null;
+  workerName?: string | null;
+  enabled?: boolean;
+}
+
+/** All configured domains, newest first. Tolerates a missing table (older databases) by returning an empty list. */
+export async function listDomains(env: Env): Promise<DomainRow[]> {
+  try {
+    const rows = (
+      await env.DB.prepare('SELECT * FROM domains ORDER BY created_at ASC, domain ASC').all<DomainRow>()
+    ).results;
+    return rows ?? [];
+  } catch {
+    return [];
+  }
+}
+
+/** Insert or update a domain row (the setup wizard calls this after a successful configure). */
+export async function upsertDomain(env: Env, d: DomainInput): Promise<void> {
+  const domain = d.domain.trim().toLowerCase();
+  const now = nowSec();
+  await env.DB.prepare(
+    `INSERT INTO domains (domain, zone_id, resend_domain_id, from_address, from_name, worker_name, enabled, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(domain) DO UPDATE SET
+       zone_id = excluded.zone_id,
+       resend_domain_id = excluded.resend_domain_id,
+       from_address = excluded.from_address,
+       from_name = excluded.from_name,
+       worker_name = excluded.worker_name,
+       enabled = excluded.enabled,
+       updated_at = excluded.updated_at`
+  )
+    .bind(
+      domain,
+      d.zoneId ?? null,
+      d.resendDomainId ?? null,
+      d.fromAddress ?? null,
+      d.fromName ?? null,
+      d.workerName ?? null,
+      d.enabled === false ? 0 : 1,
+      now,
+      now
+    )
+    .run();
 }
 
 export interface ContactRow {
@@ -833,10 +926,10 @@ function insertMessageStmt(env: Env, row: {
   const read = row.read ?? (row.direction === 'outbound' ? 1 : 0);
   return env.DB.prepare(
     `INSERT INTO messages
-      (id, direction, message_id, in_reply_to, "references", thread_id, mailbox,
+      (id, direction, message_id, in_reply_to, "references", thread_id, mailbox, mailbox_domain,
        from_name, from_email, to_emails, delivered_to, cc, bcc, reply_to, subject, body_html,
        body_text, received_at, status, resend_id, read, starred, deleted, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)`
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)`
   ).bind(
     row.id,
     row.direction,
@@ -845,6 +938,7 @@ function insertMessageStmt(env: Env, row: {
     row.references,
     row.threadId,
     row.mailbox,
+    domainOf(row.mailbox),
     row.fromName,
     row.fromEmail,
     JSON.stringify(row.to),

@@ -523,8 +523,8 @@ async function test(name, fn) {
   await test('M12 静态规则层：断点一致、桌面隐藏控件、安全区、100dvh、触摸目标', async (ctx) => {
     // 1) Both sides of the breakpoint must be consistent -- changing one side and forgetting the other is the most common drift in this project
     const mJs = /MOBILE_MAX_W\s*=\s*(\d+)/.exec(APP_JS);
-    const mobileSectionAt = APP_CSS.indexOf('移动端适配');
-    ok(mobileSectionAt >= 0, 'app.css 里能找到「移动端适配」段落标记（用它定位断点，避免撞上别的媒体查询）', mobileSectionAt);
+    const mobileSectionAt = APP_CSS.indexOf('Mobile adaptation');
+    ok(mobileSectionAt >= 0, 'app.css 里能找到「Mobile adaptation」段落标记（用它定位断点，避免撞上别的媒体查询）', mobileSectionAt);
     const cssMobile = mobileSectionAt >= 0 ? APP_CSS.slice(mobileSectionAt) : '';
     const mCss = /@media\s*\(\s*max-width\s*:\s*(\d+)px\s*\)/.exec(cssMobile);
     ok(!!mJs, 'app.js 里能提取到 MOBILE_MAX_W', mJs && mJs[1]);

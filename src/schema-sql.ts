@@ -9,6 +9,7 @@ export const SCHEMA_SQL = `CREATE TABLE IF NOT EXISTS messages (
     "references"  TEXT,
     thread_id     TEXT,
     mailbox       TEXT NOT NULL DEFAULT '',
+    mailbox_domain TEXT,
     from_name     TEXT,
     from_email    TEXT,
     to_emails     TEXT NOT NULL DEFAULT '[]',
@@ -35,6 +36,7 @@ CREATE INDEX IF NOT EXISTS idx_messages_trash  ON messages(deleted, received_at 
 CREATE INDEX IF NOT EXISTS idx_messages_resend ON messages(resend_id) WHERE resend_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_id, received_at);
 CREATE INDEX IF NOT EXISTS idx_messages_mailbox ON messages(mailbox, received_at DESC);
+CREATE INDEX IF NOT EXISTS idx_messages_mailbox_domain ON messages(mailbox_domain, deleted, received_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_counts ON messages(mailbox, direction, deleted, read, starred);
 CREATE INDEX IF NOT EXISTS idx_messages_inbox_all ON messages(deleted, received_at DESC) WHERE direction='inbound';
 CREATE INDEX IF NOT EXISTS idx_messages_sent_all  ON messages(deleted, received_at DESC) WHERE direction='outbound';
@@ -83,6 +85,7 @@ CREATE INDEX IF NOT EXISTS idx_inbound_raw_message_id ON inbound_raw(message_id)
 CREATE TABLE IF NOT EXISTS drafts (
     id          TEXT PRIMARY KEY,
     mailbox     TEXT NOT NULL DEFAULT '',
+    mailbox_domain TEXT,
     mode        TEXT NOT NULL DEFAULT 'new',
     source_id   TEXT,
     to_emails   TEXT NOT NULL DEFAULT '[]',
@@ -97,6 +100,7 @@ CREATE TABLE IF NOT EXISTS drafts (
 );
 CREATE INDEX IF NOT EXISTS idx_drafts_updated ON drafts(updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_drafts_mailbox ON drafts(mailbox, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_drafts_mailbox_domain ON drafts(mailbox_domain, updated_at DESC);
 CREATE TABLE IF NOT EXISTS app_stats (
     key        TEXT PRIMARY KEY,
     value      INTEGER NOT NULL DEFAULT 0,
@@ -113,4 +117,15 @@ CREATE TABLE IF NOT EXISTS users (
     password_hash TEXT NOT NULL,
     created_at    INTEGER NOT NULL,
     updated_at    INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS domains (
+    domain           TEXT PRIMARY KEY,
+    zone_id          TEXT,
+    resend_domain_id TEXT,
+    from_address     TEXT,
+    from_name        TEXT,
+    worker_name      TEXT,
+    enabled          INTEGER NOT NULL DEFAULT 1,
+    created_at       INTEGER NOT NULL,
+    updated_at       INTEGER NOT NULL
 );`;

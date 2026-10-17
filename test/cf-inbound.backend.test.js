@@ -314,6 +314,7 @@ function rawMime() {
   const row = db.queryOne("SELECT * FROM messages WHERE direction='inbound'");
   ok(!!row, '邮件已写入 messages', row && row.id);
   ok(row && row.mailbox === ENVELOPE.to, '⭐ mailbox = 投递地址', row && row.mailbox);
+  ok(row && row.mailbox_domain === ENVELOPE.to.split('@')[1], '⭐ mailbox_domain 派生 = mailbox 的域（多域名过滤用）', row && row.mailbox_domain);
   ok(row && JSON.stringify(JSON.parse(row.to_emails)) === JSON.stringify(['frank@example.net']),
     '⭐ to_emails = 真实 To: 头（不是投递地址）', row && row.to_emails);
   ok(row && row.to_emails !== JSON.stringify([ENVELOPE.to]),

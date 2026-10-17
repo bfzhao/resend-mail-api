@@ -6,7 +6,7 @@ import { handleInboundEmail, handleInboundQueue, replayPendingInbound } from './
 import * as repo from './repo';
 import { configureDomain, selfCheck, withRuntimeConfig } from './setup';
 import { ensureSchema } from './schema';
-import { resendSend, replySubject, forwardSubject, textToHtml, senderIdentity } from './send';
+import { resendSend, replySubject, forwardSubject, textToHtml, senderIdentity, sendingDomain, sendingDomains } from './send';
 import type { ResendAttachment } from './send';
 import { json, jsonArr, nowSec, parseAddress, parseAddressList, rootThreadId, isSaneThreadId, parseReferences, stripAngle, uuid, base64ToBytes, bytesToBase64, stripHtml } from './util';
 
@@ -130,7 +130,7 @@ async function setupStatus(request: Request, env: Env): Promise<Response> {
     from_name: cfg.from_name || env.SEND_FROM_NAME || '',
     // Whether domain resolution/sending is configured (true after the wizard writes app_config)
     complete: cfg.setup_complete === '1',
-    sending_configured: Boolean((cfg.resend_api_key || env.RESEND_API_KEY) && (cfg.from_address || env.SEND_FROM_ADDRESS)),
+    sending_configured: Boolean(cfg.resend_api_key || env.RESEND_API_KEY),
   });
 }
 
@@ -188,9 +188,10 @@ async function routeApi(request: Request, env: Env, path: string, url: URL): Pro
     const q = url.searchParams.get('q') || null;
     const unread = url.searchParams.get('unread') === '1';
     const mailbox = url.searchParams.get('mailbox') || undefined;
+    const domain = url.searchParams.get('domain') || undefined;
     const limit = clampInt(url.searchParams.get('limit'), 50, 200);
     const offset = clampInt(url.searchParams.get('offset'), 0, 100000);
-    const result = await repo.listFolder(env, { folder, q, unread, mailbox, limit, offset });
+    const result = await repo.listFolder(env, { folder, q, unread, mailbox, domain, limit, offset });
     return json({ folder, items: result.items, total: result.total, limit, offset });
   }
 
@@ -200,9 +201,10 @@ async function routeApi(request: Request, env: Env, path: string, url: URL): Pro
   if (path === '/api/folders/drafts' && method === 'GET') {
     const q = url.searchParams.get('q') || null;
     const mailbox = url.searchParams.get('mailbox') || undefined;
+    const domain = url.searchParams.get('domain') || undefined;
     const limit = clampInt(url.searchParams.get('limit'), 50, 200);
     const offset = clampInt(url.searchParams.get('offset'), 0, 100000);
-    const result = await repo.listDrafts(env, { q, mailbox, limit, offset });
+    const result = await repo.listDrafts(env, { q, mailbox, domain, limit, offset });
     return json({ folder: 'drafts', items: result.items, total: result.total, limit, offset });
   }
 
@@ -229,15 +231,36 @@ async function routeApi(request: Request, env: Env, path: string, url: URL): Pro
     return json({ error: 'Method Not Allowed' }, 405);
   }
 
-  // Sidebar counts (optionally filtered by mailbox)
+  // Sidebar counts (optionally filtered by mailbox/domain)
   if (path === '/api/counts' && method === 'GET') {
     const mailbox = url.searchParams.get('mailbox') || undefined;
-    return json(await repo.sidebarCounts(env, mailbox));
+    const domain = url.searchParams.get('domain') || undefined;
+    return json(await repo.sidebarCounts(env, mailbox, domain));
   }
 
-  // Receiving address list (multi-mailbox switching)
+  // Receiving address list (multi-mailbox switching; optionally restricted to one domain)
   if (path === '/api/mailboxes' && method === 'GET') {
-    return json({ mailboxes: await repo.mailboxes(env) });
+    const domain = url.searchParams.get('domain') || undefined;
+    return json({ mailboxes: await repo.mailboxes(env, domain) });
+  }
+
+  // Configured domains (multi-domain top-bar switcher); app_config's primary domain is included even before the domains table is populated.
+  if (path === '/api/domains' && method === 'GET') {
+    const rows = await repo.listDomains(env);
+    const seen = new Set<string>();
+    const domains: Array<{ domain: string; from_address: string | null; from_name: string | null }> = [];
+    for (const r of rows) {
+      if (r.enabled === 0 || !r.domain || seen.has(r.domain)) continue;
+      seen.add(r.domain);
+      domains.push({ domain: r.domain, from_address: r.from_address, from_name: r.from_name });
+    }
+    for (const d of sendingDomains(env)) {
+      if (!seen.has(d)) {
+        seen.add(d);
+        domains.push({ domain: d, from_address: env.SEND_FROM_ADDRESS || null, from_name: env.SEND_FROM_NAME || null });
+      }
+    }
+    return json({ domains });
   }
 
   // Local contacts (recipient input suggestions for compose/reply/forward)
@@ -248,9 +271,13 @@ async function routeApi(request: Request, env: Env, path: string, url: URL): Pro
   // Account/send capability info (for the compose UI to show the sender)
   if (path === '/api/account' && method === 'GET') {
     return json({
-      can_send: Boolean(env.RESEND_API_KEY && env.SEND_FROM_ADDRESS),
+      // Only a Resend key is required to send; the sender address itself comes from the selected mailbox
+      // (or the wizard's from-address). Any address on `domain` is accepted as a custom sender.
+      can_send: Boolean(env.RESEND_API_KEY),
       from_name: env.SEND_FROM_NAME || '',
       from_address: env.SEND_FROM_ADDRESS || '',
+      domain: sendingDomain(env),
+      domains: sendingDomains(env),
     });
   }
 

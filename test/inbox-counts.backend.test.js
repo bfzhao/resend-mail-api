@@ -309,8 +309,11 @@ const triples = (arr) => arr.map((x) => [x.inbox_unread, x.inbox_total, x.sent_t
   }
 
   // assemble the three SQL statements under test (params restored from the literals in the source)
-  const groupsParams = evalBindArgs(sql.bindArgsSrc, sql.unknownSentinel);
-  const SQL_GROUPS = substitute(sql.groupsTemplate, { groupExpr: sql.groupExpr });
+  // Note: mailboxes()'s GROUP BY template also interpolates ${whereSql} (the optional domain filter);
+  // this fixture has no domain filter, so it is substituted with an empty string.
+  const SQL_GROUPS = substitute(sql.groupsTemplate, { groupExpr: sql.groupExpr, whereSql: '' });
+  // The only placeholder left in the no-domain GROUP BY SQL is the empty-mailbox sentinel (asserted in T0).
+  const groupsParams = [sql.unknownSentinel];
   const SQL_ALL = substitute(sql.countsTemplate, { whereSql: '' });
   const SQL_PER = (mailbox) => {
     const isSentinel = mailbox === sql.unknownSentinel;

@@ -36,13 +36,13 @@ html, body {
 .hidden { display: none !important; }
 
 /*
- * 视口高度：iOS Safari 的 100vh 包含地址栏，底部内容会被遮住、页面还能上下拖。
- * dvh 跟随「当前可见视口」，地址栏收起/展开时自动跟随；不认 dvh 的老浏览器
- * 会忽略第二行、保留 100vh 回退（即原行为）。
+ * Viewport height: iOS Safari's 100vh includes the address bar, so the bottom gets hidden and the page still scrolls.
+ * dvh tracks the "currently visible viewport" and follows the address bar as it collapses/expands; older browsers that
+ * don't understand dvh ignore the second line and keep the 100vh fallback (the previous behavior).
  */
 #app { display: flex; height: 100vh; height: 100dvh; overflow: hidden; }
 
-/* ---------- 侧边栏 ---------- */
+/* ---------- Sidebar ---------- */
 #sidebar {
   width: var(--sidebar-w);
   min-width: var(--sidebar-w);
@@ -124,10 +124,10 @@ html, body {
 
 #sidebar-status { padding: 8px; color: var(--danger); font-size: 12px; }
 
-/* 侧边栏底部的后端状态：CF 存储占用 + 入站队列 + Resend 发信额度，贴近上限时变色提醒升级。 */
+/* Backend status at the bottom of the sidebar: CF storage usage + inbound queue + Resend send quota; turns color near the limit to hint at upgrading. */
 #backend-status {
   margin: 8px 6px 0;
-  margin-top: auto; /* 顶到底部（在 #sidebar-status 之上） */
+  margin-top: auto; /* Stick to the bottom (above #sidebar-status) */
   padding: 8px 8px 2px;
   border-top: 1px solid var(--border);
   display: flex;
@@ -147,7 +147,7 @@ html, body {
 #backend-status.danger .bs-row b { color: var(--danger); }
 #backend-status .bs-attn b { color: var(--warn); }
 
-/* ---------- 工作区 ---------- */
+/* ---------- Workspace ---------- */
 #workspace { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
 
 #topbar {
@@ -174,10 +174,37 @@ html, body {
 
 #topbar-actions { display: flex; gap: 8px; margin-left: auto; align-items: center; }
 
-/* ---------- 主体双栏 ---------- */
+/* Multi-domain: domain filter strip (app.js removes `hidden` only when several domains are configured).
+   Clicking a domain narrows the inbox/sidebar/sender dropdown to that domain. */
+#domain-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  overflow-x: auto;
+  flex: 0 0 auto;
+}
+.domain-chip {
+  flex: 0 0 auto;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--text);
+  font-size: 13px;
+  font-family: inherit;
+  padding: 4px 12px;
+  border-radius: 999px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.domain-chip:hover { border-color: var(--accent-strong); }
+.domain-chip.active { background: var(--accent-strong); border-color: var(--accent-strong); color: #fff; }
+
+/* ---------- Two-column body ---------- */
 #main-split { flex: 1; display: flex; min-height: 0; }
 
-/* ---- 左：清单 ---- */
+/* ---- Left: list ---- */
 #list-pane {
   width: var(--list-w);
   min-width: min(var(--list-w), 34vw);
@@ -188,9 +215,9 @@ html, body {
   min-height: 0;
 }
 
-/* ---------- 列表 / 详情分隔条（可拖动） ----------
- * 视觉上只有 1px 竖线（用伪元素画，不占布局宽度），但命中区宽 6px，好点中。
- * `touch-action: none` 让触屏拖动不触发页面滚动。
+/* ---------- List / detail splitter (draggable) ----------
+ * Visually only a 1px vertical line (drawn with a pseudo-element so it takes no layout width), but the hit area is 6px wide for easy grabbing.
+ * `touch-action: none` keeps a touch drag from also scrolling the page.
  */
 #splitter {
   flex: 0 0 6px;
@@ -219,11 +246,11 @@ html, body {
   background: var(--accent-strong);
 }
 #splitter:focus-visible { outline: none; }
-/* 拖动中：整页禁止选中文本、光标保持 col-resize（否则掠过详情区会变回文本光标） */
+/* While dragging: disable text selection page-wide and keep the col-resize cursor (otherwise it reverts to a text cursor when passing over the detail pane) */
 #app.resizing { user-select: none; cursor: col-resize; }
 
-/* 用户手动拖过宽度后，放开 34vw / 46vw 这两道响应式夹取
- * （JS 已按「最小 260px、最多视口 70%」夹取）。仅在桌面双栏区间生效。 */
+/* After the user drags the width manually, release the 34vw / 46vw responsive clamps
+ * (JS already clamps to "min 260px, max 70% of viewport"). Only applies in the desktop two-column range. */
 @media (min-width: 981px) {
   #app.list-w-custom #list-pane { width: var(--list-w); min-width: 0; max-width: none; }
 }
@@ -351,7 +378,7 @@ html, body {
 .empty { text-align: center; color: var(--text-dim); padding: 48px 20px; font-size: 14px; }
 .list-more { text-align: center; padding: 12px; }
 
-/* ---- 右：详情 ---- */
+/* ---- Right: detail ---- */
 #read-pane { flex: 1; min-width: 0; background: var(--panel-2); overflow-y: auto; }
 
 .read-placeholder {
@@ -374,7 +401,7 @@ html, body {
   margin-bottom: 14px;
 }
 
-/* 主题区 */
+/* Subject area */
 .mail-subject {
   display: flex;
   align-items: flex-start;
@@ -387,7 +414,7 @@ html, body {
 }
 .mail-subject .subj-star.starred { color: #fbbc04; }
 
-/* 信封（发件人/收件人/时间） */
+/* Envelope (from/to/time) */
 .mail-envelope { padding: 10px 22px 14px; }
 .env-top { display: flex; align-items: center; gap: 12px; }
 .env-avatar {
@@ -410,7 +437,7 @@ html, body {
 
 .env-details { margin-top: 8px; color: var(--text-dim); font-size: 13px; line-height: 1.7; }
 .env-details b { color: var(--text); font-weight: 500; }
-/* 「你是抄送 / 你是密送」角标：只在默认可见的摘要行上出现（详情行是折叠的） */
+/* "You are CC / You are BCC" chip: only shown on the default-visible summary line (the detail lines are collapsed) */
 .env-role-chip {
   display: inline-block;
   padding: 0 7px;
@@ -439,7 +466,7 @@ html, body {
 .mail-status-chip.delivered { background: var(--ok-bg); color: var(--ok); }
 .mail-status-chip.delayed, .mail-status-chip.queued { background: var(--warn-bg); color: var(--warn); }
 
-/* 会话上下文 */
+/* Thread context */
 .rm-thread { padding: 8px 22px; border-bottom: 1px solid var(--border); }
 .rm-thread .t-head { font-size: 12px; color: var(--text-dim); padding: 2px 0 6px; }
 .rm-thread .t-item {
@@ -449,8 +476,8 @@ html, body {
 }
 .rm-thread .t-item:hover { background: var(--hover); }
 .rm-thread .t-item.current { background: var(--accent-strong); font-weight: 600; }
-/* 会话行收发双方（`A → B`）比单纯的发件人名长得多，给足宽度；overflow:hidden 让 min-width 归零，
-   长地址按省略号截断，完整内容在 title 里（见 threadPanel）。 */
+/* A thread row's from→to pair (`A → B`) is much longer than a plain sender name, so give it enough width; overflow:hidden
+   zeroes min-width, long addresses are ellipsized, and the full content lives in the title (see threadPanel). */
 .rm-thread .t-sender { flex: 0 1 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-dim); }
 .rm-thread .t-item.current .t-sender { color: var(--text); }
 .rm-thread .t-subject { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -459,7 +486,7 @@ html, body {
 .rm-thread .t-tag.inbound { background: var(--ok-bg); color: var(--ok); }
 .rm-thread .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); flex: 0 0 auto; }
 
-/* 附件 */
+/* Attachments */
 .attachments { padding: 10px 22px 12px; border-bottom: 1px solid var(--border); }
 .attachments .att-title { font-size: 12px; color: var(--text-dim); margin-bottom: 8px; }
 .att-list { display: flex; flex-wrap: wrap; gap: 8px; }
@@ -470,7 +497,7 @@ html, body {
   max-width: 320px;
 }
 .att-chip:hover { border-color: var(--accent); background: var(--accent-weak); }
-/* 文件名是按钮（点了开预览），所以要抹掉按钮默认外观 */
+/* The filename is a button (click opens the preview), so strip the default button appearance */
 .att-chip .att-open {
   border: none; background: transparent; padding: 3px 0; margin: 0;
   font: inherit; color: inherit; cursor: pointer; min-width: 0;
@@ -479,7 +506,7 @@ html, body {
 .att-chip .att-open:hover .nm { text-decoration: underline; }
 .att-chip .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .att-chip .sz { color: var(--text-dim); flex: 0 0 auto; font-size: 12px; }
-/* 每个附件都配独立下载按钮：`?dl=1` 强制 attachment，PDF/图片不会被浏览器就地打开 */
+/* Each attachment also gets its own download button: `?dl=1` forces attachment, so PDFs/images don't open in place in the browser */
 .att-chip .att-dl {
   flex: 0 0 auto; font-size: 12px; line-height: 1;
   padding: 5px 9px; border-radius: 7px;
@@ -488,7 +515,7 @@ html, body {
 }
 .att-chip .att-dl:hover { background: var(--accent-weak); border-color: var(--accent); }
 
-/* ---------- 附件预览浮层 ---------- */
+/* ---------- Attachment preview overlay ---------- */
 #att-preview {
   position: fixed; inset: 0; z-index: 70;
   background: rgba(20,24,32,.55);
@@ -531,7 +558,7 @@ html, body {
   background: var(--panel); color: var(--text);
 }
 
-/* 正文 */
+/* Body */
 .mail-body-card { padding: 6px 22px 0; background: transparent; border: none; }
 .mail-body { line-height: 1.65; overflow-wrap: anywhere; }
 .mail-body img { max-width: 100%; height: auto; }
@@ -541,7 +568,7 @@ html, body {
 .mail-body pre.text { white-space: pre-wrap; font-family: inherit; margin: 0; font-size: 14px; }
 .quote-divider { border: none; border-top: 1px solid var(--border); margin: 18px 0 0; }
 
-/* ---------- 写信弹窗 ---------- */
+/* ---------- Compose dialog ---------- */
 #modal-mask {
   position: fixed; inset: 0;
   background: rgba(20,24,32,.45);
@@ -553,19 +580,19 @@ html, body {
   background: var(--panel);
   border-radius: 14px;
   box-shadow: 0 12px 48px rgba(0,0,0,.28);
-  /* 底部内边距挪到 .composer-actions 上（见那里的 sticky 说明），
-     这样「内容滚到底」与「按钮吸底」两个状态的位置完全一致，不会跳一下 */
+  /* The bottom padding moved to .composer-actions (see the sticky note there), so the
+     "content scrolled to the bottom" and "buttons pinned to the bottom" states line up exactly with no jump */
   padding: 20px 26px 0;
   display: flex;
   flex-direction: column;
   gap: 12px;
-  /* 收件人联想下拉用绝对定位挂在输入框下方，需要这里做定位上下文 */
+  /* The recipient suggestion dropdown is absolutely positioned under the input, so this needs to be the positioning context */
   position: relative;
   /*
-   * ⚠️ 必须给弹窗封顶。富文本编辑器（`.rich-editor`）会随内容长高，浮动模式下更是
-   * `max-height: none` —— 弹窗一旦高过视口，底部的「发送」就被推出屏幕，而遮罩层
-   * 本身不滚动，用户根本够不着（用户报障现象）。封顶 + 滚动 + 按钮吸底才是完整解。
-   * 用 dvh 而非 vh：移动端浏览器地址栏收放时 vh 不会跟着变。
+   * ⚠️ The dialog must be capped. The rich-text editor (`.rich-editor`) grows with its content, and in floating mode
+   * even sets `max-height: none` — once the dialog is taller than the viewport the "Send" button is pushed off-screen and
+   * the overlay itself doesn't scroll, so the user can't reach it (a reported bug). Capping + scrolling + sticky buttons is the full fix.
+   * Use dvh rather than vh: the mobile-browser address bar doesn't change vh as it collapses/expands.
    */
   max-height: calc(100vh - 32px);
   max-height: calc(100dvh - 32px);
@@ -590,17 +617,17 @@ html, body {
 #composer input[type="text"]:focus, #composer select:focus, #composer textarea:focus,
 .rich-editor:focus { outline: 2px solid var(--accent-strong); }
 
-/* ⚠️ 这里曾经写成 `#composer-body-wrap`（id 选择器），而 index.html 里它是 class
-   —— 选择器永远匹配不上，这条规则（以及依赖它的布局）从来没生效过。
-   2026-10-08 由「浮动窗口要拉伸正文」暴露出来，一并改成 class。 */
+/* ⚠️ This was once written as `#composer-body-wrap` (an id selector) while it is a class in index.html
+   — the selector could never match, so this rule (and the layout depending on it) never took effect.
+   Exposed on 2026-10-08 by "the floating window must stretch the body" and changed to a class. */
 .composer-body-wrap { display: flex; flex-direction: column; gap: 6px; }
 #f-body { width: 100%; min-height: 180px; resize: vertical; }
 .rich-editor {
   width: 100%;
   min-height: 180px;
-  /* 上限必须留出弹窗里其余固定行（收件人/发件人/主题/操作行…）的高度，
-     否则「编辑器长高 → 整窗超出视口 → 发送按钮被挤出去」。弹窗已封顶，
-     这里再收紧一点，让默认（未浮动）状态下大多数屏幕都不用滚动。 */
+  /* The cap must leave room for the dialog's other fixed rows (to/from/subject/action row…),
+     otherwise "editor grows → whole window exceeds viewport → send button squeezed out". The dialog is already capped;
+     tighten it a bit more here so that in the default (non-floating) state most screens need no scrolling. */
   max-height: min(45vh, 360px);
   overflow-y: auto;
   border: 1px solid var(--border);
@@ -639,10 +666,10 @@ html, body {
 .att-item .rm:hover { color: var(--danger); }
 
 /*
- * 底部操作行必须**始终可见**：正文编辑区会随内容长高（富文本尤其明显），
- * 弹窗一旦被内容撑到超过视口，`.composer-actions` 就会滚出屏幕 ——
- * 「发送」够不着。sticky 吸底 + 不透明背景，滚动时按钮永远钉在弹窗底部。
- * `padding-bottom` 承接原先挂在 `#composer` 上的 20px 下边距（见那里的注释）。
+ * The bottom action row must **always be visible**: the body editor grows with its content (especially rich text), so
+ * once the dialog is stretched past the viewport, `.composer-actions` scrolls off-screen and "Send" is unreachable.
+ * Sticky-to-bottom + an opaque background keeps the buttons pinned to the dialog's bottom while scrolling.
+ * `padding-bottom` takes over the 20px bottom margin previously on `#composer` (see the note there).
  */
 .composer-actions {
   display: flex; gap: 8px; justify-content: flex-end; align-items: center;
@@ -653,17 +680,17 @@ html, body {
   padding-bottom: 20px;
 }
 
-/* ---------- 写信弹窗：拖动条 / 缩放把手 / 浮动几何（桌面端） ----------
- * 桌面端弹窗默认仍是「居中 + 自适应高度」（即改动前的样子）；只有用户真的拖动 /
- * 缩放 / 最大化之后，app.js 才会给 #composer 加 .floating 并写内联 left/top/width/height。
- * 移动端这些规则由 @media (max-width: 768px) 覆盖回全屏。
+/* ---------- Compose dialog: drag bar / resize handle / floating geometry (desktop) ----------
+ * The desktop dialog still defaults to "centered + auto height" (as before the change); only after the user actually drags /
+ * resizes / maximizes does app.js add .floating to #composer and write inline left/top/width/height.
+ * On mobile these rules are overridden back to full-screen by @media (max-width: 768px).
  */
 #composer-head {
   display: flex;
   align-items: center;
   gap: 8px;
-  cursor: move;          /* 整行都是拖动热区 */
-  touch-action: none;    /* 触摸拖动时不要顺带滚动弹窗 */
+  cursor: move;          /* The whole row is a drag hotspot */
+  touch-action: none;    /* Don't also scroll the dialog during a touch drag */
   user-select: none;
 }
 .composer-grip { color: var(--text-dim); font-size: 15px; line-height: 1; }
@@ -683,23 +710,23 @@ html, body {
 }
 .composer-tool:hover { background: var(--accent-weak); color: var(--accent); }
 
-/* 浮动窗口：位置与尺寸全部由内联样式给出（app.js 是唯一写者） */
+/* Floating window: position and size are entirely given by inline styles (app.js is the only writer) */
 #composer.floating {
   position: absolute;
   max-height: none;
-  overflow-y: auto; /* 窗口被压得比内容还矮时兜底滚动，别把发送按钮挤出去 */
+  overflow-y: auto; /* Fallback scroll when the window is squeezed shorter than its content, so the send button isn't pushed out */
 }
 /*
- * 让正文吸收多余高度。放大的意义就是「能多写点」——不这么做，最大化之后
- * 下半屏全是空白，textarea 还卡在 180px（截图实测如此）。
- * 缩小时反过来：正文压到 120px 就不再缩，其余部分由上面的 overflow 兜底。
+ * Let the body absorb the extra height. The point of maximizing is "write more" — without this, after maximizing
+ * the lower half of the screen is blank while the textarea stays stuck at 180px (measured from screenshots).
+ * Shrinking is the reverse: the body stops shrinking at 120px and the rest is handled by the overflow above.
  */
 #composer.floating .composer-body-wrap { flex: 1 1 auto; min-height: 0; }
 #composer.floating #f-body,
 #composer.floating .rich-editor { flex: 1 1 auto; min-height: 120px; max-height: none; }
 
 .composer-resize {
-  position: fixed;   /* 关键：弹窗内部滚动时把手不会被滚走（绝对定位会跟着内容跑） */
+  position: fixed;   /* Key: the handle isn't scrolled away when the dialog scrolls internally (absolute positioning would follow the content) */
   width: 18px;
   height: 18px;
   cursor: nwse-resize;
@@ -720,13 +747,13 @@ html, body {
 }
 .composer-resize:hover::after { opacity: 1; }
 
-/* 拖动 / 缩放过程中禁掉文字选择与 hover 手感 */
+/* Disable text selection and hover feel during drag / resize */
 body.composer-dragging { user-select: none; cursor: move; }
 
-/* 遮罩：弹窗被拖开说明用户想对照后面的邮件，自动变淡，后面内容才看得清 */
+/* Mask: dragging the dialog aside means the user wants to compare with the mail behind, so it fades automatically */
 #modal-mask.composer-float { background: rgba(20,24,32,.18); }
 
-/* ---------- 放弃确认框（写信未发送时） ---------- */
+/* ---------- Discard confirm (when compose is unsent) ---------- */
 #confirm-mask {
   position: fixed; inset: 0;
   background: rgba(20,24,32,.45);
@@ -763,22 +790,22 @@ body.composer-dragging { user-select: none; cursor: move; }
 }
 #toast.error { background: var(--danger); }
 
-/* ---------- 窄屏 ---------- */
+/* ---------- Narrow screens ---------- */
 @media (max-width: 980px) {
   #list-pane { width: 42%; min-width: 300px; }
 }
 
-/* ---------- 写信排版修正 ---------- */
+/* ---------- Compose layout fixes ---------- */
 #composer label:not(.att-pick) { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
 #composer label.att-pick { display: inline-flex; flex-direction: row; gap: 5px; }
 #composer .composer-row > label:not(.att-pick) { flex: 0 0 auto; }
 #composer .composer-row > label.grow { flex: 1; }
-/* 发件人独占一行后不必再撑满整个弹窗（桌面端 700px 宽的下拉框很难看） */
+/* With the sender on its own row it need not fill the whole dialog (a 700px-wide dropdown looks bad on desktop) */
 #composer label.auto-label select { width: auto; min-width: 200px; max-width: 340px; }
 
-/* ---------- 合并发送（写信/回复共用一行） ---------- */
-/* 注意：上面的 `#composer label:not(.att-pick)` 把 label 设成了纵向 flex，
-   这里用同权重但更靠后的选择器覆盖回横向排列。 */
+/* ---------- Mail merge (shared row for compose/reply) ---------- */
+/* Note: the `#composer label:not(.att-pick)` above set labels to a vertical flex;
+   this overrides it back to a horizontal layout with an equal-specificity but later selector. */
 #composer .merge-row { align-items: center; }
 #composer label.merge-pick {
   display: inline-flex;
@@ -794,8 +821,8 @@ body.composer-dragging { user-select: none; cursor: move; }
 .merge-hint { color: var(--text-dim); font-size: 12px; }
 .mail-body { font-size: 15px; }
 
-/* ---------- 发件人：独占一行，默认折叠成摘要 ---------- */
-/* 折叠态只有这一行，所以它必须把「当前用哪个地址发」写全 —— 收起不等于隐藏信息。 */
+/* ---------- Sender: own row, collapsed to a summary by default ---------- */
+/* The collapsed state is only this row, so it must fully state "which address sends now" — collapsing does not mean hiding information. */
 .sender-toggle {
   display: inline-flex;
   align-items: baseline;
@@ -806,12 +833,20 @@ body.composer-dragging { user-select: none; cursor: move; }
 .sender-label { flex: 0 0 auto; color: var(--text-dim); }
 .sender-current { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sender-caret { flex: 0 0 auto; font-size: 11px; }
-/* 只有一个发件地址：没有可选项，藏掉箭头并去掉「可点」的手感 */
+/* Only one sender address: nothing to choose, so hide the caret and remove the "clickable" feel */
 .sender-solo .sender-caret { display: none; }
 .sender-solo .sender-toggle { cursor: default; }
 .sender-solo .sender-toggle:hover { text-decoration: none; }
 
-/* ---------- 抄送 / 密送 + 收件人联想 ---------- */
+/* "+ custom": add a sender address on the configured domain (session-only until the first send). */
+.sender-add {
+  flex: 0 0 auto;
+  margin-left: 8px;
+  white-space: nowrap;
+}
+
+
+/* ---------- CC / BCC + recipient suggestions ---------- */
 .link-btn {
   border: none;
   background: transparent;
@@ -823,8 +858,8 @@ body.composer-dragging { user-select: none; cursor: move; }
 }
 .link-btn:hover { text-decoration: underline; }
 
-/* 下拉挂在 #composer 内绝对定位；left/top/width 由 JS 算出来。
-   宽度是「弹窗内容宽度」而不是输入框宽度 —— 见 app.js 的 suggestBoxGeom。 */
+/* The dropdown is absolutely positioned inside #composer; left/top/width are computed by JS.
+   The width is the "dialog content width", not the input width — see suggestBoxGeom in app.js. */
 .addr-suggest {
   position: absolute;
   z-index: 5;
@@ -852,8 +887,8 @@ body.composer-dragging { user-select: none; cursor: move; }
 .addr-suggest-item mark { background: #fde68a; color: inherit; padding: 0; border-radius: 2px; }
 .addr-suggest-empty { padding: 6px 9px; font-size: 13px; color: var(--text-dim); }
 
-/* ---------- 详情正文：下载中 / 下载失败占位 ---------- */
-/* 头部（主题/发件人/时间）来自列表项，点击后同步渲染；只有正文需要等详情接口。 */
+/* ---------- Detail body: loading / failed placeholders ---------- */
+/* The header (subject/from/time) comes from the list row and renders synchronously on click; only the body waits for the detail API. */
 .mail-body-pending { display: flex; align-items: center; justify-content: center; min-height: 180px; }
 .body-pending {
   display: flex;
@@ -880,27 +915,27 @@ body.composer-dragging { user-select: none; cursor: move; }
 .env-who .who-name .from-me { font-weight: 600; }
 
 /* =========================================================================
- * 移动端适配
+ * Mobile adaptation
  *
- * 断点 768px：≤768px 进入「单栏 + 抽屉」模式，覆盖手机竖屏全段（320–430px）
- * 与手机横屏的多数场景（568–926px 中的窄端）。
+ * Breakpoint 768px: ≤768px enters "single column + drawer" mode, covering the whole
+ * phone-portrait range (320–430px) and most phone-landscape cases (the narrow end of 568–926px).
  *
- * 分工：
- *   - 布局（抽屉、单栏、弹窗全屏）全部靠这里的媒体查询 + `#app` 上的两个状态类：
- *       `.drawer-open`   抽屉展开
- *       `.mobile-detail` 单栏下正在看详情（列表让位）
- *     这两个类由 app.js 的 syncLayout() **统一**维护，别在别处 toggle。
- *   - 桌面端完全不渲染移动端专属控件（下方基础规则里 display:none）。
+ * Division of labor:
+ *   - Layout (drawer, single column, full-screen dialog) relies entirely on the media queries here + two state classes on `#app`:
+ *       `.drawer-open`   drawer expanded
+ *       `.mobile-detail` viewing detail in single-column mode (the list yields)
+ *     These two classes are maintained **solely** by syncLayout() in app.js; never toggle them elsewhere.
+ *   - The desktop never renders mobile-only controls (display:none in the base rules below).
  * ========================================================================= */
 
-/* 移动端专属控件：桌面端一律不显示 */
+/* Mobile-only controls: never shown on desktop */
 .icon-btn, #topbar-compose, #drawer-mask, #read-back { display: none; }
 
-/* 横屏时 iOS 会自行放大正文字号，禁掉以获得稳定排版 */
+/* iOS enlarges body text on its own in landscape; disable it for stable layout */
 html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
 
 @media (max-width: 768px) {
-  /* ---------- 顶栏：汉堡 + 搜索 + 写信 ---------- */
+  /* ---------- Top bar: hamburger + search + compose ---------- */
   #topbar {
     height: auto;
     min-height: 54px;
@@ -926,7 +961,7 @@ html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
   }
   .icon-btn:active { background: var(--hover); }
   #search-box { max-width: none; }
-  /* 16px：iOS 上 font-size < 16px 的输入框一聚焦就会把整页放大 */
+  /* 16px: on iOS an input with font-size < 16px zooms the whole page on focus */
   #search-input { padding: 10px 12px; font-size: 16px; }
   #topbar-compose {
     display: inline-flex;
@@ -937,7 +972,7 @@ html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
     font-size: 14px;
   }
 
-  /* ---------- 侧边栏 → 抽屉 ---------- */
+  /* ---------- Sidebar → drawer ---------- */
   #sidebar {
     position: fixed;
     top: 0; left: 0; bottom: 0;
@@ -964,30 +999,30 @@ html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
     transition: opacity .2s ease;
   }
   #app.drawer-open #drawer-mask { opacity: 1; pointer-events: auto; }
-  /* 触摸目标 ≥44px */
+  /* Touch target ≥44px */
   .folder-item { padding: 13px 16px; font-size: 15px; }
   #mailbox-select { padding: 10px 12px; font-size: 16px; }
 
-  /* 原生下拉的弹出列表：Android Chrome 会用 <option> 的字号渲染列表项。
-     闭合态为了可读 + 触摸目标已经放到 16px，列表跟着 16px 会明显偏大
-     （原生列表行高本来就比页内文字大）→ 只把**列表项**收回 14px，闭合态不受影响。
-     ⚠️ iOS 的滚轮选择器是系统 UI，不认这条规则，那边只能接受系统默认字号。 */
+  /* Native dropdown popup list: Android Chrome renders list items at the <option> font size.
+     The closed state was already raised to 16px for readability + touch target; letting the list follow at 16px is clearly
+     too big (native list row height is already larger than in-page text) → shrink only the **list items** back to 14px, leaving the closed state unaffected.
+     ⚠️ iOS's wheel picker is system UI and ignores this rule; there we accept the system default font size. */
   #mailbox-select option, #composer select option { font-size: 14px; }
 
-  /* ---------- 单栏：列表 ⇄ 详情 ---------- */
+  /* ---------- Single column: list ⇄ detail ---------- */
   #list-pane {
     width: 100%;
     min-width: 0;
     max-width: none;
     border-right: none;
   }
-  /* 单栏布局下没有「两栏」可调，分隔条整个移除（否则会在列表右侧留一条 6px 空槽） */
+  /* In single-column layout there are no "two columns" to adjust, so remove the splitter entirely (otherwise a 6px empty slot remains to the right of the list) */
   #splitter { display: none; }
   #read-pane { display: none; }
   #app.mobile-detail #list-pane { display: none; }
   #app.mobile-detail #read-pane { display: block; }
 
-  /* ---------- 详情顶部返回条（sticky 挂在 #read-pane 的滚动容器上） ---------- */
+  /* ---------- Detail top back bar (sticky on #read-pane's scroll container) ---------- */
   #read-back {
     display: flex;
     position: sticky;
@@ -999,7 +1034,7 @@ html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
   }
   #read-back .btn { flex: 1; min-height: 44px; font-size: 15px; }
 
-  /* ---------- 列表 ---------- */
+  /* ---------- List ---------- */
   #list-head { padding: 10px 12px 8px; }
   #list-title { font-size: 17px; }
   .list-item { padding: 12px; column-gap: 8px; }
@@ -1009,7 +1044,7 @@ html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
   #bulk-actions .btn { min-height: 40px; }
   .list-more .btn { min-height: 44px; width: 100%; }
 
-  /* ---------- 详情排版 ---------- */
+  /* ---------- Detail typography ---------- */
   .read-message { padding: 12px 12px calc(56px + env(safe-area-inset-bottom)); }
   .mail-subject { padding: 14px 14px 10px; }
   .mail-subject h1 { font-size: 18px; }
@@ -1021,11 +1056,11 @@ html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
   .env-actions .btn { flex: 1; min-height: 42px; }
   .env-detail-lines .k { flex: 0 0 56px; }
   .att-chip { max-width: 100%; }
-  /* 会话行原本给收发双方 320px、时间 120px 的固定列宽，窄屏会把主题挤没 */
+  /* Thread rows originally gave the from→to pair 320px and the time 120px fixed columns, which squeezes the subject away on narrow screens */
   .rm-thread .t-sender { flex: 0 1 auto; max-width: 42%; }
   .rm-thread .t-time { flex: 0 0 auto; font-size: 10px; }
 
-  /* ---------- 写信弹窗：全屏 + 内部滚动 ---------- */
+  /* ---------- Compose dialog: full-screen + internal scroll ---------- */
   #modal-mask { align-items: stretch; }
   #composer {
     width: 100%;
@@ -1044,7 +1079,7 @@ html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
   .rich-toolbar button { min-height: 38px; padding: 6px 10px; }
   #composer label.auto-label select { min-width: 0; width: 100%; max-width: none; }
   .att-item .nm { max-width: 44vw; }
-  /* 发送/取消固定在底部，长正文滚到底也不用再找按钮 */
+  /* Send/Cancel pinned to the bottom, so a long body scrolled to the end needs no button hunt */
   .composer-actions {
     position: sticky;
     bottom: 0;
@@ -1054,25 +1089,25 @@ html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
   }
   .composer-actions .btn { min-height: 44px; padding: 0 18px; font-size: 15px; }
 
-  /* ---------- 写信弹窗：全屏下不提供拖动 / 缩放 ---------- */
-  /* 移动端弹窗本来就占满屏，拖动与缩放没有意义；而且这两个手势会和滚动打架。 */
+  /* ---------- Compose dialog: no drag / resize in full-screen ---------- */
+  /* The mobile dialog already fills the screen, so drag and resize are pointless; those two gestures also fight with scrolling. */
   #composer-head { cursor: default; touch-action: auto; }
-  /* 抓手图标也是拖动暗示，移动端一并藏掉（留着会让人以为能拖） */
+  /* The grip icon is also a drag hint, so hide it on mobile too (leaving it makes people think they can drag) */
   .composer-grip, .composer-tool, .composer-resize { display: none; }
 
-  /* ---------- 收件人联想：软键盘弹出后可用高度很小 ---------- */
+  /* ---------- Recipient suggestions: little usable height once the soft keyboard is up ---------- */
   .addr-suggest { max-height: 42vh; }
-  /* 纵向排列：姓名一行、邮箱一行。窄屏上横向排列时邮箱会被姓名挤到只剩几个字，
-     而「看清楚完整邮箱」才是用户输入时唯一要确认的事。 */
+  /* Vertical layout: name on one line, email on another. In a horizontal layout on narrow screens the email is squeezed to
+     a few characters by the name, yet "seeing the full email clearly" is the only thing the user must confirm while typing. */
   .addr-suggest-item { flex-direction: column; align-items: stretch; gap: 2px; padding: 12px 12px; font-size: 16px; }
   .addr-suggest-empty { padding: 12px; font-size: 16px; }
   .addr-suggest-item .nm { max-width: 100%; }
 
-  /* ---------- 发件人摘要行 ---------- */
-  /* 折叠后它是唯一可见的发件人信息，13px 在手机上偏小 */
+  /* ---------- Sender summary row ---------- */
+  /* Once collapsed it is the only visible sender info, and 13px is a bit small on a phone */
   .sender-toggle { font-size: 15px; }
 
-  /* ---------- toast：避开底部安全区 ---------- */
+  /* ---------- toast: avoid the bottom safe area ---------- */
   #toast {
     bottom: calc(20px + env(safe-area-inset-bottom));
     max-width: calc(100vw - 24px);
@@ -1080,7 +1115,7 @@ html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
   }
 }
 
-/* ---------- 入站异常提示条（CF 入向「收了但没进收件箱」） ---------- */
+/* ---------- Inbound alert bar (CF inbound "received but not in inbox") ---------- */
 #inbound-alerts {
   background: var(--warn-bg);
   border-bottom: 1px solid #f0d9a0;
@@ -1130,7 +1165,7 @@ html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
   .ia-actions { justify-content: flex-end; }
 }
 
-/* ---------------- 安装向导 / 登录门（#gate） ---------------- */
+/* ---------------- Setup wizard / login gate (#gate) ---------------- */
 
 #gate {
   position: fixed;

@@ -51,6 +51,16 @@ export function toEmailList(addrs: Address[]): string[] {
   return addrs.map((a) => a.email);
 }
 
+/**
+ * Domain part of an email address, lowercased (for the derived `mailbox_domain` column / per-domain filtering).
+ * Returns null when the address has no `@` or is empty.
+ */
+export function domainOf(addr: string | null | undefined): string | null {
+  const s = (addr ?? '').trim().toLowerCase();
+  const at = s.lastIndexOf('@');
+  return at > 0 && at < s.length - 1 ? s.slice(at + 1) : null;
+}
+
 export function jsonArr(value: string | null | undefined): string[] {
   if (!value) return [];
   try {

@@ -277,10 +277,63 @@ const RESEND_KEY = 're_totally_secret_key';
   ok(!allValues.some((v) => v.includes(CF_TOKEN)), '⭐ app_config 中不含 CF Token（用完即弃）');
   ok(cfg('cf_token') === null, '不存在 cf_token 配置键');
 
+  section('T6b 多域名：配置成功后写入 domains 表');
+  const domRows = db.query('SELECT * FROM domains');
+  ok(domRows.length === 1 && domRows[0].domain === 'example.com', 'domains 表写入一行', JSON.stringify(domRows.map((d) => d.domain)));
+  ok(domRows[0] && domRows[0].zone_id === 'zone1', 'domains.zone_id 落库', domRows[0] && domRows[0].zone_id);
+  ok(domRows[0] && domRows[0].resend_domain_id === 'dom1', 'domains.resend_domain_id 落库', domRows[0] && domRows[0].resend_domain_id);
+  ok(domRows[0] && domRows[0].from_address === 'noreply@example.com', 'domains.from_address 落库', domRows[0] && domRows[0].from_address);
+  ok(domRows[0] && domRows[0].worker_name === 'resend-mail-api', 'domains.worker_name 落库', domRows[0] && domRows[0].worker_name);
+
   section('T7 向导配置对既有发送逻辑生效（/api/account）');
   r = await call('GET', '/api/account', undefined, cookie);
   ok(r.status === 200 && r.json.can_send === true, '未配 env、仅向导配置也能发信', r.json && `${r.json.can_send}/${r.json.from_address}`);
   ok(r.json.from_address === 'noreply@example.com', '账户发件地址来自向导配置', r.json && r.json.from_address);
+
+  section('T7b 发件域闸门：按配置域名放开同域自定义发件人');
+  const send = require(path.join(entry, 'send.js'));
+  // Wizard-less env: no default from address, only the configured domain.
+  const envDomain = { SENDING_DOMAIN: 'example.com', SEND_FROM_NAME: 'Brand' };
+  const idSame = send.senderIdentity(envDomain, 'billing@example.com');
+  ok(idSame.address === 'billing@example.com' && idSame.from === 'billing <billing@example.com>',
+    '同域自定义地址被接受（显示名取本地部分）', idSame.from);
+  const idOther = send.senderIdentity(envDomain, 'evil@other.com');
+  ok(idOther.address === '', '异域地址回退默认发件人（此处无默认 -> 空）', JSON.stringify(idOther));
+  ok(send.sendingDomain(envDomain) === 'example.com', 'sendingDomain 取 SENDING_DOMAIN', send.sendingDomain(envDomain));
+  ok(send.sendingDomain({ SEND_FROM_ADDRESS: 'x@foo.com' }) === 'foo.com', '无 SENDING_DOMAIN 时退回默认地址的域', send.sendingDomain({ SEND_FROM_ADDRESS: 'x@foo.com' }));
+
+  section('T7c can_send 只需 Resend Key（/api/account 返回配置域名）');
+  const accRes = await worker.default.fetch(new Request('https://example.com/api/account', { headers: { cookie } }), { DB: db, RESEND_API_KEY: 're_just_a_key' });
+  const acc = await accRes.json();
+  ok(acc.can_send === true, '只有 Resend Key、没有发件地址也能发信', JSON.stringify(acc));
+  ok(acc.from_address === 'noreply@example.com', '发件地址仍来自向导配置（runtime 叠加）', acc.from_address);
+  ok(acc.domain === 'example.com', '/api/account 暴露配置域名（前端据此校验自定义发件人）', acc.domain);
+
+  section('T7d 多域名：/api/account 返回 domains 列表 + GET /api/domains');
+  ok(Array.isArray(acc.domains) && acc.domains.includes('example.com'), '/api/account 返回 domains 数组', JSON.stringify(acc.domains));
+  const domRes = await worker.default.fetch(new Request('https://example.com/api/domains', { headers: { cookie } }), { DB: db });
+  const domJson = await domRes.json();
+  ok(domRes.status === 200 && Array.isArray(domJson.domains), '/api/domains -> 200 + domains 数组', domRes.status);
+  ok(domJson.domains.some((d) => d.domain === 'example.com'), '/api/domains 含已配置域名', JSON.stringify(domJson.domains));
+  ok(domJson.domains.every((d) => typeof d.domain === 'string' && 'from_address' in d), '每个域名含 domain/from_address', JSON.stringify(domJson.domains));
+
+  section('T10 域名过滤：folders / counts / mailboxes 按 domain 收窄');
+  const insMsg = (id, mailbox, dir) => db.prepare(
+    `INSERT INTO messages (id, direction, mailbox, mailbox_domain, to_emails, received_at, status, read, starred, deleted, created_at, updated_at)
+     VALUES (?, ?, ?, ?, '[]', ?, 'received', 0, 0, 0, ?, ?)`
+  ).bind(id, dir, mailbox, mailbox.split('@')[1], 100, 100, 100).run();
+  await insMsg('dm1', 'a@example.com', 'inbound');
+  await insMsg('dm2', 'b@other.com', 'inbound');
+  await insMsg('dm3', 'c@example.com', 'inbound');
+  const listDom = await (await worker.default.fetch(new Request('https://example.com/api/folders/inbox?domain=example.com', { headers: { cookie } }), { DB: db })).json();
+  ok(listDom.total === 2 && listDom.items.every((it) => it.mailbox && it.mailbox.endsWith('@example.com')),
+    'folders?domain= 只返回该域的邮件', `total=${listDom.total}`);
+  const listOther = await (await worker.default.fetch(new Request('https://example.com/api/folders/inbox?domain=other.com', { headers: { cookie } }), { DB: db })).json();
+  ok(listOther.total === 1 && listOther.items[0].mailbox === 'b@other.com', '切到 other.com 只看到该域邮件', `total=${listOther.total}`);
+  const countsDom = await (await worker.default.fetch(new Request('https://example.com/api/counts?domain=example.com', { headers: { cookie } }), { DB: db })).json();
+  ok(countsDom.inbox_total === 2, 'counts?domain= 只统计该域', `inbox_total=${countsDom.inbox_total}`);
+  const boxesDom = await (await worker.default.fetch(new Request('https://example.com/api/mailboxes?domain=example.com', { headers: { cookie } }), { DB: db })).json();
+  ok(boxesDom.mailboxes.every((m) => m.mailbox.endsWith('@example.com')), 'mailboxes?domain= 只列出该域地址', JSON.stringify(boxesDom.mailboxes.map((m) => m.mailbox)));
 
   section('T8 status 反映已配置');
   r = await call('GET', '/api/setup/status', undefined, cookie);

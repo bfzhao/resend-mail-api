@@ -536,8 +536,8 @@ async function test(name, fn, cfg) {
     ok(ruleHas(APP_CSS, 'body.composer-dragging', 'user-select:\\s*none'), '拖动期间禁文字选择');
 
     // Mobile section: drag/resize controls must be turned off
-    const at = APP_CSS.indexOf('移动端适配');
-    ok(at >= 0, 'app.css 里能找到「移动端适配」段落标记');
+    const at = APP_CSS.indexOf('Mobile adaptation');
+    ok(at >= 0, 'app.css 里能找到「Mobile adaptation」段落标记');
     const cssMobile = at >= 0 ? APP_CSS.slice(at) : '';
     const desktopCss = at >= 0 ? APP_CSS.slice(0, at) : APP_CSS;
     ok(ruleHas(cssMobile, ['.composer-grip', '.composer-tool', '.composer-resize'], 'display:\\s*none'),

@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8" />
-  <!-- viewport-fit=cover：让页面铺满刘海屏/圆角屏，配合 env(safe-area-inset-*) 留出安全区 -->
+  <!-- viewport-fit=cover: lets the page fill notch/rounded-corner screens, reserving the safe area via env(safe-area-inset-*) -->
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <meta name="referrer" content="no-referrer" />
   <title>收件箱</title>
@@ -17,32 +17,36 @@
         <select id="mailbox-select" title="切换收件地址"></select>
       </div>
       <nav id="folder-nav"></nav>
-      <!-- 后端基础状态：CF 存储占用/入站队列 + Resend 发信额度（估算）；贴近上限或有异常/积压时变色。
-           平时隐藏；由 app.js 的 loadBackendStatus() 填充。 -->
+      <!-- Backend basics: CF storage usage / inbound queue + Resend send quota (estimated); changes color near the limit or on errors/backlog.
+           Hidden by default; filled by loadBackendStatus() in app.js. -->
       <div id="backend-status" class="hidden"></div>
       <div id="sidebar-status" hidden>未连接 API</div>
     </aside>
 
-    <!-- 移动端抽屉遮罩：仅在 #app.drawer-open 时由 CSS 显示；点击关闭抽屉 -->
+    <!-- Mobile drawer mask: shown by CSS only while #app.drawer-open; clicking it closes the drawer -->
     <div id="drawer-mask"></div>
 
     <div id="workspace">
-      <!-- 入站异常提示：CF 入向「收到了但没解析进收件箱」的邮件（原始件仍在 R2 可下载）。
-           平时隐藏；由 app.js 的 loadInboundAlerts() 填充。 -->
+      <!-- Inbound alert: mail that CF inbound "received but didn't parse into the inbox" (the raw message is still downloadable from R2).
+           Hidden by default; filled by loadInboundAlerts() in app.js. -->
       <div id="inbound-alerts" class="hidden" role="status" aria-live="polite"></div>
       <header id="topbar">
-        <!-- 移动端：打开文件夹抽屉（桌面端由 CSS 隐藏） -->
+        <!-- Mobile: open the folder drawer (hidden by CSS on desktop) -->
         <button id="drawer-btn" class="icon-btn" type="button" aria-label="打开文件夹" aria-controls="sidebar">☰</button>
         <div id="search-box">
           <input id="search-input" type="search" placeholder="搜索邮件…" autocomplete="off" />
         </div>
-        <!-- 移动端：侧边栏收进抽屉后，顶栏需要一个直接可点的写信入口（桌面端由 CSS 隐藏） -->
+        <!-- Mobile: once the sidebar moves into the drawer, the top bar needs a directly clickable compose entry (hidden by CSS on desktop) -->
         <button id="topbar-compose" class="btn btn-primary" type="button">写信</button>
         <div id="topbar-actions" class="hidden"></div>
       </header>
 
+      <!-- Domain filter strip (multi-domain): filled by renderDomainBar() in app.js; shown only when several domains are configured.
+           Clicking a domain filters the inbox/sidebar/sender dropdown to it. -->
+      <div id="domain-bar" class="hidden" role="tablist" aria-label="域名筛选"></div>
+
       <div id="main-split">
-        <!-- 左：邮件清单 -->
+        <!-- Left: message list -->
         <section id="list-pane">
           <div id="list-head">
             <div id="list-title"></div>
@@ -60,7 +64,7 @@
           <div id="list-more" class="list-more hidden"></div>
         </section>
 
-        <!-- 左右分栏分隔条：桌面端可拖动调整列表宽度（移动端单栏布局下由 CSS 隐藏） -->
+        <!-- Split divider: draggable on desktop to resize the list width (hidden by CSS in the mobile single-column layout) -->
         <div
           id="splitter"
           role="separator"
@@ -69,9 +73,9 @@
           tabindex="0"
         ></div>
 
-        <!-- 右：邮件详情 -->
+        <!-- Right: message detail -->
         <section id="read-pane">
-          <!-- 移动端：单栏布局下从详情返回列表（桌面端由 CSS 隐藏） -->
+          <!-- Mobile: return from detail to list in the single-column layout (hidden by CSS on desktop) -->
           <div id="read-back">
             <button id="read-back-btn" class="btn" type="button">← 返回列表</button>
           </div>
@@ -87,7 +91,7 @@
 
   <div id="modal-mask" class="hidden">
     <div id="composer" role="dialog" aria-label="写信">
-      <!-- 标题行兼拖动条：桌面端按住这里可以随意移动弹窗（移动端全屏，拖动被禁用） -->
+      <!-- Title bar doubling as a drag handle: hold here to move the dialog freely on desktop (full-screen on mobile, dragging disabled) -->
       <div id="composer-head">
         <span class="composer-grip" aria-hidden="true">⠿</span>
         <div id="composer-title">写信</div>
@@ -98,8 +102,8 @@
       <div class="composer-row">
         <label class="grow">收件人 <input id="f-to" type="text" placeholder="name@example.com，多个用逗号分隔" autocomplete="off" /></label>
       </div>
-      <!-- 发件人独占一行：和收件人挤一行时，两个字段在窄屏上都只剩半宽（收件人输入框越窄，
-           联想下拉越难看清）。折叠时只留一行摘要显示「当前用哪个地址发」，点开才展开下拉。 -->
+      <!-- Sender on its own row: sharing a row with the recipient left both fields half-width on narrow screens (the narrower the recipient input,
+           the harder the suggestion dropdown is to read). Collapsed it shows a one-line summary of "which address sends now"; click to expand the dropdown. -->
       <div class="composer-row sender-row hidden" id="f-sender-row">
         <button id="f-sender-toggle" class="link-btn sender-toggle" type="button" aria-expanded="false" aria-controls="f-mailbox-label">
           <span class="sender-label">发件人</span><span id="f-sender-current" class="sender-current"></span><span id="f-sender-caret" class="sender-caret" aria-hidden="true">▾</span>
@@ -109,6 +113,7 @@
         <label id="f-mailbox-label" class="grow auto-label">发件人
           <select id="f-mailbox"></select>
         </label>
+        <button id="f-sender-add" class="link-btn sender-add" type="button" title="添加自定义发件人（需为同域名地址）" aria-label="添加自定义发件人">＋ 自定义</button>
       </div>
       <div class="composer-row cc-toggle-row">
         <button id="f-cc-toggle" class="link-btn" type="button">＋ 抄送 / 密送</button>
@@ -159,9 +164,9 @@
         <button id="composer-cancel" class="btn" type="button">取消</button>
         <button id="composer-send" class="btn btn-primary" type="button">发送</button>
       </div>
-      <!-- 收件人联想下拉：由 app.js 定位到当前正在输入的收件人字段下方 -->
+      <!-- Recipient suggestion dropdown: positioned by app.js below the recipient field currently being typed in -->
       <div id="addr-suggest" class="addr-suggest hidden" role="listbox"></div>
-      <!-- 右下角缩放把手：只在弹窗浮动时显示，位置由 app.js 算出来（fixed 定位，不随内容滚动） -->
+      <!-- Bottom-right resize handle: shown only when the dialog is floating, positioned by app.js (fixed, doesn't scroll with content) -->
       <div id="composer-resize" class="composer-resize hidden" title="拖动调整大小" aria-hidden="true"></div>
     </div>
   </div>
@@ -176,7 +181,7 @@
     </div>
   </div>
 
-  <!-- 附件预览浮层：点附件名打开；图片/PDF/视频/音频/纯文本内嵌，其余提示改用下载 -->
+  <!-- Attachment preview overlay: opens by clicking the attachment name; images/PDF/video/audio/plain text are embedded, others fall back to download -->
   <div id="att-preview" class="hidden" role="dialog" aria-modal="true" aria-label="附件预览">
     <div class="att-preview-box">
       <div class="att-preview-head">

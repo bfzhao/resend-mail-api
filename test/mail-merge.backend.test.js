@@ -275,7 +275,7 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
     ok(Array.isArray(r.data.failed) && r.data.failed.length === 0, 'failed 为空数组');
     ok(r.data.sent.every((s) => typeof s.to === 'string' && typeof s.id === 'string' && typeof s.resend_id === 'string'), 'sent 每项含 to/id/resend_id');
     ok(c.db.messageInserts().length === 3, '成功者各存一条 outbound 记录', `inserts=${c.db.messageInserts().length}`);
-    const rows = c.db.messageInserts().map((e) => ({ thread: e.args[5], to: JSON.parse(e.args[9]), from: e.args[8], dir: e.args[1] }));
+    const rows = c.db.messageInserts().map((e) => ({ thread: colArg(e, 'thread_id'), to: JSON.parse(colArg(e, 'to_emails')), from: colArg(e, 'from_email'), dir: colArg(e, 'direction') }));
     ok(rows.every((x) => x.dir === 'outbound'), '记录 direction 均为 outbound');
     ok(new Set(rows.map((x) => x.thread)).size === 3, '每人独立 threadId（3 个互不相同）');
     ok(rows.every((x) => x.to.length === 1), '每条记录的 to_emails 只含 1 个地址', JSON.stringify(rows.map((x) => x.to)));
@@ -299,7 +299,7 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
     ok(r.data.failed.length === 1 && r.data.failed[0].to === 'b@y.com', 'failed 只含失败者', JSON.stringify(r.data.failed));
     ok(/Resend 返回错误/.test(r.data.failed[0].error) && /invalid recipient/.test(r.data.failed[0].error), 'failed[].error 含 Resend 原始原因', r.data.failed[0].error);
     ok(c.db.messageInserts().length === 2, '只有成功者落库（2 条）', `inserts=${c.db.messageInserts().length}`);
-    const storedTo = c.db.messageInserts().map((e) => JSON.parse(e.args[9])[0]);
+    const storedTo = c.db.messageInserts().map((e) => JSON.parse(colArg(e, 'to_emails'))[0]);
     ok(!storedTo.includes('b@y.com'), '失败者没有落库', JSON.stringify(storedTo));
     ok(c.resend.calls.every((x) => x.body.to.length === 1), '每次调用 to 长度仍为 1');
   }
@@ -754,7 +754,7 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
     const toOf = (c) => (c.resend.calls[0] ? c.resend.calls[0].body.to : undefined);
     const storedTo = (c) => {
       const ins = c.db.messageInserts();
-      return ins.length ? JSON.parse(ins[0].args[9]) : null;
+      return ins.length ? JSON.parse(colArg(ins[0], 'to_emails')) : null;
     };
 
     // ① the frontend actually sends an array: original sender + people the user added
@@ -928,8 +928,8 @@ function section(name) { currentTest = name; console.log(`\n=== ${name} ===`); }
     // `|| null` + `x && ...`: when the precondition fails, produce a FAIL instead of dereferencing on the next line and throwing a TypeError
     // that crashes the whole suite (which would prevent even the summary line from printing, leaving downstream assertions with no signal).
     const row1 = ins1[0] || null;
-    ok(row1 && row1.args[5] !== 't-1', '⭐ threadId 是新会话（不是原邮件的 thread_id）', row1 && row1.args[5]);
-    ok(row1 && row1.args[3] === null && row1.args[4] === null, '落库的 in_reply_to / references 为空', row1 && `${row1.args[3]}/${row1.args[4]}`);
+    ok(row1 && colArg(row1, 'thread_id') !== 't-1', '⭐ threadId 是新会话（不是原邮件的 thread_id）', row1 && colArg(row1, 'thread_id'));
+    ok(row1 && colArg(row1, 'in_reply_to') === null && colArg(row1, 'references') === null, '落库的 in_reply_to / references 为空', row1 && `${colArg(row1, 'in_reply_to')}/${colArg(row1, 'references')}`);
     const attIns = c1.db.attachmentInserts();
     ok(attIns.length === 1, '附件表插入 1 行（只复制非内联附件）', attIns.length);
     const newKey = attIns[0] ? attIns[0].args[2] : null;
