@@ -3692,6 +3692,8 @@ function setupEvents() {
   $('#f-sender-toggle').addEventListener('click', toggleSenderExpanded);
   $('#f-mailbox').addEventListener('change', renderSenderSummary);
   $('#f-sender-add').addEventListener('click', addCustomSender);
+  // Multi-domain: open the wizard from inside the app to configure an extra domain.
+  $('#add-domain-btn').addEventListener('click', openAddDomain);
   // Mail merge: the checked state and recipient count both affect the hint text
   $('#f-merge').addEventListener('change', updateMergeHint);
   $('#f-to').addEventListener('input', updateMergeHint);
@@ -3957,6 +3959,15 @@ function gateField(id, label, type, value = '', placeholder = '') {
     <input id="${id}" type="${type}" value="${esc(value)}" placeholder="${esc(placeholder)}" autocomplete="off" /></label>`;
 }
 
+/** Hide the full-screen gate overlay (used when the wizard is opened from inside the app, e.g. "add domain"). */
+function hideGate() {
+  const root = document.getElementById('gate');
+  if (root) {
+    root.classList.add('hidden');
+    root.innerHTML = '';
+  }
+}
+
 function showLogin() {
   const root = gateRoot();
   root.innerHTML = `
@@ -4057,22 +4068,24 @@ function detectWorkerName() {
 }
 
 /** Wizard steps 2/3: domain + auto DNS setup + send/receive auth. The CF Token is used once and not saved. */
-function showDomainWizard(status) {
+function showDomainWizard(status, opts = {}) {
+  const adding = !!opts.adding;
+  const submitLabel = adding ? '添加域名' : '开始配置';
   const root = gateRoot();
   root.innerHTML = `
     <div class="gate-card gate-wide">
-      <div class="gate-title">连接你的域名</div>
-      <div class="gate-sub">第 2 步 · 输入域名并授权，自动完成收信路由与发信认证</div>
-      ${gateField('gate-domain', '域名', 'text', (status && status.domain) || '', 'example.com')}
+      <div class="gate-title">${adding ? '添加域名' : '连接你的域名'}</div>
+      <div class="gate-sub">${adding ? '为当前邮箱增加一个收发域名，自动完成收信路由与发信认证' : '第 2 步 · 输入域名并授权，自动完成收信路由与发信认证'}</div>
+      ${gateField('gate-domain', '域名', 'text', adding ? '' : (status && status.domain) || '', 'example.com')}
       ${gateField('gate-cf', 'Cloudflare API Token', 'password', '', 'Zone:Read + DNS:Edit + Email Routing')}
       ${gateField('gate-resend', 'Resend API Key', 'password', '', 're_…（保存在你自己的数据库，用于发信）')}
-      ${gateField('gate-from', '发件地址', 'text', (status && status.from_address) || '', 'noreply@example.com')}
+      ${gateField('gate-from', '发件地址', 'text', adding ? '' : (status && status.from_address) || '', 'noreply@example.com')}
       ${gateField('gate-fromname', '发件显示名（可选）', 'text', '', '')}
       <div class="gate-error" id="gate-error"></div>
       <div id="gate-steps" class="gate-steps"></div>
       <div class="gate-actions">
-        <button class="btn" id="gate-skip" type="button">暂不设置</button>
-        <button class="btn btn-primary" id="gate-submit" type="button">开始配置</button>
+        <button class="btn" id="gate-cancel" type="button">${adding ? '取消' : '暂不设置'}</button>
+        <button class="btn btn-primary" id="gate-submit" type="button">${submitLabel}</button>
       </div>
       <div class="gate-note">Cloudflare Token 仅用于本次写 DNS 与开启收信路由，<b>不会保存</b>；Resend Key 保存在你自己的 D1（发信需要）。</div>
     </div>`;
@@ -4096,7 +4109,8 @@ function showDomainWizard(status) {
       </div>`).join('');
   };
 
-  $('#gate-skip').addEventListener('click', () => {
+  $('#gate-cancel').addEventListener('click', () => {
+    if (adding) { hideGate(); return; }
     localStorage.setItem('setup-skip', '1');
     location.reload();
   });
@@ -4121,7 +4135,7 @@ function showDomainWizard(status) {
       body: JSON.stringify({ domain, cf_token, resend_key, from_address, from_name, worker_name: detectWorkerName() }),
     });
     btn.disabled = false;
-    btn.textContent = '开始配置';
+    btn.textContent = submitLabel;
     if (!r.res) {
       err.textContent = '网络错误，请重试';
       return;
@@ -4129,8 +4143,19 @@ function showDomainWizard(status) {
     const data = r.data || {};
     renderSteps(data.steps);
     if (r.res.ok && data.ok) {
-      localStorage.removeItem('setup-skip');
       err.textContent = '';
+      if (adding) {
+        // Opened from inside the app: close the overlay and refresh the account/domain list instead of a full reload.
+        hideGate();
+        await loadAccount();
+        state.cache.mailboxesAt = 0;
+        state.cache.countsAt = 0;
+        void loadMailboxes(true);
+        void refreshCounts(true);
+        showToast('域名已添加');
+        return;
+      }
+      localStorage.removeItem('setup-skip');
       setTimeout(() => location.reload(), 700);
     } else {
       err.textContent = data.error || '配置未完全成功，请检查上面的步骤后重试';
@@ -4138,6 +4163,11 @@ function showDomainWizard(status) {
   });
 
   domainEl.focus();
+}
+
+/** Open the domain wizard from inside the app, to configure an additional domain after the first one. */
+function openAddDomain() {
+  showDomainWizard({}, { adding: true });
 }
 
 /* ---------------- Initialization ---------------- */

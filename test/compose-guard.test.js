@@ -74,6 +74,8 @@ function moveSelection() {}
 // The detail pane's close/render are outside this suite's concern (and depend on a whole detail state such as detailSeq / currentThread),
 // but the event wiring references them, so a stub is given. Mobile behavior is covered by test/mobile-layout.dom.test.js with the real implementation.
 function closeMessagePane() {}
+// Multi-domain entry lives in the gate section (outside this slice) but setupEvents references it.
+function openAddDomain() {}
 `;
 
 // probe: expose the block-level let bindings for external observation and reset (test only)

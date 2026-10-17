@@ -44,27 +44,28 @@ export function normalizeDomain(raw: unknown): string | null {
 
 /** Layer the wizard config in D1 on top of env (env takes priority), so existing send/account logic can use the wizard config without changes. */
 export async function withRuntimeConfig(env: Env): Promise<Env> {
-  if (env.RESEND_API_KEY && env.SEND_FROM_ADDRESS) return env;
-  let cfg: Record<string, string> = {};
-  try {
-    if (env.DB) cfg = await repo.getConfigMap(env);
-  } catch {
-    return env;
-  }
   const merged: Env = { ...env };
-  if (!merged.RESEND_API_KEY && cfg.resend_api_key) merged.RESEND_API_KEY = cfg.resend_api_key;
-  if (!merged.SEND_FROM_ADDRESS && cfg.from_address) merged.SEND_FROM_ADDRESS = cfg.from_address;
-  if (!merged.SEND_FROM_NAME && cfg.from_name) merged.SEND_FROM_NAME = cfg.from_name;
-  if (!merged.SENDING_DOMAIN && cfg.domain) merged.SENDING_DOMAIN = cfg.domain;
-  // Multi-domain: expose every configured domain so any address on any of them may send (see sendingDomains in src/send.ts).
+  // Multi-domain: the domains table is the source of truth for the sending-domain set. Resolve it even when the rest of the
+  // config comes from env, so a domain added in-app takes effect without a redeploy (see sendingDomains in src/send.ts).
   if (!merged.SENDING_DOMAINS) {
     try {
       const doms = await repo.listDomains(env);
       if (doms.length) merged.SENDING_DOMAINS = doms.map((d) => d.domain).join(',');
     } catch {
-      /* older database without the domains table: fall back to the single SENDING_DOMAIN */
+      /* older database without the domains table: fall back to SENDING_DOMAIN / the default address */
     }
   }
+  if (merged.RESEND_API_KEY && merged.SEND_FROM_ADDRESS) return merged;
+  let cfg: Record<string, string> = {};
+  try {
+    if (env.DB) cfg = await repo.getConfigMap(env);
+  } catch {
+    return merged;
+  }
+  if (!merged.RESEND_API_KEY && cfg.resend_api_key) merged.RESEND_API_KEY = cfg.resend_api_key;
+  if (!merged.SEND_FROM_ADDRESS && cfg.from_address) merged.SEND_FROM_ADDRESS = cfg.from_address;
+  if (!merged.SEND_FROM_NAME && cfg.from_name) merged.SEND_FROM_NAME = cfg.from_name;
+  if (!merged.SENDING_DOMAIN && cfg.domain) merged.SENDING_DOMAIN = cfg.domain;
   return merged;
 }
 
@@ -85,6 +86,11 @@ export async function configureDomain(
   if (!domain) return { ok: false, steps, error: '域名格式不正确' };
   if (!cfToken) return { ok: false, steps, error: '缺少 Cloudflare API Token' };
   if (!resendKey) return { ok: false, steps, error: '缺少 Resend API Key' };
+
+  // The first configured domain becomes the "primary" stored in app_config (drives sending / account defaults).
+  // Adding a later domain must only append to the domains table, never flip the primary domain or default sender.
+  const existingDomain = await repo.getConfig(env, 'domain').catch(() => null);
+  const isPrimary = !existingDomain || existingDomain === domain;
 
   // 1) find the zone
   let zoneId: string | null;
@@ -141,7 +147,7 @@ export async function configureDomain(
     await rd.verifyDomain(resendKey, dom.id).catch(() => undefined);
     const after = await rd.getDomain(resendKey, dom.id).catch(() => dom);
     steps.push({ name: '发信认证', ok: true, detail: `${records.length} 条记录写入 ${written} 条，Resend 状态：${after.status}` });
-    await repo.setConfig(env, 'resend_domain_id', dom.id);
+    if (isPrimary) await repo.setConfig(env, 'resend_domain_id', dom.id);
   } catch (e) {
     steps.push({ name: '发信认证', ok: false, detail: (e as Error).message });
   }
@@ -149,13 +155,15 @@ export async function configureDomain(
   // 4) Persist (**do not store the CF token**)
   const fromAddress = (typeof input.fromAddress === 'string' && input.fromAddress.trim()) || `noreply@${domain}`;
   const fromName = typeof input.fromName === 'string' ? input.fromName.trim() : '';
-  await repo.setConfig(env, 'domain', domain);
-  await repo.setConfig(env, 'zone_id', zoneId);
-  await repo.setConfig(env, 'resend_api_key', resendKey);
-  await repo.setConfig(env, 'from_address', fromAddress);
-  await repo.setConfig(env, 'from_name', fromName);
-  await repo.setConfig(env, 'worker_name', workerName);
-  await repo.setConfig(env, 'setup_complete', '1');
+  if (isPrimary) {
+    await repo.setConfig(env, 'domain', domain);
+    await repo.setConfig(env, 'zone_id', zoneId);
+    await repo.setConfig(env, 'resend_api_key', resendKey);
+    await repo.setConfig(env, 'from_address', fromAddress);
+    await repo.setConfig(env, 'from_name', fromName);
+    await repo.setConfig(env, 'worker_name', workerName);
+    await repo.setConfig(env, 'setup_complete', '1');
+  }
 
   // Multi-domain: also record the domain in its own table (the per-domain source of truth; app_config keeps the "primary" one).
   try {

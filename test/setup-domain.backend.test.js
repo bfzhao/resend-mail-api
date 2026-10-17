@@ -149,33 +149,39 @@ const RESEND_KEY = 're_totally_secret_key';
     externalCalls.push({ url: u, method, body });
 
     if (u.startsWith('https://api.cloudflare.com/client/v4/zones?')) {
-      return jsonRes({ success: true, result: zoneFound ? [{ id: 'zone1', name: 'example.com' }] : [] });
+      const q = new URL(u);
+      const name = q.searchParams.get('name') || '';
+      if (!zoneFound) return jsonRes({ success: true, result: [] });
+      // findZoneId returns result[0].id regardless of name; give each domain its own zone so a second domain is configurable.
+      return jsonRes({ success: true, result: [{ id: name === 'second.com' ? 'zone2' : 'zone1', name }] });
     }
-    if (/\/zones\/zone1\/email\/routing$/.test(u)) {
+    if (/\/zones\/zone\d+\/email\/routing$/.test(u)) {
       return jsonRes({ success: true, result: { enabled: routingEnabled } });
     }
-    if (/\/zones\/zone1\/email\/routing\/dns$/.test(u) && method === 'POST') {
+    if (/\/zones\/zone\d+\/email\/routing\/dns$/.test(u) && method === 'POST') {
       routingEnabled = true;
       return jsonRes({ success: true, result: { enabled: true } });
     }
-    if (/\/zones\/zone1\/email\/routing\/rules\/catch_all$/.test(u)) {
+    if (/\/zones\/zone\d+\/email\/routing\/rules\/catch_all$/.test(u)) {
       return jsonRes({ success: true, result: { enabled: true, actions: body.actions } });
     }
-    if (/\/zones\/zone1\/dns_records\?/.test(u) && method === 'GET') {
+    if (/\/zones\/zone\d+\/dns_records\?/.test(u) && method === 'GET') {
       // the real listDnsRecords filters by both type + name (same name, different type = two records)
       const q = new URL(u);
       const name = q.searchParams.get('name') || '';
       const type = q.searchParams.get('type') || '';
       return jsonRes({ success: true, result: dnsRecords.filter((r) => r.name === name && (!type || r.type === type)) });
     }
-    if (/\/zones\/zone1\/dns_records$/.test(u) && method === 'POST') {
+    if (/\/zones\/zone\d+\/dns_records$/.test(u) && method === 'POST') {
       const rec = { id: `dns-${dnsRecords.length + 1}`, ...body };
       dnsRecords.push(rec);
       return jsonRes({ success: true, result: rec });
     }
     if (u === 'https://api.resend.com/domains' && method === 'POST') {
+      const nm = body.name;
+      const id = nm === 'second.com' ? 'dom2' : 'dom1';
       return jsonRes({
-        id: 'dom1', name: 'example.com', status: 'not_started',
+        id, name: nm, status: 'not_started',
         records: [
           { record: 'DKIM', name: 'resend._domainkey', type: 'TXT', value: 'p=MIGf...', ttl: 'Auto' },
           { record: 'SPF', name: 'send', type: 'MX', value: 'feedback-smtp.us-east-1.amazonses.com', priority: 10, ttl: 'Auto' },
@@ -184,12 +190,10 @@ const RESEND_KEY = 're_totally_secret_key';
         ],
       });
     }
-    if (u === 'https://api.resend.com/domains/dom1/verify' && method === 'POST') {
-      return jsonRes({ id: 'dom1' });
-    }
-    if (u === 'https://api.resend.com/domains/dom1') {
-      return jsonRes({ id: 'dom1', name: 'example.com', status: 'pending' });
-    }
+    const vf = /^https:\/\/api\.resend\.com\/domains\/(dom\d+)\/verify$/.exec(u);
+    if (vf && method === 'POST') return jsonRes({ id: vf[1] });
+    const gd = /^https:\/\/api\.resend\.com\/domains\/(dom\d+)$/.exec(u);
+    if (gd) return jsonRes({ id: gd[1], name: gd[1] === 'dom2' ? 'second.com' : 'example.com', status: 'pending' });
     if (u.startsWith('https://dns.google/resolve')) {
       const q = new URL(u);
       const name = q.searchParams.get('name') || '';
@@ -334,6 +338,26 @@ const RESEND_KEY = 're_totally_secret_key';
   ok(countsDom.inbox_total === 2, 'counts?domain= 只统计该域', `inbox_total=${countsDom.inbox_total}`);
   const boxesDom = await (await worker.default.fetch(new Request('https://example.com/api/mailboxes?domain=example.com', { headers: { cookie } }), { DB: db })).json();
   ok(boxesDom.mailboxes.every((m) => m.mailbox.endsWith('@example.com')), 'mailboxes?domain= 只列出该域地址', JSON.stringify(boxesDom.mailboxes.map((m) => m.mailbox)));
+
+  section('T11 应用内新增第二个域名：domains 表追加，主域/发件配置不被覆盖');
+  const primaryBefore = { domain: cfg('domain'), from: cfg('from_address'), name: cfg('from_name'), zone: cfg('zone_id') };
+  r = await call('POST', '/api/setup/domain', {
+    domain: 'second.com', cf_token: CF_TOKEN, resend_key: RESEND_KEY, from_address: 'hi@second.com', from_name: 'Second',
+  }, cookie);
+  ok(r.status === 200 && r.json && r.json.ok === true, '第二个域名配置成功', r.json && r.json.ok);
+  ok(cfg('domain') === primaryBefore.domain, '⭐ 主域 app_config.domain 未被覆盖', cfg('domain'));
+  ok(cfg('from_address') === primaryBefore.from, '⭐ 主域 from_address 未被覆盖', cfg('from_address'));
+  ok(cfg('from_name') === primaryBefore.name, '⭐ 主域 from_name 未被覆盖', cfg('from_name'));
+  ok(cfg('zone_id') === primaryBefore.zone, '主域 zone_id 未被覆盖', cfg('zone_id'));
+  const dom2 = db.query("SELECT * FROM domains WHERE domain = 'second.com'");
+  ok(dom2.length === 1, 'domains 表追加 second.com', JSON.stringify(db.query('SELECT domain FROM domains').map((d) => d.domain)));
+  ok(dom2[0] && dom2[0].from_address === 'hi@second.com', 'second.com 的 from_address 记入 domains 表', dom2[0] && dom2[0].from_address);
+  ok(dom2[0] && dom2[0].resend_domain_id === 'dom2', 'second.com 的 resend_domain_id 记入 domains 表', dom2[0] && dom2[0].resend_domain_id);
+  ok(dom2[0] && dom2[0].zone_id === 'zone2', 'second.com 的 zone_id 记入 domains 表', dom2[0] && dom2[0].zone_id);
+  const acc2 = await (await worker.default.fetch(new Request('https://example.com/api/account', { headers: { cookie } }), { DB: db })).json();
+  ok(Array.isArray(acc2.domains) && acc2.domains.includes('second.com') && acc2.domains.includes('example.com'),
+    '/api/account.domains 同时含两个域（新增域可发信）', JSON.stringify(acc2.domains));
+  ok(acc2.domain === 'example.com', '主发信域仍为第一个域', acc2.domain);
 
   section('T8 status 反映已配置');
   r = await call('GET', '/api/setup/status', undefined, cookie);

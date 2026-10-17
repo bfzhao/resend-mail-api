@@ -16,6 +16,10 @@
       <div id="mailbox-wrap" class="hidden">
         <select id="mailbox-select" title="切换收件地址"></select>
       </div>
+      <!-- Add-domain entry (multi-domain): opens the same wizard used at setup, to configure extra domains later. -->
+      <div id="domain-manage">
+        <button id="add-domain-btn" class="link-btn add-domain-btn" type="button">＋ 添加域名</button>
+      </div>
       <nav id="folder-nav"></nav>
       <!-- Backend basics: CF storage usage / inbound queue + Resend send quota (estimated); changes color near the limit or on errors/backlog.
            Hidden by default; filled by loadBackendStatus() in app.js. -->

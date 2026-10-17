@@ -94,6 +94,10 @@ html, body {
   color: var(--text);
 }
 
+/* Add-domain entry: opens the domain wizard to configure extra domains after the first one. */
+#domain-manage { padding: 0 12px 8px; }
+.add-domain-btn { font-size: 13px; }
+
 #folder-nav { flex: 1; overflow-y: auto; }
 .folder-item {
   display: flex;

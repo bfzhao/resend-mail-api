@@ -40,17 +40,16 @@ export default {
     // Everything else requires authentication (API + page assets)
     if (!(await authenticate(request, env))) return unauthorized();
 
-    // Layer the send config written by the wizard into D1 (Resend Key / from address) on top of env,
-    // so existing send/account logic can use the wizard config without changes.
-    const runtimeEnv = await withRuntimeConfig(env);
-
     if (path.startsWith('/api/')) {
+      // Layer the send config written by the wizard into D1 (Resend Key / from address, plus the multi-domain set)
+      // on top of env, so existing send/account logic can use the D1 config without changes.
+      const runtimeEnv = await withRuntimeConfig(env);
       return routeApi(request, runtimeEnv, path, url);
     }
 
-    // SPA static assets (index.html / app.js / app.css) are served by assets
-    if ((method === 'GET' || method === 'HEAD') && runtimeEnv.ASSETS) {
-      return runtimeEnv.ASSETS.fetch(request);
+    // SPA static assets (index.html / app.js / app.css) are served by assets (no DB config needed)
+    if ((method === 'GET' || method === 'HEAD') && env.ASSETS) {
+      return env.ASSETS.fetch(request);
     }
     return json({ error: 'Not Found' }, 404);
   },
