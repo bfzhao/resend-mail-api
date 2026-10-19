@@ -32,29 +32,28 @@ All data lives in **your own** Cloudflare account (D1 / R2 / Queue), and the Res
      Clicking "Start setup" then automatically: finds the zone → enables Email Routing and points catch-all at this Worker → creates the sending domain in Resend → writes DKIM/SPF/DMARC into your DNS → triggers Resend verification.
 3. Done — you can now receive, compose, and reply.
 
-The wizard's **"Open the Cloudflare authorisation page"** button opens Cloudflare's token UI with the **first three** permissions pre-selected (Cloudflare "token template URL", see `CF_TOKEN_PERMS`, including the required `accountId` / `zoneId` parameters):
+**Cloudflare API Token — four zone permissions.** The wizard's **"Open the Cloudflare authorisation page"** button opens Cloudflare's token UI (a "token template URL", see `CF_TOKEN_PERMS`) with the first three pre-selected; the fourth needs one click:
 
 - Auto-selected: `Zone → Read`, `DNS → Edit`, `Zone Settings → Edit`
 - **One manual click**: `Zone → Email Routing Rules → Edit` (Cloudflare does not allow pre-selecting this one from a link; the wizard tells you to use "+ Add more")
 - `Zone Resources` defaults to All zones — change it to `Include → your domain` to authorise just that zone
 
-The button stays **disabled until a domain is typed**; when the app already knows that domain's zone id (a domain it is already configured for), the token page opens **scoped to that exact zone** — otherwise use `Zone Resources → Include → <your domain>`.
+The link already carries the required `accountId` / `zoneId` parameters. The button stays **disabled until a domain is typed**; when the app already knows that domain's zone id (a domain it is already configured for), the token page opens **scoped to that exact zone** — otherwise use `Zone Resources → Include → <your domain>`.
 
 If the token lacks a permission, the wizard step says "this operation needs the xxx permission" instead of failing silently.
 
-**Cloudflare API Token permissions** (zone-level, four in total):
+**Resend API Key — Full access.** A sending-only key can send but cannot create / read / verify domains (`This API key is restricted to only send emails`).
 
-| Category | Permission |
+| Setting | Where it lives / how to change it |
 |---|---|
-| Zone | Zone → Read |
-| Zone | DNS → Edit |
-| Zone | Zone Settings → Edit |
-| Zone | Email Routing Rules → Edit |
+| Resend key | **Per domain** (`domains.resend_api_key`). There is **no global database key** — env `RESEND_API_KEY` is only the fallback, which is why two domains in two different Resend accounts both work |
+| Env vars on first run | **One-time bootstrap**: imported into D1 on the first request, after which the database wins (they can then be deleted). `API_USERNAME` / `API_PASSWORD` stay env-only |
+| Cloudflare token | Used once during setup, **never stored** |
+| Changing a key | No redeploy needed: click the **health marker** after the domain name → *Edit the sending key for* `<domain>` → *Save and re-check* |
 
-> The Resend API Key must have **Full access** (a sending-only key can send, but cannot create / read / verify domains — Resend answers `This API key is restricted to only send emails`).
-> ✅ **The database is the source of truth, and every domain has its own Resend key.** A key is **bound to a domain** (`domains.resend_api_key`) with env `RESEND_API_KEY` as the only fallback — there is deliberately **no global database key**, because one key can never be right for two domains in different Resend accounts. That is why two domains in **different Resend accounts** both work (that is why "same domain, verified in my dashboard" can still fail: the key used to send belonged to the other account). The key of a domain is editable in-app, no redeploy: click the **health marker** after the domain name (**✓** = check passed · **?** = not checked yet · **!** = problem) → **Edit the sending key for <domain>** → **Save and re-check**. Env vars (`RESEND_API_KEY` / `SEND_FROM_ADDRESS`) are only a **bootstrap fallback** — a purely env-configured deployment is imported into D1 once on first request, after which the env vars can be deleted (one env key / one sender is simply not enough for several domains, and an env key silently shadowing the saved one looked exactly like "Resend shows the domain verified, but sending says it is not").
-> The Cloudflare token is **used once during setup and never stored**.
-> DNS changes can take a few minutes to propagate. Each domain chip reports its state in two places: the **health marker right after the domain name** (blue **✓** = the check passed, gray **?** = not checked yet, red **!** = something is wrong) and the **unread count** in the chip's top-right corner (`99+` above 99, hidden at zero). The check runs **by itself** (on page load, then at most every 30 minutes) and verifies, with the key that actually sends, the Resend status per domain plus MX/DKIM/SPF/DMARC via public DNS (no token needed). Click the health marker for that domain's detail tables and its key settings.
+**The domain chip** · **✓ / ? / !** right after the name is the automatic check (✓ passed · ? not checked yet · ! problem — click it for that domain's tables and key settings) · the number in the top-right corner is that domain's unread mail (`99+` above 99, hidden at zero).
+
+The check runs **by itself** (on page load, then at most every 30 minutes): using the key that actually sends, it reads the domain's Resend status and then verifies MX / DKIM / SPF / DMARC over public DNS (no token needed).
 
 ---
 
