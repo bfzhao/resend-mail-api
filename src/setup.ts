@@ -396,6 +396,7 @@ export async function configureDomain(
 
 export interface DeleteDomainInput {
   domain?: unknown;
+  /** Left as `unknown` on purpose: `undefined` = use the default (delete), `false` = keep. */
   /** Optional: the user pastes the token when they want the Cloudflare side cleaned too (it is never stored). */
   cfToken?: unknown;
   /** Delete the sending domain in Resend as well (uses the key bound to that domain). */
@@ -426,14 +427,16 @@ export async function deleteDomainAndCleanup(
   if (!row) return { ok: false, steps, error: `没有这个域名：${domain}` };
 
   const cfToken = typeof input.cfToken === 'string' ? input.cfToken.trim() : '';
-  const wantResend = input.deleteResend === true;
-  const wantPurge = input.purgeMessages === true;
+  // Deleting a domain means deleting everything that belongs to it. The flags exist only so the API can opt out in
+  // special cases; the UI always sends "everything", and an omitted flag now defaults to "yes" instead of "keep".
+  const wantResend = (input.deleteResend as unknown) !== false;
+  const wantPurge = (input.purgeMessages as unknown) !== false;
   const mailCount = await repo.countDomainMessages(env, domain).catch(() => 0);
 
   // 1) Resend sending domain
   const resendKey = String(row.resend_api_key ?? '').trim() || (env.RESEND_API_KEY || '').trim();
   if (!wantResend) {
-    steps.push({ name: 'Resend 域名', ok: true, detail: '保留（未勾选删除）；resend.com 的 Domains 页仍会显示它' });
+    steps.push({ name: 'Resend 域名', ok: true, warn: true, detail: '按请求保留了 Resend 里的发送域（默认会一起删除）' });
   } else if (!resendKey) {
     steps.push({ name: 'Resend 域名', ok: false, detail: '这个域没有绑定 Resend Key（环境变量里也没有），无法删除——请到 Resend 控制台手动删除' });
   } else if (!row.resend_domain_id) {
@@ -498,7 +501,7 @@ export async function deleteDomainAndCleanup(
 
   // 4) stored mail
   if (!wantPurge) {
-    steps.push({ name: '邮件数据', ok: true, detail: `保留 ${mailCount} 封历史邮件（可在删除时勾选一并删除）` });
+    steps.push({ name: '邮件数据', ok: true, warn: true, detail: `按请求保留了 ${mailCount} 封历史邮件（默认会一起删除）` });
   } else {
     try {
       const purged = await repo.purgeDomainData(env, domain);

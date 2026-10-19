@@ -4765,14 +4765,11 @@ async function showDomainCheck(domain) {
       </details>
       ${only ? `<details class="gate-edit" id="gate-delete">
         <summary>删除这个域名（${esc(only)}）</summary>
-        <div class="gate-field"><span>同时删除 Resend 里的发送域（用该域绑定的 Key，不需要额外输入）</span>
-          <label class="row"><input id="del-resend" type="checkbox" checked /> 删除 Resend 域名</label></div>
-        <div class="gate-field"><span>同时删除该域的历史邮件（含附件与 R2 原始件）</span>
-          <label class="row"><input id="del-mail" type="checkbox" /> 删除历史邮件</label></div>
-        <div class="gate-field"><span>想一并清理 Cloudflare 的 DKIM/SPF/DMARC 记录与访问域名？粘贴 Token（不保存，可留空）</span>
+        <div class="gate-field"><span id="del-summary">删除后：域名配置、该域的全部邮件与附件、Resend 里的发送域都会一起删除，不可恢复。</span></div>
+        <div class="gate-field"><span>Cloudflare 的 DNS 记录（DKIM/SPF/DMARC）与访问域名需要 Token 才能一并清理；粘贴后用完即弃，可留空</span>
           <input id="del-cf" type="password" placeholder="留空则只在控制台手动清理" autocomplete="off" /></div>
-        <div class="gate-actions"><button class="btn" id="del-run" type="button">确认删除</button></div>
-        <div class="cf-zone-hint">域名行会立即从本站删除；Cloudflare 的收信路由（zone 级 catch-all）不会改动。</div>
+        <div class="gate-actions"><button class="btn" id="del-run" type="button">全部删除</button></div>
+        <div class="cf-zone-hint">Cloudflare 的收信路由（zone 级 catch-all）不会改动——它可能还在给其它域收信。</div>
       </details>` : ''}
       <div class="gate-actions">
         <button class="btn" id="gate-close" type="button">关闭</button>
@@ -4819,6 +4816,18 @@ async function showDomainCheck(domain) {
     applyDomainHealth(r.data); // keep the corner badges in sync with what the panel just showed
     if (!prefilled) { applyConfig(r.data.config); prefilled = true; }
   };
+  // Tell the user exactly how much mail this removes before they confirm.
+  void (async () => {
+    const summary = $('#del-summary');
+    if (!summary || !only) return;
+    const r = await probe('/api/domains');
+    if (!summary.isConnected) return;
+    const counts = (r && r.data && r.data.messages) || {};
+    const n = Number(counts[only] || 0);
+    // Plain text, one node: the i18n dictionary matches whole sentences, not text split by inline tags.
+    summary.textContent = `删除后：域名配置、该域的 ${n} 封邮件与附件（含 R2 原始件）、Resend 里的发送域都会一起删除，不可恢复。`;
+  })();
+
   const delBtn = $('#del-run');
   if (delBtn) delBtn.addEventListener('click', async () => {
     if (!delBtn.isConnected) return;
@@ -4828,8 +4837,8 @@ async function showDomainCheck(domain) {
       method: 'POST',
       body: JSON.stringify({
         domain: only,
-        delete_resend: $('#del-resend') ? $('#del-resend').checked : false,
-        purge_messages: $('#del-mail') ? $('#del-mail').checked : false,
+        delete_resend: true,
+        purge_messages: true,
         cf_token: $('#del-cf') ? $('#del-cf').value.trim() : '',
       }),
     });
@@ -4838,7 +4847,7 @@ async function showDomainCheck(domain) {
     if (data.steps) renderSteps(data.steps);
     if (r && r.res && r.res.ok && data.ok) {
       const mail = (data.steps || []).find((s) => s.name === '邮件数据');
-      showToast(only + ' 已删除' + (mail && /保留/.test(mail.detail) ? '（历史邮件保留）' : ''));
+      showToast(only + ' 已删除' + (mail && /已删除/.test(mail.detail) ? '（含邮件与附件）' : ''));
       hideGate();
       await loadAccount();
       state.cache.mailboxesAt = 0;

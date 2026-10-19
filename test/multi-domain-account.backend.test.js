@@ -556,8 +556,8 @@ const RESEND_KEY = 're_totally_secret_key';
   ok(del.status === 200 && del.json && del.json.ok === true, '删除成功', JSON.stringify(del.json && del.json.steps && del.json.steps.map((x) => [x.name, x.ok])));
   ok(!db.query("SELECT domain FROM domains WHERE domain='gone.com'").length, '⭐ 域名行已删除');
   ok(deletedResendDomains.includes('dom-gone'), '⭐ 用该域绑定的 Key 删掉了 Resend 域名', JSON.stringify(deletedResendDomains));
-  const keptMail = db.query("SELECT id FROM messages WHERE id='msg-gone'");
-  ok(keptMail.length === 1, '⭐ 默认保留历史邮件（需显式勾选才删）');
+  const purgedMail = db.query("SELECT id FROM messages WHERE id='msg-gone'");
+  ok(purgedMail.length === 0, '⭐ 默认连邮件一起删（删除域名 = 删干净）');
   const cfSkipped = (del.json.steps || []).find((x) => x.name === 'Cloudflare DNS') || {};
   ok(cfSkipped.warn === true && /未提供 Cloudflare Token/.test(cfSkipped.detail || ''),
     '⭐ 没有 Token 时明确说明跳过 + 手动清理指引', (cfSkipped.detail || '').slice(0, 60));
@@ -585,6 +585,15 @@ const RESEND_KEY = 're_totally_secret_key';
   ok(cfgLeft === 'session_secret', '⭐ app_config 只留 session_secret（管理员/登录不受影响）', cfgLeft);
   const after = await call('GET', '/api/setup/status', undefined, cookie);
   ok(after.json && after.json.authenticated === true, '重置后当前会话仍然有效', JSON.stringify(after.json && after.json.authenticated));
+
+  // 显式 false 仍然可以保留（API 兼容 / 特殊场景）
+  db.run("INSERT INTO domains (domain, zone_id, resend_domain_id, resend_api_key, from_address, from_name, worker_name, enabled, created_at, updated_at) VALUES ('keep.com','zone-1','dom-keep','re_keep_key','hi@keep.com','', 'resend-mail-api', 1, 1792000020, 1792000020)");
+  db.run("INSERT INTO messages (id, direction, mailbox, mailbox_domain, from_email, to_emails, subject, received_at, status, read, starred, deleted, created_at, updated_at) VALUES ('msg-keep','inbound','hi@keep.com','keep.com','a@b.com','[\"hi@keep.com\"]','keep',1792000021,'received',0,0,0,1792000021,1792000021)");
+  del = await call('POST', '/api/domains/delete', { domain: 'keep.com', delete_resend: false, purge_messages: false }, cookie);
+  ok(del.status === 200 && del.json.ok === true, '显式 false 的删除也成功', del.status);
+  ok(db.query("SELECT id FROM messages WHERE id='msg-keep'").length === 1, '⭐ 显式 purge_messages:false 会保留邮件', 'kept');
+  ok(!db.query("SELECT domain FROM domains WHERE domain='keep.com'").length, '但域名行仍然删掉了',
+    JSON.stringify(db.query('SELECT domain FROM domains').map((r) => r.domain)));
 
   console.log(`\n===== 结果: ${pass} passed, ${failures.length} failed =====`);
   if (failures.length) console.log(`失败项：\n- ${failures.join('\n- ')}`);

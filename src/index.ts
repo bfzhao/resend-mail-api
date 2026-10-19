@@ -312,7 +312,9 @@ async function routeApi(request: Request, env: Env, path: string, url: URL): Pro
     }
     // Per-domain unread counts drive the new-mail badge on each chip (a separate GROUP BY keeps this cheap).
     const unread = await repo.domainUnreadCounts(env).catch(() => ({} as Record<string, number>));
-    return json({ domains, unread });
+    // Message totals per domain: the delete confirmation tells the user how much mail goes with the domain.
+    const messages = await repo.domainMessageCounts(env).catch(() => ({} as Record<string, number>));
+    return json({ domains, unread, messages });
   }
 
   // Local contacts (recipient input suggestions for compose/reply/forward)
@@ -329,8 +331,9 @@ async function routeApi(request: Request, env: Env, path: string, url: URL): Pro
     const result = await deleteDomainAndCleanup(env, {
       domain: body.domain,
       cfToken: body.cf_token,
-      deleteResend: body.delete_resend === true,
-      purgeMessages: body.purge_messages === true,
+      // Omitted = delete everything (the UI always sends true); an explicit false keeps it.
+      deleteResend: body.delete_resend,
+      purgeMessages: body.purge_messages,
     });
     return json(result, result.ok ? 200 : 400);
   }

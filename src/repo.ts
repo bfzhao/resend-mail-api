@@ -717,6 +717,22 @@ export async function deleteDomain(env: Env, domain: string): Promise<boolean> {
   return Number((r.meta && r.meta.changes) || 0) > 0;
 }
 
+/** How many messages each domain has, for the delete confirmation ("this removes N messages"). */
+export async function domainMessageCounts(env: Env): Promise<Record<string, number>> {
+  const out: Record<string, number> = {};
+  try {
+    const rows = (
+      await env.DB.prepare(
+        "SELECT lower(trim(COALESCE(mailbox_domain, substr(mailbox, instr(mailbox, '@') + 1)))) AS d, COUNT(*) AS n FROM messages GROUP BY d"
+      ).all<{ d: string | null; n: number }>()
+    ).results || [];
+    for (const r of rows) if (r.d) out[String(r.d)] = Number(r.n || 0);
+  } catch {
+    /* older database: no counts */
+  }
+  return out;
+}
+
 /** How many messages belong to a domain (single query: the compose/list views derive the same way). */
 export async function countDomainMessages(env: Env, domain: string): Promise<number> {
   const d = String(domain || '').trim().toLowerCase();
