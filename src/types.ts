@@ -5,6 +5,12 @@ export interface Env {
   RESEND_WEBHOOK_SECRET: string;
   RESEND_EVENTS_SECRET?: string;
   RESEND_API_KEY?: string;
+  /**
+   * Per-domain Resend keys as JSON `{ "<domain>": "re_…" }`, built by withRuntimeConfig from the domains table.
+   * Two domains may live in **different Resend accounts**, so a domain's own key always wins over RESEND_API_KEY
+   * (see resendKeyFor in src/send.ts). Domains without an entry fall back to the global key.
+   */
+  RESEND_API_KEYS?: string;
   SEND_FROM_ADDRESS?: string;
   SEND_FROM_NAME?: string;
   /** The configured sending domain (written by the wizard into app_config). Any address on this domain may send. */

@@ -140,6 +140,7 @@ const RESEND_KEY = 're_totally_secret_key';
   const dnsRecords = [];
   let zoneFound = true;
   let routingEnabled = false;
+  let dmarcMissing = false; // T9b: a domain without a _dmarc record is advisory and must not fail the check
   const jsonRes = (obj, status = 200) => new Response(JSON.stringify(obj), { status, headers: { 'content-type': 'application/json' } });
 
   globalThis.fetch = async (url, init) => {
@@ -194,14 +195,29 @@ const RESEND_KEY = 're_totally_secret_key';
     if (vf && method === 'POST') return jsonRes({ id: vf[1] });
     const gd = /^https:\/\/api\.resend\.com\/domains\/(dom\d+)$/.exec(u);
     if (gd) return jsonRes({ id: gd[1], name: gd[1] === 'dom2' ? 'second.com' : 'example.com', status: 'pending' });
+    // GET /domains — the self-check asks with the key that actually sends "which of my domains does Resend see as verified".
+    if (u === 'https://api.resend.com/domains' && method === 'GET') {
+      return jsonRes({
+        data: [
+          { id: 'dom1', name: 'example.com', status: 'verified' },
+          { id: 'dom2', name: 'second.com', status: 'verified' },
+        ],
+      });
+    }
     if (u.startsWith('https://dns.google/resolve')) {
       const q = new URL(u);
       const name = q.searchParams.get('name') || '';
       const type = q.searchParams.get('type') || '';
-      if (type === 'MX' && name === 'example.com') return jsonRes({ Answer: [{ name, type: 15, data: '10 route1.mx.cloudflare.net.' }] });
-      if (type === 'TXT' && name === 'resend._domainkey.example.com') return jsonRes({ Answer: [{ name, type: 16, data: '"p=MIGf..."' }] });
-      if (type === 'TXT' && name === 'send.example.com') return jsonRes({ Answer: [{ name, type: 16, data: '"v=spf1 include:amazonses.com ~all"' }] });
-      if (type === 'TXT' && name === '_dmarc.example.com') return jsonRes({ Answer: [{ name, type: 16, data: '"v=DMARC1; p=none;"' }] });
+      // The self-check runs per configured domain (example.com was set up first, second.com later in T11).
+      if (type === 'MX' && /^(example|second)\.com$/.test(name)) return jsonRes({ Answer: [{ name, type: 15, data: '10 route1.mx.cloudflare.net.' }] });
+      // Resend's sending SPF also needs an MX at `send` (the self-check verifies it: without it Resend deems the domain unverified)
+      if (type === 'MX' && /^send\.(example|second)\.com$/.test(name)) return jsonRes({ Answer: [{ name, type: 15, data: '10 feedback-smtp.us-east-1.amazonses.com.' }] });
+      if (type === 'TXT' && /^resend\._domainkey\.(example|second)\.com$/.test(name)) return jsonRes({ Answer: [{ name, type: 16, data: '"p=MIGf..."' }] });
+      if (type === 'TXT' && /^send\.(example|second)\.com$/.test(name)) return jsonRes({ Answer: [{ name, type: 16, data: '"v=spf1 include:amazonses.com ~all"' }] });
+      if (type === 'TXT' && /^_dmarc\.(example|second)\.com$/.test(name)) {
+        if (dmarcMissing && name === '_dmarc.second.com') return jsonRes({ Answer: [] });
+        return jsonRes({ Answer: [{ name, type: 16, data: '"v=DMARC1; p=none;"' }] });
+      }
       return jsonRes({ Answer: [] });
     }
     return jsonRes({});
@@ -273,7 +289,7 @@ const RESEND_KEY = 're_totally_secret_key';
   section('T6 落库 + ⭐ CF Token 用完即弃');
   ok(cfg('domain') === 'example.com', 'domain 落库', cfg('domain'));
   ok(cfg('zone_id') === 'zone1', 'zone_id 落库', cfg('zone_id'));
-  ok(cfg('resend_api_key') === RESEND_KEY, 'Resend Key 落库', cfg('resend_api_key'));
+  ok(cfg('resend_api_key') === null, '⭐ 不再写全局 Key（Key 只绑定到域名）', cfg('resend_api_key'));
   ok(cfg('from_address') === 'noreply@example.com', '发件地址默认 noreply@<domain>', cfg('from_address'));
   ok(cfg('from_name') === 'Support', '发件显示名落库', cfg('from_name'));
   ok(cfg('setup_complete') === '1', 'setup_complete 标记');
@@ -287,6 +303,8 @@ const RESEND_KEY = 're_totally_secret_key';
   ok(domRows[0] && domRows[0].zone_id === 'zone1', 'domains.zone_id 落库', domRows[0] && domRows[0].zone_id);
   ok(domRows[0] && domRows[0].resend_domain_id === 'dom1', 'domains.resend_domain_id 落库', domRows[0] && domRows[0].resend_domain_id);
   ok(domRows[0] && domRows[0].from_address === 'noreply@example.com', 'domains.from_address 落库', domRows[0] && domRows[0].from_address);
+  ok(domRows[0] && domRows[0].resend_api_key === RESEND_KEY,
+    '⭐ 向导填的 Key 存为该域**专属** Key（多域可各用不同 Resend 账号的 Key）', domRows[0] && domRows[0].resend_api_key);
   ok(domRows[0] && domRows[0].worker_name === 'resend-mail-api', 'domains.worker_name 落库', domRows[0] && domRows[0].worker_name);
 
   section('T7 向导配置对既有发送逻辑生效（/api/account）');
@@ -339,6 +357,21 @@ const RESEND_KEY = 're_totally_secret_key';
   const boxesDom = await (await worker.default.fetch(new Request('https://example.com/api/mailboxes?domain=example.com', { headers: { cookie } }), { DB: db })).json();
   ok(boxesDom.mailboxes.every((m) => m.mailbox.endsWith('@example.com')), 'mailboxes?domain= 只列出该域地址', JSON.stringify(boxesDom.mailboxes.map((m) => m.mailbox)));
 
+  // The top-bar filter is multi-select: the frontend sends ?domain=a.com,b.com and the backend matches IN (...).
+  section('T10b 多选域名过滤：?domain=a,b（逗号分隔）');
+  const get = async (p) => (await worker.default.fetch(new Request(`https://example.com${p}`, { headers: { cookie } }), { DB: db })).json();
+  const listBoth = await get('/api/folders/inbox?domain=example.com,other.com');
+  ok(listBoth.total === 3, 'folders?domain=a,b -> 两个域的邮件都返回', `total=${listBoth.total}`);
+  const countsBoth = await get('/api/counts?domain=example.com,other.com');
+  ok(countsBoth.inbox_total === 3, 'counts?domain=a,b -> 合计', `inbox_total=${countsBoth.inbox_total}`);
+  const boxesBoth = await get('/api/mailboxes?domain=example.com,other.com');
+  ok(new Set(boxesBoth.mailboxes.map((m) => m.mailbox)).size === 3, 'mailboxes?domain=a,b -> 两个域的地址都在', JSON.stringify(boxesBoth.mailboxes.map((m) => m.mailbox)));
+  // URLSearchParams encodes the comma as %2C — must behave identically.
+  const listEncoded = await get('/api/folders/inbox?domain=example.com%2Cother.com');
+  ok(listEncoded.total === 3, 'URL 编码过的逗号（%2C）同样有效', `total=${listEncoded.total}`);
+  const listOne = await get('/api/folders/inbox?domain=example.com');
+  ok(listOne.total === 2, '负控制：单个域名仍是 2 封（没有把逗号逻辑写坏）', `total=${listOne.total}`);
+
   section('T11 应用内新增第二个域名：domains 表追加，主域/发件配置不被覆盖');
   const primaryBefore = { domain: cfg('domain'), from: cfg('from_address'), name: cfg('from_name'), zone: cfg('zone_id') };
   r = await call('POST', '/api/setup/domain', {
@@ -369,8 +402,19 @@ const RESEND_KEY = 're_totally_secret_key';
   r = await call('GET', '/api/setup/check', undefined, cookie);
   ok(r.status === 200 && r.json && r.json.ok === true, '自检全绿', r.json && r.json.ok);
   const names = (r.json.items || []).map((i) => i.name);
-  ok(names.includes('收信 MX') && names.includes('DKIM') && names.includes('SPF'), '含 MX/DKIM/SPF 检查', names.join(','));
+  // The self-check now runs per configured domain, so item names carry a " · <domain>" suffix.
+  ok(names.some((n) => n.startsWith('收信 MX')) && names.some((n) => n.startsWith('DKIM')) && names.some((n) => n.startsWith('SPF')),
+    '含 MX/DKIM/SPF 检查', names.join(','));
   ok((r.json.items || []).every((i) => i.ok), '每一项都通过', JSON.stringify((r.json.items || []).filter((i) => !i.ok)));
+
+  section('T9b DMARC 缺失属于「建议项」：不判定为失败，只给提醒');
+  dmarcMissing = true;
+  r = await call('GET', '/api/setup/check', undefined, cookie);
+  const dmarcItem = ((r.json && r.json.items) || []).find((i) => i.name === 'DMARC · second.com') || {};
+  ok(r.json && r.json.ok === true, '⭐ 只是缺 DMARC，自检整体仍为 ok', r.json && r.json.ok);
+  ok(dmarcItem.ok === true && dmarcItem.warn === true, '⭐ DMARC 缺失 -> ok + warn（前端显示橙色 ! 而不是红叉）', JSON.stringify(dmarcItem));
+  ok(/可选/.test(dmarcItem.detail || ''), '文案说明是可选项', dmarcItem.detail);
+  dmarcMissing = false;
 
   cleanup();
   console.log(`\n===== 总结：${pass} 通过，${failures.length} 失败 =====`);

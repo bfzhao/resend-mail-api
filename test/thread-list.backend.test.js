@@ -200,8 +200,27 @@ run('T2 两个 thread 返回 2 行', async () => {
   ok(res.items[1].thread_count === 2, 't2 有 2 封', res.items[1].thread_count);
 });
 
-/* T3 rows without thread_id are each independent */
-run('T3 无 thread_id 每行独立', async () => {
+/* T2b Sent folder is NOT collapsed by thread (each sent message is its own row) */
+run('T2b 发件箱不按会话合并', async () => {
+  db.exec('DELETE FROM messages');
+  seedMessages(db, [
+    { id: 's1', direction: 'outbound', mailbox: 'me@x.com', from_email: 'me@x.com', to: ['alice@x.com'], subject: 'A', body_text: '1', received_at: t0 - 300, thread_id: 'ts' },
+    { id: 's2', direction: 'outbound', mailbox: 'me@x.com', from_email: 'me@x.com', to: ['alice@x.com'], subject: 'B', body_text: '2', received_at: t0 - 200, thread_id: 'ts' },
+    { id: 's3', direction: 'outbound', mailbox: 'me@x.com', from_email: 'me@x.com', to: ['bob@x.com'], subject: 'C', body_text: '3', received_at: t0 - 100, thread_id: 'ts' },
+  ]);
+  const sent = await repo.listFolder(env, { folder: 'sent', limit: 20, offset: 0 });
+  ok(sent.items.length === 3, '⭐ 发件箱：同一 thread 的 3 封各自一行（不合并）', sent.items.length);
+  ok(sent.total === 3, 'total = 3', sent.total);
+  ok(sent.items.every((it) => it.thread_count === 1), 'thread_count 都是 1（无会话徽标）', JSON.stringify(sent.items.map((it) => it.thread_count)));
+  ok(sent.items[0].id === 's3', '仍按时间倒序（最新在前）', sent.items[0].id);
+
+  // Negative control: the inbox-style grouping is untouched for other folders.
+  db.exec("UPDATE messages SET direction = 'inbound'");
+  const inbox = await repo.listFolder(env, { folder: 'inbox', limit: 20, offset: 0 });
+  ok(inbox.items.length === 1 && inbox.items[0].thread_count === 3, '对照：收件箱仍按会话合并为 1 行（3 封）', `${inbox.items.length}/${inbox.items[0] && inbox.items[0].thread_count}`);
+});
+
+/* T3 rows without thread_id are each independent */run('T3 无 thread_id 每行独立', async () => {
   db.exec('DELETE FROM messages');
   seedMessages(db, [
     { id: 'd1', direction: 'inbound', mailbox: 'inbox', from_email: 'd@x.com', to: ['me@x.com'], subject: 'D1', body_text: 'd1', received_at: t0 - 200, read: 1, thread_id: '' },
@@ -288,15 +307,16 @@ run('T8 搜索不破坏聚合', async () => {
 });
 
 /* T9 sent folder aggregates too */
-run('T9 已发送文件夹也聚合', async () => {
+run('T9 已发送文件夹**不**聚合（每封一行）', async () => {
   db.exec('DELETE FROM messages');
   seedMessages(db, [
     { id: 'm1', direction: 'outbound', mailbox: 'inbox', from_email: 'me@x.com', to: ['a@x.com'], subject: 'S1', body_text: 's1', received_at: t0 - 200, read: 1, thread_id: 't9' },
     { id: 'm2', direction: 'outbound', mailbox: 'inbox', from_email: 'me@x.com', to: ['a@x.com'], subject: 'S2', body_text: 's2', received_at: t0 - 100, read: 1, thread_id: 't9' },
   ]);
   const res = await repo.listFolder(env, { folder: 'sent', limit: 20, offset: 0 });
-  ok(res.items.length === 1, 'sent 返回 1 行', res.items.length);
-  ok(res.items[0].thread_count === 2, 'thread_count = 2', res.items[0].thread_count);
+  ok(res.items.length === 2, '⭐ 发件箱每封一行（不再按会话合并）', res.items.length);
+  ok(res.total === 2, 'total = 2', res.total);
+  ok(res.items.every((it) => it.thread_count === 1), 'thread_count 都是 1', JSON.stringify(res.items.map((it) => it.thread_count)));
 });
 
 /* T10 thread_count matches the conversation panel's convention (folding loopback copies) */

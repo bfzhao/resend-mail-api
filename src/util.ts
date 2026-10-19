@@ -61,6 +61,15 @@ export function domainOf(addr: string | null | undefined): string | null {
   return at > 0 && at < s.length - 1 ? s.slice(at + 1) : null;
 }
 
+/**
+ * The RFC 2606 reserved names used as placeholders in the deployment template (`SEND_FROM_ADDRESS = inbox@example.com`).
+ * They can never be verified as sending domains, so they must never be shown or adopted as a real domain.
+ */
+export function isPlaceholderDomain(domain: string | null | undefined): boolean {
+  const d = String(domain ?? '').trim().toLowerCase();
+  return d === 'example.com' || d === 'example.net' || d === 'example.org';
+}
+
 export function jsonArr(value: string | null | undefined): string[] {
   if (!value) return [];
   try {

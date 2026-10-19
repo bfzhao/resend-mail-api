@@ -100,9 +100,22 @@ function mailboxCond(mailbox: string): { sql: string; params: unknown[] } {
   return { sql: 'mailbox = ?', params: [mailbox] };
 }
 
-/** domain filter condition: matches the derived mailbox_domain column (lowercased). Applies to messages and drafts alike. */
+/**
+ * domain filter condition: matches the derived `mailbox_domain` column (lowercased). Applies to messages and drafts alike.
+ * Accepts one domain or a **comma-separated list** (the top-bar domain filter is multi-select; an empty selection = all).
+ */
+/**
+ * The domain filter as SQL. `undefined` = no filter at all (every domain), while an **empty list** (the caller passed
+ * `''`, i.e. "no domain ticked in the UI") matches **no rows**: ticking nothing must show nothing, not everything.
+ */
 function domainCond(domain: string): { sql: string; params: unknown[] } {
-  return { sql: 'mailbox_domain = ?', params: [domain.trim().toLowerCase()] };
+  const list = String(domain)
+    .split(',')
+    .map((d) => d.trim().toLowerCase())
+    .filter(Boolean);
+  if (list.length === 0) return { sql: '0 = 1', params: [] };
+  if (list.length === 1) return { sql: 'mailbox_domain = ?', params: list };
+  return { sql: `mailbox_domain IN (${list.map(() => '?').join(',')})`, params: list };
 }
 
 /** The DB row params assembled after uploading stored attachments to R2 are already included in attachments[]. */
@@ -135,7 +148,8 @@ function whereForFolder(
     conds.push(c.sql);
     params.push(...c.params);
   }
-  if (domain) {
+  // `''` (explicitly "no domain selected") must be applied too — see domainCond.
+  if (domain !== undefined && domain !== null) {
     const c = domainCond(domain);
     conds.push(c.sql);
     params.push(...c.params);
@@ -209,10 +223,16 @@ export async function listFolder(env: Env, opts: ListOpts): Promise<{ items: Fol
   const whereSql = w.sql ? `WHERE ${w.sql}` : '';
   const unreadCond = opts.unread === true ? 'AND thread_unread > 0' : '';
 
+  // The **Sent** folder is not collapsed by thread: it is a chronological log of what you sent, and grouping there hid
+  // individual messages behind a thread row (user-requested). Every other folder keeps the conversation grouping.
+  const grouped = opts.folder !== 'sent';
+  const outerKey = grouped ? "COALESCE(NULLIF(m.thread_id, ''), m.id)" : 'm.id';
+  const innerKey = grouped ? "COALESCE(NULLIF(thread_id, ''), id)" : 'id';
+
   const items = (
     await env.DB.prepare(
       `WITH folder_threads AS (
-         SELECT DISTINCT COALESCE(NULLIF(thread_id, ''), id) AS pk
+         SELECT DISTINCT ${innerKey} AS pk
          FROM messages m
          ${whereSql}
        ),
@@ -223,13 +243,13 @@ export async function listFolder(env: Env, opts: ListOpts): Promise<{ items: Fol
            m.received_at, m.read, m.starred, m.status,
            (SELECT COUNT(*) FROM attachments a WHERE a.message_id = m.id) AS attachments_count,
            ROW_NUMBER() OVER (
-             PARTITION BY COALESCE(NULLIF(m.thread_id, ''), m.id)
+             PARTITION BY ${outerKey}
              ORDER BY m.received_at DESC, m.id DESC
            ) AS rn,
-           COUNT(*) OVER (PARTITION BY COALESCE(NULLIF(m.thread_id, ''), m.id)) AS thread_count,
-           SUM(CASE WHEN m.read = 0 THEN 1 ELSE 0 END) OVER (PARTITION BY COALESCE(NULLIF(m.thread_id, ''), m.id)) AS thread_unread
+           COUNT(*) OVER (PARTITION BY ${outerKey}) AS thread_count,
+           SUM(CASE WHEN m.read = 0 THEN 1 ELSE 0 END) OVER (PARTITION BY ${outerKey}) AS thread_unread
          FROM messages m
-         WHERE COALESCE(NULLIF(m.thread_id, ''), m.id) IN (SELECT pk FROM folder_threads)
+         WHERE ${outerKey} IN (SELECT pk FROM folder_threads)
        )
        SELECT
          id, direction, mailbox, from_name, from_email, subject, to_emails,
@@ -247,16 +267,16 @@ export async function listFolder(env: Env, opts: ListOpts): Promise<{ items: Fol
   const totalSql =
     opts.unread === true
       ? `SELECT COUNT(*) AS n FROM (
-           SELECT COALESCE(NULLIF(thread_id, ''), id) AS pk,
+           SELECT ${innerKey} AS pk,
                   SUM(CASE WHEN read = 0 THEN 1 ELSE 0 END) AS thread_unread
            FROM messages m
-           WHERE COALESCE(NULLIF(m.thread_id, ''), m.id) IN (
-             SELECT DISTINCT COALESCE(NULLIF(thread_id, ''), id) FROM messages m2 ${whereSql}
+           WHERE ${outerKey} IN (
+             SELECT DISTINCT ${innerKey} FROM messages m2 ${whereSql}
            )
            GROUP BY pk
            HAVING thread_unread > 0
          )`
-      : `SELECT COUNT(DISTINCT COALESCE(NULLIF(m.thread_id, ''), m.id)) AS n FROM messages m WHERE COALESCE(NULLIF(m.thread_id, ''), m.id) IN (SELECT DISTINCT COALESCE(NULLIF(thread_id, ''), id) FROM messages m2 ${whereSql})`;
+      : `SELECT COUNT(DISTINCT ${outerKey}) AS n FROM messages m WHERE ${outerKey} IN (SELECT DISTINCT ${innerKey} FROM messages m2 ${whereSql})`;
 
   const totalRow = (
     await env.DB.prepare(totalSql).bind(...w.params).first<{ n: number }>()
@@ -311,6 +331,10 @@ export interface DraftInput {
  * The returned shape is **deliberately identical to listFolder** (disguised as a message with `direction='draft'`):
  * the frontend's list rendering, cache fingerprint, paging, and search can all be reused as-is, with only the "opening it shows
  * a compose dialog instead of a detail" branch differing. `received_at` is filled with `updated_at` — a draft's ordering semantics is "last modified time".
+ *
+ * ⚠️ Drafts are **never** filtered by the mailbox / domain filters (only by search `q`). A draft belongs to the sender
+ * you picked, not to the address you are currently browsing, so filtering them made a draft written from another
+ * address/domain silently disappear — which reads as "my draft was lost" (user-reported).
  */
 export async function listDrafts(
   env: Env,
@@ -318,16 +342,6 @@ export async function listDrafts(
 ): Promise<{ items: FolderRow[]; total: number }> {
   const conds: string[] = [];
   const params: unknown[] = [];
-  if (opts.mailbox) {
-    const c = mailboxCond(opts.mailbox);
-    conds.push(c.sql);
-    params.push(...c.params);
-  }
-  if (opts.domain) {
-    const c = domainCond(opts.domain);
-    conds.push(c.sql);
-    params.push(...c.params);
-  }
   if (opts.q) {
     const like = `%${opts.q}%`;
     conds.push('(subject LIKE ? OR to_emails LIKE ? OR body_text LIKE ?)');
@@ -431,14 +445,15 @@ export async function sidebarCounts(env: Env, mailbox?: string, domain?: string)
     conds.push(c.sql);
     params.push(...c.params);
   }
-  if (domain) {
+  // `''` (explicitly "no domain selected") matches nothing — see domainCond; undefined/null = all domains.
+  if (domain !== undefined && domain !== null) {
     const c = domainCond(domain);
     conds.push(c.sql);
     params.push(...c.params);
   }
   const whereSql = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
-  // Drafts live in a separate table (see the drafts notes in schema.sql), but **reuse the same mailbox filter condition**,
-  // otherwise the invariant "all mailboxes count = sum of each group's count" would break on drafts.
+  // Drafts are counted **without** the mailbox/domain filters, matching listDrafts: a draft belongs to the sender you
+  // picked, not to the address you are browsing, so it must not vanish (nor bounce the badge) when you switch filters.
   const [row, draftRow] = await Promise.all([
     env.DB.prepare(
       `SELECT
@@ -449,8 +464,7 @@ export async function sidebarCounts(env: Env, mailbox?: string, domain?: string)
         SUM(CASE WHEN deleted=1 THEN 1 ELSE 0 END) AS trash_total
        FROM messages ${whereSql}`
     ).bind(...params).first<{ inbox_unread: number | null; inbox_total: number | null; sent_total: number | null; starred_total: number | null; trash_total: number | null }>(),
-    env.DB.prepare(`SELECT COUNT(*) AS n FROM drafts ${whereSql}`)
-      .bind(...params)
+    env.DB.prepare('SELECT COUNT(*) AS n FROM drafts')
       .first<{ n: number | null }>(),
   ]);
 
@@ -473,12 +487,31 @@ export async function sidebarCounts(env: Env, mailbox?: string, domain?: string)
  * by an ordered scan of the covering index, no longer producing `TEMP B-TREE FOR GROUP BY` (measured 20000 rows 100ms → 4.0ms).
  * Empty-string/NULL normalization is marked as a sentinel in the SELECT and merged by sentinel key in JS (if NULL and '' appear together they produce two rows).
  */
+/**
+ * Unread inbound counts **per domain**, for the new-mail badge on the domain chips. One GROUP BY, no filtering by the
+ * current selection: every chip shows its own count.
+ */
+export async function domainUnreadCounts(env: Env): Promise<Record<string, number>> {
+  const rows = (
+    await env.DB.prepare(
+      `SELECT lower(trim(mailbox_domain)) AS d, COUNT(*) AS n
+         FROM messages
+        WHERE direction = 'inbound' AND deleted = 0 AND read = 0 AND mailbox_domain IS NOT NULL AND mailbox_domain != ''
+        GROUP BY lower(trim(mailbox_domain))`
+    ).all<{ d: string; n: number }>()
+  ).results;
+  const out: Record<string, number> = {};
+  for (const r of rows) if (r.d) out[r.d] = Number(r.n) || 0;
+  return out;
+}
+
 export async function mailboxes(env: Env, domain?: string): Promise<
   Array<{ mailbox: string; inbox_unread: number; inbox_total: number; sent_total: number }>
 > {
   const groupExpr = "CASE WHEN mailbox IS NULL OR mailbox = '' THEN ? ELSE mailbox END";
-  const domParam = domain ? domain.trim().toLowerCase() : null;
-  const whereSql = domParam ? 'WHERE mailbox_domain = ?' : '';
+  // `''` = explicitly nothing selected -> match nothing (see domainCond); undefined = all domains.
+  const domCond = domain === undefined || domain === null ? null : domainCond(domain);
+  const whereSql = domCond ? `WHERE ${domCond.sql}` : '';
   const rows = await env.DB.prepare(
     `SELECT
        ${groupExpr} AS mailbox,
@@ -489,7 +522,7 @@ export async function mailboxes(env: Env, domain?: string): Promise<
      ${whereSql}
      GROUP BY mailbox
      ORDER BY inbox_unread DESC, mailbox ASC`
-  ).bind(...(domParam ? [UNKNOWN_MAILBOX, domParam] : [UNKNOWN_MAILBOX])).all<{ mailbox: string | null; inbox_unread: number | null; inbox_total: number | null; sent_total: number | null }>();
+  ).bind(...[UNKNOWN_MAILBOX, ...((domCond?.params ?? []) as string[])]).all<{ mailbox: string | null; inbox_unread: number | null; inbox_total: number | null; sent_total: number | null }>();
 
   // Merge the '' / NULL sentinel group (with GROUP BY on the raw column the two are different groups and may each return a row).
   const merged = new Map<string, { mailbox: string; inbox_unread: number; inbox_total: number; sent_total: number }>();
@@ -520,6 +553,8 @@ export interface DomainRow {
   domain: string;
   zone_id: string | null;
   resend_domain_id: string | null;
+  /** This domain's own Resend key (domains can live in different Resend accounts). NULL = use the global key. */
+  resend_api_key?: string | null;
   from_address: string | null;
   from_name: string | null;
   worker_name: string | null;
@@ -532,6 +567,7 @@ export interface DomainInput {
   domain: string;
   zoneId?: string | null;
   resendDomainId?: string | null;
+  resendApiKey?: string | null;
   fromAddress?: string | null;
   fromName?: string | null;
   workerName?: string | null;
@@ -550,12 +586,61 @@ export async function listDomains(env: Env): Promise<DomainRow[]> {
   }
 }
 
+/**
+ * Update a domain's own settings (only the fields provided). Returns false when the database predates migration 012
+ * (no `resend_api_key` column) so the caller can fall back to the global key instead of losing the value.
+ */
+export async function updateDomainSettings(
+  env: Env,
+  domain: string,
+  patch: { apiKey?: string | null; fromAddress?: string | null; fromName?: string | null }
+): Promise<boolean> {
+  const sets: string[] = [];
+  const args: unknown[] = [];
+  if (patch.apiKey !== undefined) {
+    sets.push('resend_api_key = ?');
+    args.push(patch.apiKey);
+  }
+  if (patch.fromAddress !== undefined) {
+    sets.push('from_address = ?');
+    args.push(patch.fromAddress);
+  }
+  if (patch.fromName !== undefined) {
+    sets.push('from_name = ?');
+    args.push(patch.fromName);
+  }
+  if (!sets.length) return true;
+  sets.push('updated_at = ?');
+  args.push(nowSec(), domain.trim().toLowerCase());
+  try {
+    await env.DB.prepare(`UPDATE domains SET ${sets.join(', ')} WHERE domain = ?`).bind(...args).run();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Convenience wrapper for the per-domain key only (returns false on a pre-012 database). */
+export async function setDomainKey(env: Env, domain: string, apiKey: string | null): Promise<boolean> {
+  return updateDomainSettings(env, domain, { apiKey });
+}
+
 /** Insert or update a domain row (the setup wizard calls this after a successful configure). */
 export async function upsertDomain(env: Env, d: DomainInput): Promise<void> {
   const domain = d.domain.trim().toLowerCase();
   const now = nowSec();
-  await env.DB.prepare(
-    `INSERT INTO domains (domain, zone_id, resend_domain_id, from_address, from_name, worker_name, enabled, created_at, updated_at)
+  const args = [
+    domain,
+    d.zoneId ?? null,
+    d.resendDomainId ?? null,
+    d.fromAddress ?? null,
+    d.fromName ?? null,
+    d.workerName ?? null,
+    d.enabled === false ? 0 : 1,
+    now,
+    now,
+  ];
+  const base = `INSERT INTO domains (domain, zone_id, resend_domain_id, from_address, from_name, worker_name, enabled, created_at, updated_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(domain) DO UPDATE SET
        zone_id = excluded.zone_id,
@@ -564,20 +649,29 @@ export async function upsertDomain(env: Env, d: DomainInput): Promise<void> {
        from_name = excluded.from_name,
        worker_name = excluded.worker_name,
        enabled = excluded.enabled,
-       updated_at = excluded.updated_at`
-  )
-    .bind(
-      domain,
-      d.zoneId ?? null,
-      d.resendDomainId ?? null,
-      d.fromAddress ?? null,
-      d.fromName ?? null,
-      d.workerName ?? null,
-      d.enabled === false ? 0 : 1,
-      now,
-      now
+       updated_at = excluded.updated_at`;
+  try {
+    await env.DB.prepare(
+      `INSERT INTO domains (domain, zone_id, resend_domain_id, resend_api_key, from_address, from_name, worker_name, enabled, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(domain) DO UPDATE SET
+         zone_id = excluded.zone_id,
+         resend_domain_id = excluded.resend_domain_id,
+         resend_api_key = COALESCE(excluded.resend_api_key, domains.resend_api_key),
+         from_address = excluded.from_address,
+         from_name = excluded.from_name,
+         worker_name = excluded.worker_name,
+         enabled = excluded.enabled,
+         updated_at = excluded.updated_at`
     )
-    .run();
+      .bind(domain, args[1], args[2], d.resendApiKey ?? null, ...args.slice(3))
+      .run();
+  } catch (e) {
+    // Database predates migration 012 (no `resend_api_key` column): write the rest so the domain still works, and let
+    // the caller decide what to do with the key (it can still be kept as the global key).
+    if (!/resend_api_key|no column|has no column/i.test(String(e))) throw e;
+    await env.DB.prepare(base).bind(...args).run();
+  }
 }
 
 export interface ContactRow {
@@ -1409,6 +1503,11 @@ export async function setConfig(env: Env, key: string, value: string | null): Pr
   )
     .bind(key, value, nowSec())
     .run();
+}
+
+/** Drop one app_config entry (used to retire the legacy global Resend key after it was migrated per domain). */
+export async function deleteConfig(env: Env, key: string): Promise<void> {
+  await env.DB.prepare('DELETE FROM app_config WHERE key = ?').bind(key).run();
 }
 
 export interface AdminUserRow {

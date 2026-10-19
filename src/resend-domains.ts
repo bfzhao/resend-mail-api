@@ -5,6 +5,8 @@
  *      → POST /domains/:id/verify to trigger verification → GET /domains/:id to poll status.
  */
 
+import { explainResendError } from './resend-errors';
+
 const RESEND_API = 'https://api.resend.com';
 
 export class ResendError extends Error {
@@ -58,7 +60,7 @@ async function resendFetch<T>(apiKey: string, path: string, init: RequestInit = 
     const msg = (body as { message?: string; error?: string } | null)?.message ||
       (body as { error?: string } | null)?.error ||
       `HTTP ${resp.status}`;
-    throw new ResendError(`Resend API 错误：${msg}`, resp.status);
+    throw new ResendError(explainResendError(`Resend API 错误：${msg}`), resp.status);
   }
   return body as T;
 }

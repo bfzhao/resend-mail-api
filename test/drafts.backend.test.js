@@ -271,7 +271,7 @@ function info(t) { console.log(`  INFO  ${t}`); }
   const newest = db.queryOne('SELECT id FROM drafts ORDER BY updated_at DESC, id DESC LIMIT 1');
   ok(it0.id === newest.id, '⭐ 列表按 updated_at DESC 排序（最新改的排最前）', `${it0.id} vs ${newest.id}`);
 
-  /* ---- T4 counts: drafts_total uses the same convention as the drafts folder total ---- */
+  /* ---- T4 counts: drafts are global (never narrowed by the mailbox/domain filters) ---- */
   section('T4 /api/counts 的 drafts_total');
   r = await call('GET', '/api/counts');
   ok(r.json && r.json.drafts_total === 2, 'drafts_total = 2', String(r.json && r.json.drafts_total));
@@ -279,17 +279,19 @@ function info(t) { console.log(`  INFO  ${t}`); }
   ok(r.json.drafts_total === listAll.total, '⭐ 计数与列表 total 一致（同一套 WHERE）',
     `${r.json.drafts_total} vs ${listAll.total}`);
 
-  // add one more draft belonging to another mailbox -> "all mailboxes" must equal the sum of the groups
+  // add one more draft belonging to another mailbox -> drafts are a **global** list; the mailbox filter must not hide them
   await call('PUT', '/api/drafts/d-alias', { mailbox: ALIAS, subject: '另一个信箱的草稿', body: 'y' });
   const countsAll = (await call('GET', '/api/counts')).json;
   const cM = (await call('GET', `/api/counts?mailbox=${encodeURIComponent(MAILBOX)}`)).json;
   const cA = (await call('GET', `/api/counts?mailbox=${encodeURIComponent(ALIAS)}`)).json;
-  ok(countsAll.drafts_total === cM.drafts_total + cA.drafts_total,
-    '⭐「全部邮箱」drafts_total === 各信箱之和（不变量不破）',
-    `${countsAll.drafts_total} = ${cM.drafts_total} + ${cA.drafts_total}`);
-  ok(cM.drafts_total === 2 && cA.drafts_total === 1, '各信箱草稿数正确', `${cM.drafts_total} / ${cA.drafts_total}`);
+  ok(countsAll.drafts_total === 3, '全部邮箱：3 条草稿', String(countsAll.drafts_total));
+  ok(cM.drafts_total === 3 && cA.drafts_total === 3,
+    '⭐ 切换信箱过滤后 drafts_total 不变（草稿不属于某个收件地址，不能被过滤掉）',
+    `${cM.drafts_total} / ${cA.drafts_total}`);
   const listM = (await call('GET', `/api/folders/drafts?mailbox=${encodeURIComponent(MAILBOX)}`)).json;
-  ok(listM.total === 2 && listM.items.every((x) => x.mailbox === MAILBOX), '按 mailbox 过滤列表正确', String(listM.total));
+  ok(listM.total === 3, '⭐ 带 mailbox 过滤拉草稿列表 -> 仍返回全部 3 条（否则用户以为草稿丢了）', String(listM.total));
+  const listDom = (await call('GET', '/api/folders/drafts?domain=other.example')).json;
+  ok(listDom.total === 3, '带 domain 过滤同样返回全部', String(listDom.total));
 
   /* ---- T5 search ---- */
   section('T5 草稿箱搜索');

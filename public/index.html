@@ -36,11 +36,14 @@
         <div id="search-box">
           <input id="search-input" type="search" placeholder="搜索邮件…" autocomplete="off" />
         </div>
-        <!-- Domain list (multi-domain): filled by renderDomainBar() in app.js; shown to the right of the search box.
-             Clicking a domain filters the inbox/sidebar/sender dropdown to it. -->
-        <div id="domain-bar" class="hidden" role="tablist" aria-label="域名筛选"></div>
+        <!-- Domain filter (multi-domain, multi-select): filled by renderDomainBar() in app.js; shown to the right of the
+             search box. Ticking one or more domains narrows the inbox/sidebar/sender dropdown; none ticked = all domains. -->
+        <div id="domain-bar" class="hidden" role="group" aria-label="域名筛选（可多选）"></div>
         <!-- Add-domain entry: opens the wizard to configure extra domains later. -->
         <button id="add-domain-btn" class="add-domain-btn" type="button" title="添加域名">＋ 域名</button>
+        <!-- Language switch (中文 / English). The label always shows the language you would switch **to**; the choice is
+             remembered in localStorage and applied by /i18n.js (data-no-i18n keeps the label itself untranslated). -->
+        <button id="lang-btn" class="lang-btn" type="button" data-no-i18n aria-label="Switch to English">EN</button>
         <!-- Mobile: once the sidebar moves into the drawer, the top bar needs a directly clickable compose entry (hidden by CSS on desktop) -->
         <button id="topbar-compose" class="btn btn-primary" type="button">写信</button>
         <div id="topbar-actions" class="hidden"></div>
@@ -109,6 +112,9 @@
         <button id="f-sender-toggle" class="link-btn sender-toggle" type="button" aria-expanded="false" aria-controls="f-mailbox-label">
           <span class="sender-label">发件人</span><span id="f-sender-current" class="sender-current"></span><span id="f-sender-caret" class="sender-caret" aria-hidden="true">▾</span>
         </button>
+        <!-- Only one address to pick from: the dropdown row (with its own ＋ 自定义) never opens, so the same entry point
+             lives here. Any local part on a configured domain is a valid sender. -->
+        <button id="f-sender-custom" class="link-btn sender-add hidden" type="button" title="设置任意发件地址（该域下的任意本地部分）" aria-label="设置任意发件地址">＋ 自定义</button>
       </div>
       <div class="composer-row sender-row hidden" id="f-mailbox-row">
         <label id="f-mailbox-label" class="grow auto-label">发件人
@@ -197,6 +203,7 @@
 
   <div id="toast" class="hidden"></div>
 
+  <script src="/i18n.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

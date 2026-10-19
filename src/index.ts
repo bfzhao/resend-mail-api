@@ -5,6 +5,7 @@ import { handleInbound, handleEvents } from './webhook';
 import { handleInboundEmail, handleInboundQueue, replayPendingInbound } from './inbound-email';
 import * as repo from './repo';
 import { configureDomain, selfCheck, withRuntimeConfig } from './setup';
+import * as rd from './resend-domains';
 import { ensureSchema } from './schema';
 import { resendSend, replySubject, forwardSubject, textToHtml, senderIdentity, sendingDomain, sendingDomains } from './send';
 import type { ResendAttachment } from './send';
@@ -120,16 +121,20 @@ async function setupDomain(request: Request, env: Env): Promise<Response> {
 async function setupStatus(request: Request, env: Env): Promise<Response> {
   const mode = await authMode(env);
   const cfg = env.DB ? await repo.getConfigMap(env).catch(() => ({} as Record<string, string>)) : {};
+  // Report the *effective* config (D1 wins, env is only a bootstrap fallback). Running the merge here also imports a
+  // purely env-configured deployment into D1 on the very first request, so the wizard does not nag a deployment that is
+  // already fully configured through env vars.
+  const rt = await withRuntimeConfig(env).catch(() => env);
   return json({
     configured: mode !== 'none',
     mode,
     authenticated: await isAuthenticated(request, env),
-    domain: cfg.domain || '',
-    from_address: cfg.from_address || env.SEND_FROM_ADDRESS || '',
-    from_name: cfg.from_name || env.SEND_FROM_NAME || '',
-    // Whether domain resolution/sending is configured (true after the wizard writes app_config)
+    domain: rt.SENDING_DOMAIN || '',
+    from_address: rt.SEND_FROM_ADDRESS || '',
+    from_name: rt.SEND_FROM_NAME || '',
+    // Whether the wizard completed once (a domain was resolved and a key is available)
     complete: cfg.setup_complete === '1',
-    sending_configured: Boolean(cfg.resend_api_key || env.RESEND_API_KEY),
+    sending_configured: Boolean(rt.RESEND_API_KEY),
   });
 }
 
@@ -187,7 +192,7 @@ async function routeApi(request: Request, env: Env, path: string, url: URL): Pro
     const q = url.searchParams.get('q') || null;
     const unread = url.searchParams.get('unread') === '1';
     const mailbox = url.searchParams.get('mailbox') || undefined;
-    const domain = url.searchParams.get('domain') || undefined;
+    const domain = readDomainParam(url);
     const limit = clampInt(url.searchParams.get('limit'), 50, 200);
     const offset = clampInt(url.searchParams.get('offset'), 0, 100000);
     const result = await repo.listFolder(env, { folder, q, unread, mailbox, domain, limit, offset });
@@ -200,7 +205,7 @@ async function routeApi(request: Request, env: Env, path: string, url: URL): Pro
   if (path === '/api/folders/drafts' && method === 'GET') {
     const q = url.searchParams.get('q') || null;
     const mailbox = url.searchParams.get('mailbox') || undefined;
-    const domain = url.searchParams.get('domain') || undefined;
+    const domain = readDomainParam(url);
     const limit = clampInt(url.searchParams.get('limit'), 50, 200);
     const offset = clampInt(url.searchParams.get('offset'), 0, 100000);
     const result = await repo.listDrafts(env, { q, mailbox, domain, limit, offset });
@@ -233,13 +238,13 @@ async function routeApi(request: Request, env: Env, path: string, url: URL): Pro
   // Sidebar counts (optionally filtered by mailbox/domain)
   if (path === '/api/counts' && method === 'GET') {
     const mailbox = url.searchParams.get('mailbox') || undefined;
-    const domain = url.searchParams.get('domain') || undefined;
+    const domain = readDomainParam(url);
     return json(await repo.sidebarCounts(env, mailbox, domain));
   }
 
   // Receiving address list (multi-mailbox switching; optionally restricted to one domain)
   if (path === '/api/mailboxes' && method === 'GET') {
-    const domain = url.searchParams.get('domain') || undefined;
+    const domain = readDomainParam(url);
     return json({ mailboxes: await repo.mailboxes(env, domain) });
   }
 
@@ -247,19 +252,21 @@ async function routeApi(request: Request, env: Env, path: string, url: URL): Pro
   if (path === '/api/domains' && method === 'GET') {
     const rows = await repo.listDomains(env);
     const seen = new Set<string>();
-    const domains: Array<{ domain: string; from_address: string | null; from_name: string | null }> = [];
+    const domains: Array<{ domain: string; from_address: string | null; from_name: string | null; zone_id: string | null }> = [];
     for (const r of rows) {
       if (r.enabled === 0 || !r.domain || seen.has(r.domain)) continue;
       seen.add(r.domain);
-      domains.push({ domain: r.domain, from_address: r.from_address, from_name: r.from_name });
+      domains.push({ domain: r.domain, from_address: r.from_address, from_name: r.from_name, zone_id: r.zone_id || null });
     }
     for (const d of sendingDomains(env)) {
       if (!seen.has(d)) {
         seen.add(d);
-        domains.push({ domain: d, from_address: env.SEND_FROM_ADDRESS || null, from_name: env.SEND_FROM_NAME || null });
+        domains.push({ domain: d, from_address: env.SEND_FROM_ADDRESS || null, from_name: env.SEND_FROM_NAME || null, zone_id: null });
       }
     }
-    return json({ domains });
+    // Per-domain unread counts drive the new-mail badge on each chip (a separate GROUP BY keeps this cheap).
+    const unread = await repo.domainUnreadCounts(env).catch(() => ({} as Record<string, number>));
+    return json({ domains, unread });
   }
 
   // Local contacts (recipient input suggestions for compose/reply/forward)
@@ -267,16 +274,108 @@ async function routeApi(request: Request, env: Env, path: string, url: URL): Pro
     return json({ contacts: await repo.contacts(env) });
   }
 
+  // Sending settings (in-app editing). The key is **bound to a domain** (two domains may live in different Resend
+  // accounts), so editing a key requires `domain`. Only the *default sender* can be set globally (it is optional: the
+  // composer picks the sender per message).
+  if (path === '/api/settings/send' && method === 'POST') {
+    const body = (await request.json().catch(() => null)) as
+      | { domain?: unknown; resend_key?: unknown; from_address?: unknown; from_name?: unknown }
+      | null;
+    if (!body) return json({ error: '参数错误' }, 400);
+    const targetDomain = typeof body.domain === 'string' ? body.domain.trim().toLowerCase() : '';
+    const updates: Array<[string, string]> = [];
+    const domainPatch: { apiKey?: string; fromAddress?: string; fromName?: string } = {};
+    let keyCheck: { domains?: Array<{ name: string; status: string }>; warning?: string } | null = null;
+
+    if (typeof body.resend_key === 'string' && body.resend_key.trim()) {
+      const key = body.resend_key.trim();
+      if (!targetDomain) return json({ error: 'Resend Key 是按域名保存的，请指定 domain' }, 400);
+      if (!/^re_[A-Za-z0-9_-]{6,}$/.test(key)) return json({ error: 'Resend API Key 格式不正确（应以 re_ 开头）' }, 400);
+      // Verify before replacing a working key: a typo would silently break sending for that domain.
+      try {
+        const list = await rd.listDomains(key);
+        keyCheck = { domains: list.map((d) => ({ name: d.name, status: d.status })) };
+        // Cross-check against the domain being edited: saving a key from the wrong Resend account is exactly the mistake
+        // per-domain keys exist to prevent, so warn loudly (still allowed: a key may be domain-limited).
+        if (!list.some((d) => String(d.name || '').trim().toLowerCase() === targetDomain)) {
+          keyCheck.warning = `这把 Key 在 Resend 里看不到 ${targetDomain}，保存后该域发信仍会报「domain is not verified」。请确认用的是该域所在 Resend 账号的 Key。`;
+        }
+      } catch (e) {
+        const msg = (e as Error).message;
+        // A "sending access" key is legitimate for sending, it just cannot list domains — accept it, but say so.
+        if (/restricted to only send emails/i.test(msg)) {
+          keyCheck = { warning: '这把 Key 是「仅发送」权限：可以发信，但不能建域 / 验证域名。' };
+        } else {
+          return json({ error: `新 Key 校验失败，未保存：${msg}` }, 400);
+        }
+      }
+      domainPatch.apiKey = key;
+    }
+    if (typeof body.from_address === 'string' && body.from_address.trim()) {
+      const addr = body.from_address.trim().toLowerCase();
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(addr)) return json({ error: '发件地址格式不正确' }, 400);
+      if (targetDomain) domainPatch.fromAddress = addr;
+      else updates.push(['from_address', addr]);
+    }
+    // An empty display name is a legitimate value ("send without a name"), so it is always written when provided.
+    if (typeof body.from_name === 'string') {
+      if (targetDomain) domainPatch.fromName = body.from_name.trim();
+      else updates.push(['from_name', body.from_name.trim()]);
+    }
+    const hasDomainPatch = Object.keys(domainPatch).length > 0;
+    if (!updates.length && !hasDomainPatch) return json({ error: '没有需要保存的内容' }, 400);
+
+    if (hasDomainPatch) {
+      const rows = await repo.listDomains(env).catch(() => [] as repo.DomainRow[]);
+      if (!rows.some((r) => String(r.domain).trim().toLowerCase() === targetDomain)) {
+        return json({ error: `未知域名：${targetDomain}` }, 400);
+      }
+      const ok = await repo.updateDomainSettings(env, targetDomain, domainPatch);
+      if (!ok) {
+        // Database predates per-domain keys (migration 012 missing): keep the key usable by storing it globally.
+        if (domainPatch.apiKey) await repo.setConfig(env, 'resend_api_key', domainPatch.apiKey);
+        if (domainPatch.fromAddress) await repo.setConfig(env, 'from_address', domainPatch.fromAddress);
+        if (domainPatch.fromName !== undefined) await repo.setConfig(env, 'from_name', domainPatch.fromName);
+      }
+    }
+    for (const [k, v] of updates) await repo.setConfig(env, k, v);
+    return json({
+      ok: true,
+      domain: targetDomain || null,
+      updated: updates.map((u) => u[0]).concat(Object.keys(domainPatch)),
+      key_check: keyCheck,
+    });
+  }
+
   // Account/send capability info (for the compose UI to show the sender)
   if (path === '/api/account' && method === 'GET') {
+    // Sender candidates for the composer. The frontend can derive senders from "mailboxes that have messages", which is
+    // empty on a brand-new domain — that left the picker with nothing to show, hiding the whole sender row (and the
+    // "custom sender" entry) so no mail could be sent at all. So the configured defaults are listed here explicitly:
+    // the default from address first (the pre-multi-domain sender), then each configured domain's own default address.
+    const domRows = await repo.listDomains(env).catch(() => [] as repo.DomainRow[]);
+    const rowByDomain = new Map<string, repo.DomainRow>();
+    for (const r of domRows) {
+      if (r.enabled === 0 || !r.domain) continue;
+      rowByDomain.set(String(r.domain).trim().toLowerCase(), r);
+    }
+    const senders: string[] = [];
+    const addSender = (raw: unknown): void => {
+      const v = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
+      if (v && v.includes('@') && !senders.includes(v)) senders.push(v);
+    };
+    addSender(env.SEND_FROM_ADDRESS);
+    for (const d of sendingDomains(env)) addSender(rowByDomain.get(d)?.from_address || `noreply@${d}`);
+
     return json({
-      // Only a Resend key is required to send; the sender address itself comes from the selected mailbox
-      // (or the wizard's from-address). Any address on `domain` is accepted as a custom sender.
-      can_send: Boolean(env.RESEND_API_KEY),
+      // A key is required to send, but it is bound per domain (or falls back to env) — so "can send" means at least one
+      // of those exists.
+      can_send: Boolean(env.RESEND_API_KEY) || sendingDomains(env).some((d) => (rowByDomain.get(d)?.resend_api_key || '').trim()),
       from_name: env.SEND_FROM_NAME || '',
       from_address: env.SEND_FROM_ADDRESS || '',
       domain: sendingDomain(env),
       domains: sendingDomains(env),
+      senders,
     });
   }
 
@@ -409,6 +508,17 @@ function parseDraftInput(id: string, body: unknown): repo.DraftInput | null {
 }
 
 /** Discard the corresponding draft after a successful send. Failure does **not affect** the send result (at worst one extra draft lingers, which the user can delete manually). */
+/**
+ * The `domain` query parameter, keeping the difference that matters to the UI:
+ *   · absent            -> undefined = every domain (plain API usage)
+ *   · present but empty -> \`\`         = nothing ticked = match nothing (the top-bar filter with no tick)
+ *   · "a.com,b.com"     -> both domains
+ */
+function readDomainParam(url: URL): string | undefined {
+  const raw = url.searchParams.get('domain');
+  return raw === null ? undefined : raw;
+}
+
 async function dropDraft(env: Env, draftId: string | undefined | null): Promise<void> {
   if (!draftId) return;
   try {

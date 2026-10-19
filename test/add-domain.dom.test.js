@@ -74,6 +74,12 @@ function makeStub() {
       state.domains = ['example.com', 'new.com'];
       return Promise.resolve(jsonRes({ ok: true, steps: [{ name: '写 DNS', ok: true, detail: 'ok' }] }));
     }
+    if (url.startsWith('/api/domains')) {
+      return Promise.resolve(jsonRes({
+        domains: [{ domain: 'example.com', from_address: 'noreply@example.com', from_name: 'Me', zone_id: 'zone-example' }],
+        unread: {},
+      }));
+    }
     if (url.startsWith('/api/account')) {
       return Promise.resolve(jsonRes({ can_send: true, from_name: 'Me', from_address: 'a@example.com', domain: 'example.com', domains: state.domains }));
     }
@@ -206,7 +212,7 @@ async function test(name, fn) {
     ctx.stub.calls.length = 0;
     // Before: a single domain -> the list is visible and shows exactly that one domain (no "全部域名" chip yet).
     ok(!el(ctx, '#domain-bar').classList.contains('hidden'), '前置：仅一个域名时域名条也可见');
-    const beforeChips = Array.from(ctx.doc.querySelectorAll('#domain-bar .domain-chip')).map((c) => c.textContent);
+    const beforeChips = Array.from(ctx.doc.querySelectorAll('#domain-bar .domain-chip')).map((c) => (c.querySelector('.domain-name') || c).textContent);
     ok(beforeChips.length === 1 && beforeChips[0] === 'example.com', '前置：只显示 example.com 一个域名块', JSON.stringify(beforeChips));
 
     clickEl(ctx, el(ctx, '#add-domain-btn'));
@@ -228,9 +234,60 @@ async function test(name, fn) {
     ok(gate(ctx).classList.contains('hidden'), '成功后关闭浮层');
     ok(callsMatching(ctx, /^\/api\/account/).length >= 1, '成功后重新拉取 /api/account 刷新域名列表');
 
-    const chips = Array.from(ctx.doc.querySelectorAll('#domain-bar .domain-chip')).map((c) => c.textContent);
+    const chips = Array.from(ctx.doc.querySelectorAll('#domain-bar .domain-chip')).map((c) => (c.querySelector('.domain-name') || c).textContent);
     ok(!el(ctx, '#domain-bar').classList.contains('hidden'), '域名条出现（现在有两个域名）', JSON.stringify(chips));
     ok(chips.includes('new.com') && chips.includes('example.com'), '域名条包含新增域名', JSON.stringify(chips));
+  });
+
+  await test('A4 一键 Cloudflare 授权：填域名后才激活，并锁定到该域名所在 zone', async (ctx) => {
+    ctx.doc.querySelector('#add-domain-btn').dispatchEvent(new ctx.win.MouseEvent('click', { bubbles: true }));
+    await ticks(ctx.win, 5);
+
+    const link = ctx.doc.querySelector('#cf-auth-open');
+    const hint = ctx.doc.querySelector('#cf-zone-hint');
+    const domainInput = ctx.doc.querySelector('#gate-domain');
+    ok(!!link && !!hint && !!domainInput, '向导里有授权按钮 / 提示 / 域名输入框', !!link && !!hint && !!domainInput);
+
+    // 1) 没填域名：按钮禁用、链接不生效
+    ok(link.classList.contains('disabled') && link.getAttribute('aria-disabled') === 'true',
+      '⭐ 未填域名时按钮是禁用状态', link.className);
+    ok(link.getAttribute('href') === '#', '⭐ 禁用时没有可用链接', link.getAttribute('href'));
+    ok(/先在上面填写域名/.test(hint.textContent), '提示说明要先填域名', hint.textContent.trim());
+    link.dispatchEvent(new ctx.win.MouseEvent('click', { bubbles: true, cancelable: true }));
+    ok(/请先填写域名/.test(ctx.doc.querySelector('#gate-error').textContent), '点了也只会提示先填域名',
+      ctx.doc.querySelector('#gate-error').textContent.trim());
+
+    // 2) 填一个还没配置过的新域名：按钮激活，链接 zoneId=all + 提示改成 Include → 该域名
+    domainInput.value = 'new-domain.com';
+    domainInput.dispatchEvent(new ctx.win.Event('input', { bubbles: true }));
+    await ticks(ctx.win, 2);
+    ok(!link.classList.contains('disabled'), '⭐ 填了域名后按钮激活', link.className);
+    let qs = new URLSearchParams(link.getAttribute('href').split('?')[1]);
+    ok(qs.get('zoneId') === 'all', '未知 zone 时 zoneId=all', qs.get('zoneId'));
+    ok(qs.get('accountId') === '*', '带 accountId 参数', qs.get('accountId'));
+    ok(new RegExp('Include → new-domain\\.com').test(hint.textContent), '⭐ 提示里写明把 Zone Resources 改成该域名',
+      hint.textContent.trim());
+
+    // 3) 填一个已知 zone id 的域名（应用里已配置）：链接直接锁定 zoneId
+    domainInput.value = 'example.com';
+    domainInput.dispatchEvent(new ctx.win.Event('input', { bubbles: true }));
+    await ticks(ctx.win, 2);
+    qs = new URLSearchParams(link.getAttribute('href').split('?')[1]);
+    ok(qs.get('zoneId') === 'zone-example', '⭐ 已知域名 -> 链接直接带上该 zone id', qs.get('zoneId'));
+    ok(hint.textContent.includes('已按 example.com 所在的 zone 打开'), '提示说明已锁定到该 zone', hint.textContent.trim());
+
+    // 4) 权限清单与手动补一项的说明仍在
+    let perms = [];
+    try { perms = JSON.parse(qs.get('permissionGroupKeys') || '[]'); } catch { perms = []; }
+    const pairs = perms.map((x) => x.key + ':' + x.type).sort();
+    ok(pairs.join(',') === 'dns:edit,email_routing_rules:edit,zone:read,zone_settings:edit',
+      '⭐ 预选四项权限（Email Routing 那一项 Cloudflare 会忽略，需手动补）', JSON.stringify(pairs));
+    const hints = Array.from(ctx.doc.querySelectorAll('.cf-perms-list li')).map((x) => x.textContent).join(' ');
+    ok(/Email Routing Rules/.test(hints) && /Add more/.test(hints), '页面说明要手动补 Email Routing Rules',
+      hints.replace(/\s+/g, ' ').slice(0, 100));
+    ok(!!ctx.doc.querySelector('#gate-cf'), '仍然保留 Token 粘贴框', !!ctx.doc.querySelector('#gate-cf'));
+    ok(ctx.win.eval('cfTokenTemplateUrl("example.com")') === link.getAttribute('href'),
+      '按钮链接与 cfTokenTemplateUrl(domain) 一致');
   });
 
   console.log(`\n===== 结果: ${pass} passed, ${fail} failed =====`);

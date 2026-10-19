@@ -35,7 +35,7 @@ const CACHE_KEY = 'inbox-cache-v1';
 // v4: list rows' thread_count changed to the count "after folding loop-back duplicates" (see src/repo.ts applyFoldedThreadCounts),
 //     aligned with the conversation panel's definition. Old snapshots' list badges still hold the raw pre-folding row count (e.g. 3 vs 2),
 //     and the list revalidate fingerprint does not include thread_count, so not bumping the version would keep showing the old badge.
-const CACHE_VERSION = 4;
+const CACHE_VERSION = 5;
 const PERSIST_DEBOUNCE_MS = 300;
 
 /* In-memory LRU for opened message bodies: max 40 messages or 2MB total, whichever comes first. */
@@ -87,10 +87,22 @@ const state = {
   canSend: false,
   fromAddress: '',
   fromName: '',
-  /** Domain filter selected in the top bar ('' = all domains). Narrows the list, counts, mailboxes and sender picker. */
-  domain: '',
+  /** Domains ticked in the top bar (empty = all domains). Narrows the list, counts, mailboxes and sender picker. */
+  domainSel: [],
   /** All configured domains (from GET /api/account); drives the top-bar domain switcher and the custom-sender validation. */
   domains: [],
+  /** Configured default senders (GET /api/account.senders): the default from address + each domain's default address. */
+  senders: [],
+  /** Unread count per domain for the chip corner badge: { '<domain>': n }. */
+  domainUnread: {},
+  /** domain -> Cloudflare zone id (from GET /api/domains); lets the authorisation link pre-select the exact zone. */
+  zoneIds: {},
+  /** Per-domain result of the automatic self-check: { '<domain>': 'ok' | 'bad' }. Missing = not checked yet (gray ?). */
+  domainHealth: {},
+  /** Which self-check rows failed per domain ({ '<domain>': ['Resend · …'] }), shown in the badge tooltip. */
+  domainHealthDetail: {},
+  /** When domainHealth was last computed (ms). Drives the 30-minute throttle. */
+  domainHealthAt: 0,
   /** Session-only custom sender addresses added via the composer "+" button; they become real (visible in /api/mailboxes) after the first send. */
   customSenders: [],
   /** Local contacts (GET /api/contacts), used for recipient input autocomplete. */
@@ -361,7 +373,15 @@ async function api(path, opts = {}) {
 /* ---------------- Cache ---------------- */
 
 function folderKey() {
-  return `${state.domain}|${state.mailbox}|${state.folder}|${state.q}`;
+  return `${domainParam()}|${state.mailbox}|${state.folder}|${state.q}`;
+}
+
+/**
+ * The top-bar domain filter as the API expects it: comma-separated (the backend accepts a list and matches
+ * `mailbox_domain IN (…)`). Empty string = all domains, i.e. "no checkbox ticked".
+ */
+function domainParam() {
+  return (Array.isArray(state.domainSel) ? state.domainSel : []).join(',');
 }
 
 /** Lightweight fingerprint: first/last id + total + per-row read/starred, used for "don't re-render if data hasn't changed". */
@@ -594,7 +614,7 @@ function writePersisted() {
     at: Date.now(),
     folderKey: folderKey(),
     mailbox: state.mailbox,
-    domain: state.domain,
+    domainSel: state.domainSel,
     folderName: state.folder,
     q: state.q,
     folder: { items: state.items, total: state.total },
@@ -631,7 +651,7 @@ function restorePersisted() {
     if (p.counts && typeof p.counts === 'object') state.counts = { ...state.counts, ...p.counts };
     if (Array.isArray(p.mailboxes)) state.mailboxList = p.mailboxes;
     if (typeof p.mailbox === 'string') state.mailbox = p.mailbox;
-    if (typeof p.domain === 'string') state.domain = p.domain;
+    if (Array.isArray(p.domainSel)) state.domainSel = p.domainSel.map((d) => String(d).toLowerCase()).filter(Boolean);
     if (typeof p.openId === 'string') state.openId = p.openId;
     // Persisted order is "least recently used → most recently used"; setting them in order restores the LRU order
     if (Array.isArray(p.messages)) {
@@ -796,7 +816,7 @@ function endpointsOf(item) {
     return [senderLabel(item), mine || tos[0] || '?'];
   }
   // Our actual sending mailbox → recipient list (full, not truncated to the local part of the first address)
-  return [String(item.from_email || '').trim() || mine || '我', tos.join(', ') || '?'];
+  return [String(item.from_email || '').trim() || mine || '?', tos.join(', ') || '?'];
 }
 
 /** Envelope card's second line: inbound "other mailbox · received at <my mailbox>", outbound "to <recipient list>". */
@@ -814,10 +834,12 @@ function envelopeSubLine(m, pending) {
 }
 
 function avatarChar(item) {
-  if (item.direction === 'outbound') return '我';
-  const name = item.from_name || '';
-  const ch = (name.trim()[0] || (item.from_email || '?')[0] || '?').toUpperCase();
-  return ch;
+  // No "我" marker any more: with several managed domains that send to each other, both sides would be "me".
+  // Always show the real address's first letter.
+  const addr = String((item.direction === 'outbound' ? item.from_email || item.mailbox : item.from_email) || '').trim();
+  const name = item.direction === 'inbound' ? String(item.from_name || '') : '';
+  const ch = name.trim()[0] || addr[0] || '?';
+  return ch.toUpperCase();
 }
 
 /* ---------------- Sidebar / multiple mailboxes ---------------- */
@@ -826,7 +848,9 @@ function renderMailboxSelect() {
   const wrap = $('#mailbox-wrap');
   const sel = $('#mailbox-select');
   const list = state.mailboxList;
-  if (list.length < 1) {
+  // Show the selector as soon as *anything* is configured. It used to disappear whenever no mail had arrived yet, which
+  // made a freshly added domain look like a broken sidebar (and left no way to narrow to one address later).
+  if (list.length < 1 && !(Array.isArray(state.domains) && state.domains.length)) {
     wrap.classList.add('hidden');
     return;
   }
@@ -837,7 +861,8 @@ function renderMailboxSelect() {
   sel.innerHTML = '';
   const allOpt = document.createElement('option');
   allOpt.value = '';
-  allOpt.textContent = '全部邮箱';
+  // The list is a list of **accounts** (addresses), not of mails: when it is empty there is simply no account yet.
+  allOpt.textContent = list.length ? '全部邮箱' : '全部邮箱（未发现账号）';
   sel.appendChild(allOpt);
   for (const m of list) {
     const opt = document.createElement('option');
@@ -849,7 +874,7 @@ function renderMailboxSelect() {
   // Only fall back when the current selection truly no longer exists (account deleted/renamed);
   // on fallback, update both the dropdown display and state.mailbox, the two never get decoupled (BUG-3a).
   const keep = prev === '' || list.some((m) => m.mailbox === prev);
-  const target = keep ? prev : (list.find((m) => m.inbox_unread > 0) || list[0]).mailbox;
+  const target = keep ? prev : (list.find((m) => m.inbox_unread > 0) || list[0] || { mailbox: '' }).mailbox;
   sel.value = target;
   state.mailbox = target;
 }
@@ -863,6 +888,105 @@ function addrDomain(addr) {
   return at > 0 && at < s.length - 1 ? s.slice(at + 1) : '';
 }
 
+/* ---------------- Per-domain colour ----------------
+ * A domain's colour comes from a **fixed qualitative palette** (hue + saturation per slot) rather than a hash-derived
+ * hue: hashing produced neighbouring hues that were impossible to tell apart at a glance (user feedback), while a small
+ * hand-picked palette keeps every pair clearly distinct. Lightness is fixed per usage (list tint / left bar / dot), so
+ * text contrast never depends on which slot a domain got.
+ *
+ * The slot is the domain's **position in the configured domain list**, so the first domains always get different colours;
+ * a domain that is not in the list yet (or beyond the palette) falls back to a stable hash-based slot.
+ */
+const DOMAIN_PALETTE = [
+  { h: 210, s: 62 }, // 蓝
+  { h: 25, s: 82 }, // 橙
+  { h: 145, s: 48 }, // 绿
+  { h: 340, s: 68 }, // 红
+  { h: 265, s: 52 }, // 紫
+  { h: 175, s: 55 }, // 青
+  { h: 100, s: 45 }, // 橄榄
+  { h: 310, s: 50 }, // 品红
+];
+
+/** Palette slot of a domain (-1 when there is no domain at all). */
+function domainSlot(domain) {
+  const d = String(domain || '').trim().toLowerCase();
+  if (!d) return -1;
+  const list = state && Array.isArray(state.domains) ? state.domains : [];
+  const i = list.indexOf(d);
+  if (i >= 0) return i % DOMAIN_PALETTE.length;
+  // Not configured (yet): keep a stable slot so the colour does not jump around.
+  let h = 0;
+  for (let k = 0; k < d.length; k++) h = (h * 31 + d.charCodeAt(k)) % 997;
+  return h % DOMAIN_PALETTE.length;
+}
+
+/** The domain's palette entry, or null when the domain is unknown. */
+function domainColor(domain) {
+  const slot = domainSlot(domain);
+  return slot < 0 ? null : DOMAIN_PALETTE[slot];
+}
+
+/** Kept for the tests / callers that only need the hue. */
+function domainHue(domain) {
+  const c = domainColor(domain);
+  return c === null ? null : c.h;
+}
+
+/** The domain a message belongs to: our mailbox's domain (same for outbound and inbound). */
+function itemDomain(item) {
+  return addrDomain(String((item && item.mailbox) || ''));
+}
+
+/** Set `--dom-h` / `--dom-s` (and the marker class) on an element; false when the domain is unknown. */
+function setDomainHue(el, domain) {
+  if (!el) return false;
+  const c = domainColor(domain);
+  if (c === null) {
+    el.classList.remove('has-dom-color');
+    el.style.removeProperty('--dom-h');
+    el.style.removeProperty('--dom-s');
+    return false;
+  }
+  el.classList.add('has-dom-color');
+  el.style.setProperty('--dom-h', String(c.h));
+  el.style.setProperty('--dom-s', `${c.s}%`);
+  return true;
+}
+
+/**
+ * One **delegated** click listener for the whole domain bar.
+ *
+ * The chips are re-rendered on every toggle, so a listener attached per chip is easy to lose (and the browser's implicit
+ * `<label> → checkbox` activation is fragile: a click that lands on the text or the colour dot must flip the filter just
+ * like a click on the 13px box). Delegation keeps exactly one handler alive for the bar itself, and the toggle is applied
+ * explicitly (`preventDefault` + `toggleDomain`) so every click flips the filter exactly once.
+ */
+function installDomainBarDelegation(bar) {
+  if (!bar || bar.dataset.delegated === '1') return;
+  bar.dataset.delegated = '1';
+  bar.addEventListener('click', (e) => {
+    const chip = e.target && e.target.closest ? e.target.closest('.domain-chip') : null;
+    if (!chip || !bar.contains(chip)) return;
+    const d = String(chip.dataset.domain || '').toLowerCase();
+    if (!d) return;
+    // The inline health marker is a button of its own: it opens the self-check panel and must not toggle the filter.
+    if (e.target && e.target.closest && e.target.closest('.domain-status')) {
+      e.preventDefault();
+      showDomainCheck(d);
+      return;
+    }
+    // Toggle relative to the **state**, never relative to `input.checked`: the checkbox's activation steps flip
+    // `checked` *before* click handlers run, so reading it would invert the result for a click on the box itself.
+    const selected = Array.isArray(state.domainSel) ? state.domainSel : [];
+    const on = !selected.includes(d);
+    e.preventDefault(); // never rely on the label's implicit activation; the toggle is applied below
+    const box = chip.querySelector('input[type="checkbox"]');
+    if (box) box.checked = on;
+    toggleDomain(d, on);
+  });
+}
+
 /** Render the domain list next to the search box. Hidden only when no domain is configured. */
 function renderDomainBar() {
   const bar = $('#domain-bar');
@@ -874,38 +998,231 @@ function renderDomainBar() {
     return;
   }
   bar.classList.remove('hidden');
+  installDomainBarDelegation(bar);
   bar.innerHTML = '';
-  const single = list.length === 1;
-  const make = (value, label, active) => {
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.className = 'domain-chip' + (active || state.domain === value ? ' active' : '');
-    btn.dataset.domain = value;
-    btn.textContent = label;
-    btn.addEventListener('click', () => switchDomain(value));
-    return btn;
-  };
-  // "全部域名" only adds meaning once several domains exist; with a single domain we show just that one (marked active).
-  if (list.length >= 2) bar.appendChild(make('', '全部域名', false));
-  for (const d of list) bar.appendChild(make(d, d, single));
+  const sep = document.createElement('span');
+  sep.className = 'domain-sep';
+  sep.setAttribute('aria-hidden', 'true');
+  bar.appendChild(sep);
+
+  const sel = Array.isArray(state.domainSel) ? state.domainSel : [];
+  for (const d of list) {
+    const on = sel.includes(d);
+    const wrap = document.createElement('span');
+    wrap.className = 'domain-chip-wrap';
+    const chip = document.createElement('label');
+    chip.className = 'domain-chip' + (on ? ' on' : '');
+    chip.dataset.domain = d;
+    chip.title = on
+      ? '已勾选：只看该域（可多选）；取消全部勾选 = 不显示邮件'
+      : '勾选可只看某些域（支持多选）；都不勾选 = 不显示邮件';
+    const box = document.createElement('input');
+    box.type = 'checkbox';
+    box.checked = on;
+    box.addEventListener('change', () => toggleDomain(d, box.checked));
+    const text = document.createElement('span');
+    text.className = 'domain-name';
+    text.textContent = d;
+    chip.appendChild(box);
+    chip.appendChild(text);
+    setDomainHue(chip, d);
+    // Health marker: inline **after the domain name** (user request) — clicking it opens the self-check panel and must
+    // not tick the filter, which the bar's delegated handler takes care of.
+    const badge = document.createElement('span');
+    badge.className = 'domain-status';
+    badge.dataset.domain = d;
+    badge.setAttribute('role', 'button');
+    badge.tabIndex = 0;
+    badge.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        showDomainCheck(d);
+      }
+    });
+    chip.appendChild(badge);
+    // New-mail badge: the chip's top-right corner shows this domain's unread count (99+ beyond that).
+    const count = document.createElement('span');
+    count.className = 'domain-count hidden';
+    count.dataset.domain = d;
+    wrap.appendChild(chip);
+    wrap.appendChild(count);
+    bar.appendChild(wrap);
+  }
+  renderDomainHealth();
+  renderDomainCounts();
 }
 
-/** Switch the domain filter: re-fetch the list, counts and mailbox list for the new domain. */
-function switchDomain(domain) {
-  const next = (domain || '').toLowerCase();
-  if (next === state.domain) return;
-  state.domain = next;
+/** Unread count per domain, as the chip's corner badge (`99+` above 99). */
+function renderDomainCounts() {
+  for (const el of document.querySelectorAll('#domain-bar .domain-count')) {
+    const d = el.dataset.domain || '';
+    const n = Number((state.domainUnread && state.domainUnread[d]) || 0);
+    el.classList.toggle('hidden', !(n > 0));
+    el.textContent = n > 99 ? '99+' : String(n);
+    el.title = n > 0 ? `${d}：${n} 封未读` : '';
+  }
+}
+
+/**
+ * Refresh the per-domain unread counts (chip corner badge). Cheap D1 GROUP BY; throttled so a burst of folder loads
+ * does not hammer it.
+ */
+let domainCountsAt = 0;
+async function refreshDomainCounts(force = false) {
+  if (!force && Date.now() - domainCountsAt < 5000) return;
+  try {
+    const data = await api('/api/domains');
+    domainCountsAt = Date.now();
+    state.domainUnread = data && data.unread && typeof data.unread === 'object' ? data.unread : {};
+    const ids = {};
+    for (const row of Array.isArray(data && data.domains) ? data.domains : []) {
+      const name = String((row && row.domain) || '').trim().toLowerCase();
+      const zone = String((row && row.zone_id) || '').trim();
+      if (name && zone) ids[name] = zone;
+    }
+    state.zoneIds = ids;
+    renderDomainCounts();
+  } catch {
+    /* badge is informational: keep the previous numbers on failure */
+  }
+}
+
+/** Tick / untick one domain in the filter: re-fetch the list, counts and mailbox list for the new selection. */
+function toggleDomain(domain, on) {
+  const d = String(domain || '').toLowerCase();
+  if (!d) return;
+  const wanted = new Set(Array.isArray(state.domainSel) ? state.domainSel : []);
+  if (on) wanted.add(d);
+  else wanted.delete(d);
+  // Keep the configured order (not the click order) so the filter string is stable for caching.
+  const next = (Array.isArray(state.domains) ? state.domains : []).filter((x) => wanted.has(x));
+  if (next.join(',') === (Array.isArray(state.domainSel) ? state.domainSel : []).join(',')) return;
+  state.domainSel = next;
   state.selected.clear();
-  state.mailbox = ''; // a mailbox from the previous domain may not exist under the new one; let renderMailboxSelect re-derive it
+  // The mailbox filter only survives when it still belongs to one of the ticked domains.
+  if (state.mailbox && next.length && !next.includes(addrDomain(state.mailbox))) state.mailbox = '';
   state.cache.countsAt = 0;
   state.cache.mailboxesAt = 0;
   closeMessagePane();
   renderDomainBar();
   renderMailboxSelect();
+  renderListTitle(); // the ticked domains are part of the title, so the filter is visible immediately
   void loadMailboxes(true);
   void refreshCounts(true);
   void loadFolder();
   persistSoon();
+}
+
+/* ---------------- Domain health (automatic self-check, no button) ----------------
+ * The self-check runs **by itself**, at most once every 30 minutes, and each domain chip shows the result at its
+ * top-right corner: blue ✓ = fine, gray ? = not checked yet, red ! = a problem (click the badge for details / settings).
+ * The last result is cached in localStorage, so a page refresh shows the known state immediately instead of "?".
+ */
+const DOMAIN_HEALTH_TTL = 30 * 60 * 1000;  // at most one automatic check per 30 minutes
+const DOMAIN_HEALTH_TICK = 5 * 60 * 1000;  // re-evaluate the throttle every 5 min (a tab can stay open for hours)
+const DOMAIN_HEALTH_KEY = 'domain-health-v1';
+/** Advisory rows that must not turn the badge red: a missing DMARC does not stop mail from being delivered. */
+const DOMAIN_HEALTH_ADVISORY = /^DMARC\b/;
+
+let domainHealthTimer = null;
+
+function domainHealthOf(domain) {
+  const st = state.domainHealth && state.domainHealth[domain];
+  return st === 'ok' || st === 'bad' ? st : 'unknown';
+}
+
+/** Map the self-check items onto per-domain states. Items are named `<label> · <domain>`; everything else is global. */
+function domainHealthFromCheck(data) {
+  const items = Array.isArray(data && data.items) ? data.items : [];
+  const map = {};
+  const detail = {};
+  for (const d of state.domains) {
+    // Every check row is per domain (`<label> · <domain>`); DMARC is advisory and excluded from the badge.
+    const mine = items.filter(
+      (i) => typeof i.name === 'string' && i.name.endsWith(` · ${d}`) && !DOMAIN_HEALTH_ADVISORY.test(i.name)
+    );
+    if (!mine.length) { map[d] = 'unknown'; detail[d] = []; continue; }
+    const failed = mine.filter((i) => !i.ok).map((i) => String(i.name));
+    map[d] = failed.length ? 'bad' : 'ok';
+    detail[d] = failed;
+  }
+  return { map, detail };
+}
+
+function persistDomainHealth() {
+  try {
+    localStorage.setItem(
+      DOMAIN_HEALTH_KEY,
+      JSON.stringify({ at: state.domainHealthAt, map: state.domainHealth, detail: state.domainHealthDetail })
+    );
+  } catch {
+    /* storage disabled / quota: the state simply isn't cached */
+  }
+}
+
+function restoreDomainHealth() {
+  try {
+    const raw = localStorage.getItem(DOMAIN_HEALTH_KEY);
+    if (!raw) return;
+    const p = JSON.parse(raw);
+    if (!p || typeof p !== 'object') return;
+    if (p.map && typeof p.map === 'object') state.domainHealth = p.map;
+    if (p.detail && typeof p.detail === 'object') state.domainHealthDetail = p.detail;
+    if (typeof p.at === 'number') state.domainHealthAt = p.at;
+  } catch {
+    /* corrupt cache: start from "unknown" */
+  }
+}
+
+/** Update the corner badges in place (no re-render, so focus / scroll of the bar are untouched). */
+function renderDomainHealth() {
+  for (const badge of document.querySelectorAll('#domain-bar .domain-status')) {
+    const d = badge.dataset.domain || '';
+    const st = domainHealthOf(d);
+    const failed = (state.domainHealthDetail && state.domainHealthDetail[d]) || [];
+    badge.classList.remove('ok', 'bad', 'unknown');
+    badge.classList.add(st);
+    // "!" rather than "✕": a cross reads as a close button.
+    badge.textContent = st === 'ok' ? '✓' : st === 'bad' ? '!' : '?';
+    badge.title =
+      st === 'ok'
+        ? `${d}：自动自检正常（Resend 已验证、收发信 DNS 齐全）。点击查看详情`
+        : st === 'bad'
+          ? `${d}：自检发现问题${failed.length ? `（${failed.join('、')}）` : ''}。点击查看详情 / 修改发信 Key 与默认发件人`
+          : `${d}：还没有检查过。点击立即检查`;
+    badge.setAttribute('aria-label', badge.title);
+  }
+}
+
+/** Store one check payload (used by both the background check and the details panel). */
+function applyDomainHealth(data) {
+  const { map, detail } = domainHealthFromCheck(data || {});
+  state.domainHealth = map;
+  state.domainHealthDetail = detail;
+  state.domainHealthAt = Date.now();
+  persistDomainHealth();
+  renderDomainHealth();
+}
+
+/** Automatic self-check. `force` skips the 30-minute throttle (after adding a domain / saving settings). */
+async function refreshDomainHealth(force = false) {
+  if (!Array.isArray(state.domains) || !state.domains.length) return;
+  if (!force && Date.now() - (state.domainHealthAt || 0) < DOMAIN_HEALTH_TTL) return;
+  try {
+    const data = await api('/api/setup/check');
+    applyDomainHealth(data);
+  } catch {
+    /* network / auth hiccup: keep the last known state instead of flashing "?" everywhere */
+  }
+}
+
+function startDomainHealthTimer() {
+  if (domainHealthTimer) return;
+  domainHealthTimer = setInterval(() => void refreshDomainHealth(), DOMAIN_HEALTH_TICK);
+  // A background tab can sleep for hours: re-check when it becomes visible again (the TTL still applies).
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') void refreshDomainHealth();
+  });
 }
 
 function renderNav() {
@@ -955,7 +1272,8 @@ function renderTitle() {
 function countQuery() {
   const params = new URLSearchParams();
   if (state.mailbox) params.set('mailbox', state.mailbox);
-  if (state.domain) params.set('domain', state.domain);
+  // Always present: '' = nothing ticked = zero counts (see fetchFolderPage).
+  params.set('domain', domainParam());
   const s = params.toString();
   return s ? `?${s}` : '';
 }
@@ -968,9 +1286,10 @@ async function refreshCounts(force = false) {
     c.countsAt = Date.now();
     state.counts = next;
     renderNav();
+    void refreshDomainCounts();
     persistSoon();
-  } catch {
-    /* silent */
+  } catch (e) {
+    reportLoadError(e);
   }
 }
 
@@ -988,7 +1307,8 @@ async function loadMailboxes(force = false) {
   }
   c.mailboxesLoading = true;
   try {
-    const data = await api(`/api/mailboxes${state.domain ? `?domain=${encodeURIComponent(state.domain)}` : ''}`);
+    // '' = nothing ticked -> no addresses at all (same rule as the list / counts).
+    const data = await api(`/api/mailboxes?domain=${encodeURIComponent(domainParam())}`);
     state.mailboxList = data.mailboxes || [];
     c.mailboxesAt = Date.now();
     renderMailboxSelect();
@@ -1006,6 +1326,26 @@ async function loadMailboxes(force = false) {
 
 /* ---------------- List ---------------- */
 
+/**
+ * Surface a failed background fetch instead of silently keeping the previous view.
+ * A filter change that looks like it "does nothing" is usually an API error being swallowed by a bare `catch {}`;
+ * deduplicated by message so a flapping endpoint cannot spam toasts.
+ */
+let lastLoadError = { msg: '', at: 0 };
+function reportLoadError(e) {
+  const msg = (e && e.message) || String(e || '');
+  if (!msg) return;
+  if (window.console) console.warn('[load]', msg);
+  const now = Date.now();
+  if (msg === lastLoadError.msg && now - lastLoadError.at < 30000) return;
+  lastLoadError = { msg, at: now };
+  try {
+    showToast(msg, true);
+  } catch {
+    /* no toast container (e.g. a bare headless harness): the console warning above is enough */
+  }
+}
+
 function folderLabel() {
   const f = FOLDERS.find((x) => x.key === state.folder);
   return f ? f.label : state.folder;
@@ -1015,6 +1355,8 @@ function renderListTitle() {
   // Explicitly label the definition: this is "the folder's total count", semantically different from the "unread" in the sidebar/dropdown, and not forcibly unified (BUG-3d).
   const extra = state.total ? ` · 共 ${state.total} 封` : '';
   const q = state.q ? `：搜索“${state.q}”` : '';
+  // Only the folder + total (user request): the active domain filter is already visible as ticked chips, and the
+  // empty state explains "no domain selected" when nothing is shown.
   $('#list-title').textContent = `${folderLabel()}${q}${extra}`;
 }
 
@@ -1042,7 +1384,14 @@ function afterListRender() {
   renderListTitle();
   const empty = $('#list-empty');
   if (state.items.length === 0) {
-    empty.textContent = state.loading ? '加载中…' : '这里还没有邮件';
+    const noDomain = !(Array.isArray(state.domainSel) && state.domainSel.length);
+    empty.textContent = state.loading
+      ? '加载中…'
+      : state.folder === 'drafts'
+        ? '这里还没有邮件'
+        : noDomain
+          ? '未选择域名：勾选上方的域名后显示邮件'
+          : '这里还没有邮件';
     empty.classList.remove('hidden');
   } else {
     empty.classList.add('hidden');
@@ -1073,8 +1422,14 @@ function cachedFolderFingerprint(token) {
 function fetchFolderPage(offset) {
   const params = new URLSearchParams({ limit: String(PAGE_SIZE), offset: String(offset) });
   if (state.q) params.set('q', state.q);
-  if (state.mailbox) params.set('mailbox', state.mailbox);
-  if (state.domain) params.set('domain', state.domain);
+  // Drafts belong to the sender you picked, not to the address/domain you are browsing: never narrow them by filters,
+  // otherwise a draft written from another address looks lost.
+  if (state.folder !== 'drafts') {
+    if (state.mailbox) params.set('mailbox', state.mailbox);
+    // Always sent, even when empty: an empty value means "no domain ticked", which must show **nothing** rather than
+    // everything (that is the whole point of the top-bar filter).
+    params.set('domain', domainParam());
+  }
   return api(`/api/folders/${state.folder}?${params}`);
 }
 
@@ -1091,7 +1446,7 @@ async function revalidateFolder(token, first) {
     if (token !== folderKey()) return;
     state.loading = false;
     if (first) paintList();
-    if (!state.items.length) showToast(e.message, true);
+    reportLoadError(e);
     return;
   }
   if (token !== folderKey()) return; // view switched, discard stale response
@@ -1123,7 +1478,7 @@ async function loadFolder(append = false, force = false) {
       paintList();
       persistSoon();
     } catch (e) {
-      if (!state.items.length) showToast(e.message, true);
+      reportLoadError(e);
     } finally {
       if (token === folderKey()) state.loading = false;
     }
@@ -1212,6 +1567,8 @@ function itemRow(item) {
   const row = document.createElement('div');
   row.className = 'list-item' + (hasUnread ? ' unread' : '') + (item.id === state.openId ? ' active' : '');
   row.dataset.id = item.id;
+  // Domain colour: the tint (and the left bar) tells at a glance which domain this mail belongs to.
+  setDomainHue(row, itemDomain(item));
 
   if (!isDraft) {
     const chk = document.createElement('input');
@@ -1679,6 +2036,7 @@ function renderRead() {
   // Envelope card
   const env = document.createElement('div');
   env.className = 'mail-card mail-envelope';
+  setDomainHue(env, itemDomain(m));
 
   const top = document.createElement('div');
   top.className = 'env-top';
@@ -1718,8 +2076,12 @@ function renderRead() {
   // Action buttons
   const actions = document.createElement('div');
   actions.className = 'env-actions';
-  if (isInbound) {
-    actions.appendChild(readBtn('回复', () => { if (isOpen()) openReplyComposer(); }, 'btn-primary'));
+  // A message we sent to one of our own addresses is stored twice: the thread keeps the outbound copy and folds the
+  // received one into `copy_ids`, so "incoming" mail from a managed domain would show no reply button. Treat any
+  // message that also arrived as incoming and reply to that inbound copy.
+  const inboundCopyId = isInbound ? '' : inboundCopyIdOf(m);
+  if (isInbound || inboundCopyId) {
+    actions.appendChild(readBtn('回复', () => { if (isOpen()) openReplyComposer(inboundCopyId || undefined); }, 'btn-primary'));
   }
   // Forwarding is available for both inbound / outbound mail (you can forward your own sent mail to others too)
   actions.appendChild(readBtn('转发', () => { if (isOpen()) openForwardComposer(); }));
@@ -1845,6 +2207,18 @@ function isCurrentThreadRow(t) {
   if (!currentMessage) return false;
   if (t.id === currentMessage.id) return true;
   return jsonArr(t.copy_ids).includes(currentMessage.id);
+}
+
+/**
+ * The id of the **inbound copy** of the currently open message, when it is an outbound row that also arrived
+ * (self-sent mail across our own domains / loopback). '' when unknown. Reply must target that inbound row.
+ */
+function inboundCopyIdOf(m) {
+  if (!m) return '';
+  const row = currentThread.find((t) => t.id === m.id || jsonArr(t.copy_ids).includes(m.id));
+  if (!row || row.direction !== 'outbound') return '';
+  const ids = jsonArr(row.copy_ids);
+  return ids.length ? String(ids[0]) : '';
 }
 
 function threadPanel() {
@@ -2502,7 +2876,12 @@ function renderSenderSummary() {
     return;
   }
   row.classList.remove('hidden');
-  row.classList.toggle('sender-solo', list.length < 2);
+  const solo = list.length < 2;
+  row.classList.toggle('sender-solo', solo);
+  // With a single address the dropdown row never opens, so the "＋ 自定义" entry has to be visible here instead —
+  // otherwise a fresh mailbox offers no way to send from any other address (user-reported).
+  const customBtn = $('#f-sender-custom');
+  if (customBtn) customBtn.classList.toggle('hidden', !solo);
   $('#f-sender-current').textContent = $('#f-mailbox').value;
 }
 
@@ -2517,11 +2896,22 @@ function composerMailboxOptions() {
   const list = state.mailboxList.map((m) => m.mailbox).filter((m) => m && m !== UNKNOWN_MAILBOX);
   const custom = Array.isArray(state.customSenders) ? state.customSenders : [];
   for (const c of custom) if (c && !list.includes(c)) list.push(c);
+  // Configured default senders (GET /api/account.senders). A freshly added domain has no message history yet, so without
+  // these the list would be empty and the sender row (with the "custom sender" entry) would be hidden entirely,
+  // leaving no way to pick a sender — i.e. no way to send at all.
+  const senders = Array.isArray(state.senders) ? state.senders : [];
+  for (const s of senders) if (s && !list.includes(s)) list.push(s);
   if (state.fromAddress && !list.includes(state.fromAddress.toLowerCase())) list.unshift(state.fromAddress.toLowerCase());
   const def = state.composing && state.composing.mailbox ? state.composing.mailbox : '';
   if (def && !list.includes(def)) list.unshift(def);
-  // When a domain filter is active, only offer senders on that domain.
-  return state.domain ? list.filter((a) => addrDomain(a) === state.domain) : list;
+  // When one or more domains are ticked, only offer senders on those domains (multi-select aware).
+  const sel = Array.isArray(state.domainSel) ? state.domainSel : [];
+  const scoped = sel.length ? list.filter((a) => sel.includes(addrDomain(a))) : list;
+  if (scoped.length) return scoped;
+  // Last resort: a domain is configured but it has neither history nor a stored default sender → offer the canonical
+  // default address of that domain (the setup wizard writes noreply@<domain>), instead of leaving the composer unusable.
+  const fallbackDomain = sel[0] || (Array.isArray(state.domains) ? state.domains[0] : '');
+  return fallbackDomain ? [`noreply@${fallbackDomain}`] : [];
 }
 
 /**
@@ -2531,7 +2921,7 @@ function composerMailboxOptions() {
 function addCustomSender() {
   if (!state.composing) return;
   const domains = Array.isArray(state.domains) ? state.domains : [];
-  const preferred = state.domain || domains[0] || '';
+  const preferred = (Array.isArray(state.domainSel) ? state.domainSel[0] : '') || domains[0] || '';
   const input = prompt(
     preferred ? `自定义发件人地址（需为 ${preferred} 下的地址）` : '自定义发件人地址',
     preferred ? `noreply@${preferred}` : ''
@@ -2661,22 +3051,25 @@ function openComposer() {
   });
 }
 
-function openReplyComposer() {
+function openReplyComposer(inboundCopyId) {
   if (!state.canSend) {
     showToast('服务端未配置发送能力', true);
     return;
   }
   const m = currentMessage;
   if (!m) return;
-  const to = m.reply_to && m.reply_to.length ? m.reply_to[0] : m.from_email;
+  // The reply endpoint only accepts inbound mail. For a self-sent message the thread keeps the outbound copy and the
+  // received one lives in `copy_ids`, so reply against that copy (same physical mail, correct mailbox/thread).
+  const original = inboundCopyId ? Object.assign({}, m, { id: inboundCopyId, direction: 'inbound' }) : m;
+  const to = original.reply_to && original.reply_to.length ? original.reply_to[0] : original.from_email;
   openComposerShell({
     mode: 'reply',
     title: '回复',
-    original: m,
-    originalId: m.id,
+    original,
+    originalId: original.id,
     to: to || '',
-    subject: /^\s*re:/i.test(m.subject || '') ? m.subject : `Re: ${m.subject || ''}`,
-    mailbox: m.mailbox || undefined,
+    subject: /^\s*re:/i.test(original.subject || '') ? original.subject : `Re: ${original.subject || ''}`,
+    mailbox: original.mailbox || undefined,
     showMerge: false, // Reply mode: merge send is meaningless, hide the control to avoid misleading
     showQuote: true,
     focus: '#f-body',
@@ -3694,6 +4087,7 @@ function setupEvents() {
   $('#f-sender-toggle').addEventListener('click', toggleSenderExpanded);
   $('#f-mailbox').addEventListener('change', renderSenderSummary);
   $('#f-sender-add').addEventListener('click', addCustomSender);
+  $('#f-sender-custom').addEventListener('click', addCustomSender);
   // Multi-domain: open the wizard from inside the app to configure an extra domain.
   $('#add-domain-btn').addEventListener('click', openAddDomain);
   // Mail merge: the checked state and recipient count both affect the hint text
@@ -4070,6 +4464,67 @@ function detectWorkerName() {
 }
 
 /** Wizard steps 2/3: domain + auto DNS setup + send/receive auth. The CF Token is used once and not saved. */
+/**
+ * Cloudflare's "API token template URL": opening it pre-selects the permission groups below, so the user only has to
+ * review and confirm instead of hunting through the token UI. The four permissions are exactly what the wizard uses:
+ *   Zone:Read        → GET /zones?name=…            (find the zone)
+ *   DNS:Edit         → /zones/:id/dns_records       (Resend DKIM/SPF/MX + Email Routing records)
+ *   Zone Settings:Edit → Email Routing settings      (enable routing for the zone)
+ *   Email Routing Rules:Edit → routing rules/catch_all (point catch-all at this Worker)
+ * If Cloudflare ever ignores the parameters the page simply opens with the normal token form — the same four
+ * permissions are spelled out right next to the button, so the flow still works.
+ */
+const CF_TOKEN_PERMS = [
+  { key: 'zone', type: 'read' },
+  { key: 'dns', type: 'edit' },
+  { key: 'zone_settings', type: 'edit' },
+  { key: 'email_routing_rules', type: 'edit' },
+];
+/** Normalize a domain typed by the user (lowercase, no scheme/path) — same rule the wizard uses. */
+function normDomainInput(raw) {
+  return String(raw || '').trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '').replace(/\.$/, '');
+}
+
+/** Is this something that can be a zone name? */
+function looksLikeDomain(d) {
+  return /^(?=.{4,253}$)([a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$/.test(String(d || ''));
+}
+
+/**
+ * The zone id of a domain the app already knows (its own `domains` table), trying the exact name first and then the
+ * registrable-ish apex — the same fallback the wizard's zone lookup uses.
+ */
+function knownZoneIdFor(domain) {
+  const d = normDomainInput(domain);
+  if (!d) return '';
+  const map = state.zoneIds && typeof state.zoneIds === 'object' ? state.zoneIds : {};
+  if (map[d]) return map[d];
+  const parts = d.split('.');
+  for (let i = 1; i < parts.length - 1; i++) {
+    const apex = parts.slice(i).join('.');
+    if (map[apex]) return map[apex];
+  }
+  return '';
+}
+
+/**
+ * Cloudflare token template URL.
+ *
+ * `zoneId` is the only way to pre-select a zone, and Cloudflare accepts a **zone id** (not a name) there. The id can only
+ * be discovered with a token — which is exactly what the user is about to create — so:
+ *   · domain already configured (its zone id is stored in the app's `domains` table) -> link is scoped to that zone;
+ *   · brand-new domain -> `zoneId=all` plus a hint telling the user to switch Zone Resources to that domain.
+ */
+function cfTokenTemplateUrl(domain) {
+  const q = new URLSearchParams();
+  q.set('permissionGroupKeys', JSON.stringify(CF_TOKEN_PERMS));
+  // Cloudflare's docs mark both scope parameters as required.
+  q.set('accountId', '*');
+  q.set('zoneId', knownZoneIdFor(domain) || 'all');
+  q.set('name', 'Resend Mail API');
+  return `https://dash.cloudflare.com/profile/api-tokens?${q.toString()}`;
+}
+
 function showDomainWizard(status, opts = {}) {
   const adding = !!opts.adding;
   const submitLabel = adding ? '添加域名' : '开始配置';
@@ -4079,7 +4534,20 @@ function showDomainWizard(status, opts = {}) {
       <div class="gate-title">${adding ? '添加域名' : '连接你的域名'}</div>
       <div class="gate-sub">${adding ? '为当前邮箱增加一个收发域名，自动完成收信路由与发信认证' : '第 2 步 · 输入域名并授权，自动完成收信路由与发信认证'}</div>
       ${gateField('gate-domain', '域名', 'text', adding ? '' : (status && status.domain) || '', 'example.com')}
-      ${gateField('gate-cf', 'Cloudflare API Token', 'password', '', 'Zone:Read + DNS:Edit + Email Routing')}
+      <div class="gate-field cf-auth">
+        <span>Cloudflare 授权（自动勾选权限）</span>
+        <a class="btn btn-primary cf-auth-btn disabled" id="cf-auth-open" href="#" aria-disabled="true" target="_blank" rel="noopener noreferrer">打开 Cloudflare 授权页</a>
+        <div class="cf-zone-hint" id="cf-zone-hint">先在上面填写域名，按钮才会激活。</div>
+        <div class="cf-perms" id="cf-perms">
+          <div>需要 4 项权限：Zone → Read · DNS → Edit · Zone Settings → Edit · Email Routing Rules → Edit</div>
+          <ul class="cf-perms-list">
+            <li>打开后前 3 项已自动勾选；Email Routing Rules 若没有出现，点 Permissions 下的「+ Add more」→ 选 Zone → Email Routing Rules → Edit（Cloudflare 目前不支持用链接预选这一项）。</li>
+            <li>Zone Resources 默认 All zones；想只授权这一个域，改成 Include → 你的域名。</li>
+            <li>最后点「Continue to summary」→「Create Token」，把 Token 粘到下面。</li>
+          </ul>
+        </div>
+      </div>
+      ${gateField('gate-cf', '把创建好的 Token 粘贴到这里', 'password', '', 'Cloudflare API Token')}
       ${gateField('gate-resend', 'Resend API Key', 'password', '', 're_…（保存在你自己的数据库，用于发信）')}
       ${adding ? '' : gateField('gate-from', '发件地址', 'text', (status && status.from_address) || '', 'noreply@example.com')}
       ${adding ? '' : gateField('gate-fromname', '发件显示名（可选）', 'text', '', '')}
@@ -4093,6 +4561,47 @@ function showDomainWizard(status, opts = {}) {
     </div>`;
 
   const domainEl = $('#gate-domain');
+
+  /**
+   * Enable the Cloudflare authorisation button only once the domain looks valid, and (re)build its link for exactly that
+   * domain: when the app already knows the zone id the token page opens with that zone pre-selected, otherwise the hint
+   * tells the user which row to change.
+   */
+  const syncCfAuth = () => {
+    const link = $('#cf-auth-open');
+    const hint = $('#cf-zone-hint');
+    if (!link || !hint) return;
+    const raw = domainEl ? domainEl.value : '';
+    const d = normDomainInput(raw);
+    const ok = looksLikeDomain(d);
+    link.classList.toggle('disabled', !ok);
+    link.setAttribute('aria-disabled', ok ? 'false' : 'true');
+    if (!ok) {
+      link.setAttribute('href', '#');
+      hint.textContent = '先在上面填写域名，按钮才会激活。';
+      return;
+    }
+    link.setAttribute('href', cfTokenTemplateUrl(d));
+    const zoneId = knownZoneIdFor(d);
+    hint.textContent = zoneId
+      ? `已按 ${d} 所在的 zone 打开（Zone Resources 已锁定到该域名）。`
+      : `打开后把 Zone Resources 改成 Include → ${d}，只授权这一个域（Cloudflare 的链接只接受 zone id，首次配置时还查不到）。`;
+  };
+  if (domainEl) {
+    domainEl.addEventListener('input', syncCfAuth);
+    domainEl.addEventListener('change', syncCfAuth);
+  }
+  const cfLink = $('#cf-auth-open');
+  if (cfLink) {
+    cfLink.addEventListener('click', (e) => {
+      if (cfLink.classList.contains('disabled')) {
+        e.preventDefault();
+        const err = $('#gate-error');
+        if (err) err.textContent = '请先填写域名，再打开 Cloudflare 授权页。';
+      }
+    });
+  }
+  syncCfAuth();
   const fromEl = $('#gate-from');
   // When the domain changes, if the from address isn't customized yet, auto-fill noreply@<domain>
   // (setup only; the add-domain flow has no sender fields — senders are derived in the composer).
@@ -4156,6 +4665,7 @@ function showDomainWizard(status, opts = {}) {
         state.cache.countsAt = 0;
         void loadMailboxes(true);
         void refreshCounts(true);
+        void refreshDomainHealth(true); // a new domain must not keep showing the previous badge state
         showToast('域名已添加');
         return;
       }
@@ -4174,6 +4684,134 @@ function openAddDomain() {
   showDomainWizard({}, { adding: true });
 }
 
+/**
+ * Render the self-check result as two tables: **sending (Resend)** and **receiving (Cloudflare Email Routing)**.
+ * Row names arrive as `<label> · <domain>`; the domain is already in the title, so the suffix is stripped here.
+ */
+function renderCheckTables(box, items, only) {
+  if (!box) return;
+  const rows = (Array.isArray(items) ? items : []).map((i) => {
+    const name = String(i.name || '');
+    const label = only && name.endsWith(` · ${only}`) ? name.slice(0, -(only.length + 3)) : name.replace(/ · .*$/, '');
+    return { label, ok: !!i.ok, warn: !!i.warn, detail: String(i.detail || '') };
+  });
+  const send = rows.filter((r) => !r.label.startsWith('收信'));
+  const recv = rows.filter((r) => r.label.startsWith('收信'));
+  const table = (caption, list) => {
+    if (!list.length) return '';
+    const body = list.map((r) => {
+      const cls = r.warn ? 'warn' : r.ok ? 'ok' : 'bad';
+      const mark = r.warn ? '!' : r.ok ? '✓' : '✕';
+      return `<tr class="${cls}">
+        <td class="ct-name">${esc(r.label)}</td>
+        <td class="ct-state">${mark}</td>
+        <td class="ct-detail">${esc(r.detail)}</td>
+      </tr>`;
+    }).join('');
+    return `<table class="check-table">
+      <caption>${esc(caption)}</caption>
+      <thead><tr><th>项目</th><th>状态</th><th>详情</th></tr></thead>
+      <tbody>${body}</tbody>
+    </table>`;
+  };
+  box.innerHTML = table('发信（Resend）', send) + table('收信（Cloudflare Email Routing）', recv);
+}
+
+/**
+ * Domain self-check panel. Opened by clicking a domain chip's health badge, so it **always** describes exactly one
+ * domain: `GET /api/setup/check` still checks them all (the badges need that), the panel filters to this one.
+ */
+async function showDomainCheck(domain) {
+  const only = String(domain || '').trim().toLowerCase();
+  const root = gateRoot();
+  root.innerHTML = `
+    <div class="gate-card gate-wide gate-check">
+      <div class="gate-title">域名自检${only ? ` · ${esc(only)}` : ''}</div>
+      <div id="gate-error" class="gate-error"></div>
+      <div id="gate-loading" class="gate-loading"><span class="spinner" aria-hidden="true"></span>检查中…</div>
+      <div id="gate-tables" class="gate-tables hidden"></div>
+      <details class="gate-edit" id="gate-edit">
+        <summary>${only ? `修改 ${esc(only)} 的发信 Key` : '修改发信 Key'}</summary>
+        <label class="gate-field"><span>${only ? `Resend API Key · ${esc(only)}（留空则不修改）` : 'Resend API Key（留空则不修改）'}</span>
+          <input id="set-key" type="password" value="" placeholder="re_…" autocomplete="off" /></label>
+        <div class="gate-actions"><button class="btn btn-primary" id="set-save" type="button">保存并重新检查</button></div>
+      </details>
+      <div class="gate-actions">
+        <button class="btn" id="gate-close" type="button">关闭</button>
+        <button class="btn btn-primary" id="gate-rerun" type="button">重新检查</button>
+      </div>
+    </div>`;
+  const tables = $('#gate-tables');
+  const loading = $('#gate-loading');
+  const err = $('#gate-error');
+  const rerunBtn = $('#gate-rerun');
+  let prefilled = false;
+  /** Only this domain's rows (`<label> · <domain>`); the panel describes a single domain. */
+  const visibleItems = (items) => {
+    const list = Array.isArray(items) ? items : [];
+    if (!only) return list;
+    return list.filter((i) => typeof i.name === 'string' && (!/ · /.test(i.name) || i.name.endsWith(` · ${only}`)));
+  };
+  const applyConfig = (config) => {
+    if (!config) return;
+    const per = (only && config.domains && config.domains[only]) || null;
+    const keyEl = $('#set-key');
+    if (keyEl) {
+      const masked = per ? per.key_masked : '';
+      const src = per ? { domain: '域名绑定', env: '环境变量', none: '未配置' }[per.key_source] || '' : '';
+      keyEl.placeholder = masked ? `当前 ${masked}${src ? `（${src}）` : ''}（留空不修改）` : 're_…';
+    }
+  };
+  const run = async () => {
+    err.textContent = '';
+    rerunBtn.disabled = true;
+    loading.classList.remove('hidden');
+    tables.classList.add('hidden');
+    const r = await probe('/api/setup/check');
+    // The panel may have been closed while the check was in flight (关闭) — don't touch detached nodes.
+    if (!rerunBtn.isConnected) return;
+    rerunBtn.disabled = false;
+    loading.classList.add('hidden');
+    if (!r.res || !r.res.ok || !r.data) {
+      err.textContent = (r.data && r.data.error) || '检查失败，请重试';
+      return;
+    }
+    renderCheckTables(tables, visibleItems(r.data.items), only);
+    tables.classList.remove('hidden');
+    applyDomainHealth(r.data); // keep the corner badges in sync with what the panel just showed
+    if (!prefilled) { applyConfig(r.data.config); prefilled = true; }
+  };
+  $('#set-save').addEventListener('click', async () => {
+    const saveBtn = $('#set-save');
+    err.textContent = '';
+    saveBtn.disabled = true;
+    const r = await probe('/api/settings/send', {
+      method: 'POST',
+      body: JSON.stringify({
+        domain: only || undefined, // the key is bound to the domain
+        resend_key: $('#set-key').value.trim(),
+      }),
+    });
+    if (!saveBtn.isConnected) return;
+    saveBtn.disabled = false;
+    if (!r.res || !r.res.ok) {
+      err.textContent = (r.data && r.data.error) || '保存失败';
+      return;
+    }
+    const warning = r.data.key_check && (r.data.key_check.warning || '');
+    const seen = r.data.key_check && Array.isArray(r.data.key_check.domains)
+      ? `，这把 Key 能看到：${r.data.key_check.domains.map((d) => `${d.name}(${d.status})`).join('、') || '（无）'}`
+      : '';
+    showToast(`${only ? `${only} 的` : ''}发信设置已保存${seen}${warning ? ` · ${warning}` : ''}`);
+    $('#set-key').value = '';
+    prefilled = false;
+    await run();
+  });
+  $('#gate-close').addEventListener('click', hideGate);
+  rerunBtn.addEventListener('click', () => void run());
+  await run();
+}
+
 /* ---------------- Initialization ---------------- */
 
 async function loadAccount() {
@@ -4185,8 +4823,14 @@ async function loadAccount() {
     state.domains = Array.isArray(account.domains) && account.domains.length
       ? account.domains.map((d) => String(d).toLowerCase()).filter(Boolean)
       : (account.domain ? [String(account.domain).toLowerCase()] : []);
-    // Drop a restored domain filter that is no longer configured.
-    if (state.domain && !state.domains.includes(state.domain)) state.domain = '';
+    // Configured default senders: needed before a domain has any message history (see composerMailboxOptions).
+    state.senders = Array.isArray(account.senders)
+      ? account.senders.map((s) => String(s).trim().toLowerCase()).filter(Boolean)
+      : [];
+    // Drop restored domain ticks that are no longer configured.
+    if (Array.isArray(state.domainSel) && state.domainSel.length) {
+      state.domainSel = state.domains.filter((d) => state.domainSel.includes(d));
+    }
     renderDomainBar();
   } catch (e) {
     showToast(e.message, true);
@@ -4200,8 +4844,9 @@ async function init() {
 
   // 1) Synchronously restore local cache → first paint shows the list / count badges / account dropdown with 0 requests
   const restored = restorePersisted();
+  restoreDomainHealth(); // last known domain health, so the corner badges paint immediately (may be refreshed below)
   const mailboxAtStart = state.mailbox;
-  const domainAtStart = state.domain;
+  const domainAtStart = domainParam();
 
   setupEvents();
   applyListWidth(loadListWidth()); // restore the list width set by the last drag (null if not customized, using the CSS default)
@@ -4234,8 +4879,15 @@ async function init() {
     loadBackendStatus(),
   ]);
 
+  // 3) Per-domain unread badges + automatic domain health (the health result comes from cache first, then refreshes).
+  void refreshDomainCounts(true);
+  // Domain health: the badges are already painted from cache; the self-check runs by itself at most every 30 min
+  //    (and every 5 minutes the throttle is re-evaluated, so a long-open tab keeps refreshing).
+  void refreshDomainHealth();
+  startDomainHealthTimer();
+
   // The restored mailbox/domain filter may have been dropped by loadAccount (no longer configured); refresh with the corrected filter.
-  if (state.mailbox !== mailboxAtStart || state.domain !== domainAtStart) {
+  if (state.mailbox !== mailboxAtStart || domainParam() !== domainAtStart) {
     state.cache.mailboxesAt = 0;
     state.cache.countsAt = 0;
     renderMailboxSelect();

@@ -23,6 +23,15 @@ export class CfError extends Error {
   }
 }
 
+/** Which wizard permission a path needs — used only to make the error message actionable. */
+function permissionForPath(path: string): string {
+  if (/\/dns_records/.test(path)) return 'DNS → Edit';
+  if (/\/email\/routing/.test(path)) return 'Email Routing Rules → Edit';
+  if (/\/settings/.test(path)) return 'Zone Settings → Edit';
+  if (/^\/zones(\?|$)/.test(path)) return 'Zone → Read';
+  return '';
+}
+
 async function cfFetch<T>(token: string, path: string, init: RequestInit = {}): Promise<T> {
   let resp: Response;
   try {
@@ -46,7 +55,12 @@ async function cfFetch<T>(token: string, path: string, init: RequestInit = {}): 
   }
   if (!resp.ok || !body || body.success === false) {
     const msg = body?.errors?.map((e) => `${e.code} ${e.message}`).join('; ') || `HTTP ${resp.status}`;
-    throw new CfError(`Cloudflare API 错误：${msg}`, resp.status);
+    // 401/403 almost always means the token is missing one of the four wizard permissions: name it.
+    const need = permissionForPath(path);
+    const hint = (resp.status === 401 || resp.status === 403) && need
+      ? `（该操作需要 Token 具备 ${need} 权限 —— 请回到 Cloudflare 的 Token 页面补上这一项后重新粘贴）`
+      : '';
+    throw new CfError(`Cloudflare API 错误：${msg}${hint}`, resp.status);
   }
   return body.result;
 }

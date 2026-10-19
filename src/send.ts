@@ -1,5 +1,6 @@
 import type { Env, SendResult } from './types';
-import { escapeHtml, parseJsonObject, domainOf } from './util';
+import { escapeHtml, parseJsonObject, domainOf, isPlaceholderDomain } from './util';
+import { explainResendError, domainOfFrom } from './resend-errors';
 
 /** Convert plain text into safely displayable HTML (escape + line breaks). */
 export function textToHtml(text: string): string {
@@ -16,7 +17,7 @@ export function buildFrom(env: Env): string {
   return name ? `${name} <${addr}>` : addr;
 }
 
-/** Take the local part of an address as the display name (`zhanglili@notionmanager.com` → `zhanglili`). */
+/** Take the local part of an address as the display name (`zhanglili@example.com` → `zhanglili`). */
 function localPart(addr: string): string {
   const at = addr.indexOf('@');
   return at > 0 ? addr.slice(0, at) : addr;
@@ -35,7 +36,7 @@ export interface SenderIdentity {
  * Resolve the sender identity (`from` / address / display name) for the given mailbox.
  *
  * ⚠️ It once applied the global `SEND_FROM_NAME` as the display name to **all** mailboxes in the same domain — so mail sent from
- * `zhanglili@notionmanager.com` appeared to the recipient as "support", making multiple accounts
+ * `zhanglili@example.com` appeared to the recipient as "support", making multiple accounts
  * completely indistinguishable. Production data measured: inbound `from_name` was always `"support"`.
  *
  * Current convention (three tiers):
@@ -60,21 +61,33 @@ export function senderIdentity(env: Env, mailbox: string): SenderIdentity {
   return { from: buildFrom(env), address: def, name: defaultName };
 }
 
-/** All domains allowed to send: the configured set (SENDING_DOMAINS), else SENDING_DOMAIN, else the default from address's domain. */
+/**
+ * All domains allowed to send, in display order: the primary domain (SENDING_DOMAIN, i.e. app_config.domain),
+ * the default from address's domain, then the configured set (SENDING_DOMAINS, derived from the domains table).
+ *
+ * ⚠️ The set must be a **union**, not "SENDING_DOMAINS else the single domain": a deployment configured only through
+ * env vars (SEND_FROM_ADDRESS / SENDING_DOMAIN) has no app_config.domain, so the moment the wizard adds the first
+ * in-app domain the derived SENDING_DOMAINS becomes non-empty and the original domain silently vanishes from the
+ * top-bar switcher, from /api/account and from the sender whitelist (the "added a domain and lost the old one" bug).
+ */
 export function sendingDomains(env: Env): string[] {
   const out: string[] = [];
-  for (const raw of (env.SENDING_DOMAINS || '').split(',')) {
-    const d = raw.trim().toLowerCase();
+  const add = (raw: string | null | undefined): void => {
+    const d = String(raw ?? '').trim().toLowerCase();
     if (d && !out.includes(d)) out.push(d);
-  }
-  if (!out.length) {
-    const single = (env.SENDING_DOMAIN || '').trim().toLowerCase();
-    if (single) out.push(single);
-  }
-  if (!out.length) {
-    const d = domainOf((env.SEND_FROM_ADDRESS || '').trim().toLowerCase());
-    if (d) out.push(d);
-  }
+  };
+  const configured = Boolean((env.SENDING_DOMAIN || '').trim() || (env.SENDING_DOMAINS || '').trim());
+  // The primary/legacy domain leads: it is what the pre-multi-domain config (and every fallback) called "the domain".
+  add(env.SENDING_DOMAIN);
+  // The default sender's domain is allowed by definition (buildFrom() uses it when no mailbox is chosen), so it belongs
+  // in the set even when it never made it into app_config / the domains table. It comes before the table's domains so
+  // that an env-configured deployment keeps its original primary domain.
+  // Exception: the template placeholder is dropped once a real domain is configured — a deployment that never replaced
+  // `SEND_FROM_ADDRESS = inbox@example.com` must not grow an "example.com" entry in the domain switcher. When the
+  // default address is the *only* thing configured it is kept as-is (that is the pre-existing single-domain behavior).
+  const fromDomain = domainOf((env.SEND_FROM_ADDRESS || '').trim().toLowerCase());
+  if (fromDomain && !(configured && isPlaceholderDomain(fromDomain))) add(fromDomain);
+  for (const raw of (env.SENDING_DOMAINS || '').split(',')) add(raw);
   return out;
 }
 
@@ -86,6 +99,31 @@ export function sendingDomain(env: Env): string {
 /** Build the sender for the given mailbox; fall back to the default sender if the mailbox's domain is not the default sending domain. */
 export function senderFromMailbox(env: Env, mailbox: string): string {
   return senderIdentity(env, mailbox).from;
+}
+
+/**
+ * The Resend key to use for an address / `from` value, most specific first:
+ *
+ *   domains.resend_api_key (bound to the domain, built into env.RESEND_API_KEYS)
+ *     → env RESEND_API_KEY (deployment-wide fallback)
+ *
+ * There is deliberately **no** global database level: two domains can live in different Resend accounts, so one
+ * "global" key can never be right for both — it only created the illusion that a domain was configured while it was
+ * quietly using another account's key (the classic "Resend shows the domain verified, but sending says it is not").
+ *
+ * ⚠️ `from` is the **full header value**, e.g. `support <support@example.com>` (see senderIdentity). Using
+ * util.domainOf() here returned `example.com>` — the `>` broke the per-domain lookup, the key silently fell back to the
+ * env one, and sending from a domain bound to another Resend account failed with "domain is not verified" while the
+ * self-check (which resolves the key from the domain name) was all green.
+ */
+export function resendKeyFor(env: Env, from?: string | null): string {
+  const domain = domainOfFrom(from);
+  if (domain) {
+    const perDomain = parseJsonObject<Record<string, string>>(env.RESEND_API_KEYS || '');
+    const key = perDomain && typeof perDomain[domain] === 'string' ? perDomain[domain].trim() : '';
+    if (key) return key;
+  }
+  return (env.RESEND_API_KEY || '').trim();
 }
 
 export interface ResendAttachment {
@@ -109,9 +147,13 @@ interface ResendRequest {
 
 /** Send mail via the Resend HTTP API (avoiding a Node dependency in the Worker). */
 export async function resendSend(env: Env, req: ResendRequest): Promise<SendResult> {
-  const apiKey = env.RESEND_API_KEY;
-  if (!apiKey) return { ok: false, error: '未配置 RESEND_API_KEY' };
   const from = req.from ?? buildFrom(env);
+  // The key follows the sending domain: domains in different Resend accounts each have their own.
+  const apiKey = resendKeyFor(env, from);
+  if (!apiKey) {
+    const d = domainOfFrom(from);
+    return { ok: false, error: d ? `未配置 RESEND_API_KEY（${d} 没有绑定 Key，环境变量里也没有）` : '未配置 RESEND_API_KEY' };
+  }
   if (!from) return { ok: false, error: '未配置 SEND_FROM_ADDRESS' };
   // Any one of to / cc / bcc non-empty is enough to send (a BCC-only email is legal)
   const hasRecipient = req.to.length > 0 || (req.cc?.length ?? 0) > 0 || (req.bcc?.length ?? 0) > 0;
@@ -144,7 +186,9 @@ export async function resendSend(env: Env, req: ResendRequest): Promise<SendResu
   const body = parseJsonObject<{ id?: string; message?: string }>(await resp.text());
   if (!resp.ok) {
     const msg = body?.message || body?.id || `HTTP ${resp.status}`;
-    return { ok: false, error: `Resend 返回错误: ${msg}` };
+    // Keep Resend's wording, but say what to do about it ("domain is not verified" is almost always a *key* problem,
+    // not a DNS problem — see src/resend-errors.ts).
+    return { ok: false, error: `Resend 返回错误: ${explainResendError(msg, { from })}` };
   }
   if (!body?.id) return { ok: false, error: 'Resend 未返回邮件 id' };
   return { ok: true, id: body.id };

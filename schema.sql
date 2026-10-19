@@ -164,6 +164,7 @@ CREATE TABLE IF NOT EXISTS domains (
     domain           TEXT PRIMARY KEY,              -- e.g. 'example.com' (lowercased)
     zone_id          TEXT,                          -- Cloudflare zone id
     resend_domain_id TEXT,                          -- Resend sending-domain id
+    resend_api_key   TEXT,                          -- this domain's own Resend key (domains may live in different Resend accounts)
     from_address     TEXT,                          -- default sender for this domain (e.g. 'noreply@example.com')
     from_name        TEXT,                          -- default display name for this domain
     worker_name      TEXT,                          -- Worker script the catch-all points at

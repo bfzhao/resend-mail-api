@@ -122,6 +122,7 @@ CREATE TABLE IF NOT EXISTS domains (
     domain           TEXT PRIMARY KEY,
     zone_id          TEXT,
     resend_domain_id TEXT,
+    resend_api_key   TEXT,
     from_address     TEXT,
     from_name        TEXT,
     worker_name      TEXT,
