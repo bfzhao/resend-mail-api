@@ -1,12 +1,19 @@
 # Template config for the "Deploy to Cloudflare button".
-# On deploy, Cloudflare **auto-creates** the D1 / R2 / Queue using the resource names below and backfills the generated ids into the repository you cloned.
-# For your own production deployment use wrangler.local.toml (see the README "self-hosting" section); do not put your real ids in this file.
+#
+# The button clones this repo into your GitHub account and then runs `npm run deploy`. That command first runs
+# scripts/predeploy.js, which makes sure the D1 / R2 names below cannot be silently *shared* with another deployment in
+# the same account. The generated D1 id is written back into the cloned repository on cloud deploy.
+#
+# For your own production deployment use wrangler.local.toml (see the README "self-hosting" section); do not put your
+# real ids in this file.
 name = "resend-mail-api"
 main = "src/index.ts"
 compatibility_date = "2024-12-01"
 
-# D1: database_id is a placeholder, auto-created and backfilled on deploy.
-# The schema for a brand-new empty database is created automatically on the Worker's first request (no need to run migrations manually).
+# D1: database_name is what the Deploy Button creates; database_id is a placeholder that gets filled in on deploy.
+# The schema for a brand-new empty database is created automatically on the Worker's first request (no migrations needed).
+# ⚠️ scripts/predeploy.js appends "-(worker name)" to `database_name` when that name already exists in the account but is
+# not ours, so a second deployment in the same account never ends up writing into the first one's database.
 [[d1_databases]]
 binding = "DB"
 database_name = "resend-webhooks-db"
@@ -23,27 +30,35 @@ binding = "ASSETS"
 run_worker_first = true
 not_found_handling = "none"
 
+# Declared explicitly so a fresh deploy does not emit the "workers_dev / preview_urls is not in your Wrangler file" warnings.
+workers_dev = true
+preview_urls = false
+
 [vars]
-# The values below are template defaults; the setup wizard overrides them with the domain / sender you enter (stored in your own D1, secrets never leave your account).
-SEND_FROM_ADDRESS = "inbox@example.com"
-SEND_FROM_NAME = "Inbox"
-# The setup wizard points the inbound catch-all rule at this Worker script name; the frontend auto-corrects it based on the actual domain visited.
-WORKER_NAME = "resend-mail-api"
-# Subrequest budget available for merged-send "per-recipient loop". The free plan caps a single request at 50, so we keep a margin of 5 and use 45.
+# ⚠️ Intentionally no SEND_FROM_ADDRESS / SEND_FROM_NAME / WORKER_NAME: the in-app wizard writes the real domain, sender
+# and script name into your own D1 on first run (the database wins over env). A placeholder address here used to leak
+# "inbox@example.com" into the database as the default sender.
+#
+# Subrequest budget for the merged-send "per-recipient loop". The free plan caps a single request at 50, so keep a margin of 5.
 MERGE_SUBREQ_BUDGET = "45"
 
-# CF inbound async parse queue (the second stage of the never-lose pipeline, see src/inbound-email.ts). Auto-created on deploy.
-[[queues.producers]]
-binding = "INBOUND_QUEUE"
-queue = "resend-mail-inbound"
+# Inbound parsing runs **inline** by default (no Queue declared). Cloudflare allows exactly ONE consumer per queue, so a
+# queue in this template made a second deployment in the same account fail with
+#   "Queue 'resend-mail-inbound' already has a consumer [code: 11004]"
+# and both workers pointed at the same queue. For the asynchronous pipeline (recommended for high inbound volume) create a
+# queue that is unique in your account and uncomment:
+#
+# [[queues.producers]]
+# binding = "INBOUND_QUEUE"
+# queue = "resend-mail-inbound"
+#
+# [[queues.consumers]]
+# queue = "resend-mail-inbound"
+# max_batch_size = 1
+# max_retries = 5
 
-[[queues.consumers]]
-queue = "resend-mail-inbound"
-# One invocation per message: a large-attachment email (base64 + parsing) is CPU/memory intensive, and batching would make several messages share the same budget, so processing one at a time is more stable.
-max_batch_size = 1
-max_retries = 5
-
-# Recovery cron: periodically re-enqueues inbound messages that were stored in R2 but not fully parsed (never-lose self-healing, see src/inbound-email.ts).
+# Recovery cron: re-parses inbound messages that are in R2 but not fully parsed (never-lose self-healing). Without a queue
+# this cron parses the pending rows itself, so mail is never stranded.
 [triggers]
 crons = ["*/15 * * * *"]
 

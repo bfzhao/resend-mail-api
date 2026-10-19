@@ -357,21 +357,30 @@ function rawMime() {
   ok(b2.acks.length === 1, '重复指针仍被 ack（已入库 → 跳过）', b2.acks.length);
   ok(after === before, '⭐ messages 行数不变（幂等）', `${before} → ${after}`);
 
-  /* ---- T5 no queue binding: still preserve the raw message (neither parse nor lose) ---- */
-  section('T5 未配队列时 email() 仍落 R2 + 登记（不丢）');
+  /* ---- T5 no queue binding: raw is preserved **and** parsed inline (the one-click deploy template has no queue) ---- */
+  section('T5 ⭐ 未配队列时 email() 落 R2 + 登记 + 内联解析入库');
   const envNoQ = { DB: db, BUCKET: bucket, INBOUND_QUEUE: undefined };
   const m2 = fakeMessage({ from: 'bob@ext.example', to: 'support@example.com', headers: { 'Message-ID': '<noq@ext.example>' }, rawBytes: new TextEncoder().encode('From: bob@ext.example\r\n\r\nhi') });
   await inbound.handleInboundEmail(envNoQ, m2.msg);
   const noq = db.queryOne('SELECT * FROM inbound_raw WHERE message_id = ?', 'noq@ext.example');
-  ok(!!noq && noq.parsed_at === null, '登记成功但未解析（ очередь缺失不影响「不丢」）', noq && noq.id);
+  ok(!!noq, '登记成功', noq && noq.id);
   ok(bucket.store.has(noq.r2_key), '原始件确实在 R2', noq && noq.r2_key);
+  ok(noq.parsed_at !== null && !!noq.message_row,
+    '⭐ 没有队列时直接内联解析入库（parsed_at + message_row 都有）', noq && `${noq.parsed_at}/${noq.message_row}`);
+  const inlineRow = noq.message_row ? db.queryOne('SELECT * FROM messages WHERE id = ?', noq.message_row) : null;
+  ok(!!inlineRow && inlineRow.direction === 'inbound', '⭐ 收件箱里确实有这封信', inlineRow && inlineRow.id);
 
   /* ---- T6 negative control: R2 raw object missing -> record error and ack (do not poison the queue) ---- */
   section('T6 负控制：R2 原始件丢失 → error + ack');
-  const b3 = makeBatch([noq.id]);
+  // 单独造一条「已登记、原始件却不在 R2」的待办行（T5 那行现在会被内联解析，不能再用）
+  const id6 = 'raw-missing-object';
+  db.prepare('INSERT INTO inbound_raw (id, r2_key, from_email, to_email, size, message_id, received_at, parsed_at, message_row, error, attempts) VALUES (?,?,?,?,?,?,?,NULL,NULL,NULL,0)')
+    .bind(id6, 'inbound-raw/does-not-exist.eml', 'gone@ext.example', 'inbox@example.com', 3, 'gone@ext.example', 1700000002)
+    .run();
+  const b3 = makeBatch([id6]);
   await bucket.delete(noq.r2_key);
   await inbound.handleInboundQueue(b3.batch, env);
-  const noqAfter = db.queryOne('SELECT * FROM inbound_raw WHERE id = ?', noq.id);
+  const noqAfter = db.queryOne('SELECT * FROM inbound_raw WHERE id = ?', id6);
   ok(b3.acks.length === 1 && b3.retries.length === 0, '缺原始件 → ack（不无限重试）', `${b3.acks.length}/${b3.retries.length}`);
   ok(noqAfter && /missing/.test(noqAfter.error || ''), 'error 记录原因', noqAfter && noqAfter.error);
 
@@ -424,13 +433,30 @@ function rawMime() {
   /* ---- T10 ⭐ recovery cron: re-enqueue emails "already in R2 but not fully parsed" (never-lose self-healing loop) ---- */
   section('T10 ⭐ replayPendingInbound 重放待办');
   const q10 = makeQueue();
-  const m10 = fakeMessage({ from: 'r@ext.example', to: 's@example.com', headers: { 'Message-ID': '<replay@ext.example>' }, rawBytes: new TextEncoder().encode('From: r@ext.example\r\n\r\nhi') });
-  await inbound.handleInboundEmail({ DB: db, BUCKET: bucket, INBOUND_QUEUE: undefined }, m10.msg); // no queue -> pending
-  const pending = db.queryOne('SELECT * FROM inbound_raw WHERE message_id = ?', 'replay@ext.example');
+  // 造一条「原始件在 R2、但还没解析」的待办行（没有队列时 email() 会内联解析，所以这里直接落库模拟遗留待办）
+  const id10 = 'raw-replay-pending';
+  const pendingKey = `inbound-raw/${id10}.eml`;
+  await bucket.put(pendingKey, new TextEncoder().encode('From: r@ext.example\r\nMessage-ID: <replay@ext.example>\r\n\r\nhi'));
+  db.prepare('INSERT INTO inbound_raw (id, r2_key, from_email, to_email, size, message_id, received_at, parsed_at, message_row, error, attempts) VALUES (?,?,?,?,?,?,?,NULL,NULL,NULL,0)')
+    .bind(id10, pendingKey, 'r@ext.example', 's@example.com', 3, 'replay@ext.example', 1700000000)
+    .run();
+  const pending = db.queryOne('SELECT * FROM inbound_raw WHERE id = ?', id10);
   ok(pending && pending.parsed_at === null, '前置：入队缺失时该行处于待办（parsed_at NULL）', pending && pending.id);
   const n10 = await inbound.replayPendingInbound({ DB: db, BUCKET: bucket, INBOUND_QUEUE: q10 });
   ok(n10 >= 1 && q10.sent.some((m) => m.rawId === pending.id), '⭐ cron 重新入队了待办行', `${n10}/${q10.sent.map((m) => m.rawId).join(',')}`);
-  ok((await inbound.replayPendingInbound({ DB: db, BUCKET: bucket, INBOUND_QUEUE: undefined })) === 0, '未配队列时 replay 安全返回 0（不崩）');
+
+  /* no queue: the cron parses the pending row itself instead of enqueuing (returns the number stored) */
+  const id10b = 'raw-inline-replay';
+  const key10b = `inbound-raw/${id10b}.eml`;
+  await bucket.put(key10b, new TextEncoder().encode('From: inline@ext.example\r\nMessage-ID: <inline-replay@ext.example>\r\n\r\ninline body'));
+  db.prepare('INSERT INTO inbound_raw (id, r2_key, from_email, to_email, size, message_id, received_at, parsed_at, message_row, error, attempts) VALUES (?,?,?,?,?,?,?,NULL,NULL,NULL,0)')
+    .bind(id10b, key10b, 'inline@ext.example', 'inbox@example.com', 5, 'inline-replay@ext.example', 1700000001)
+    .run();
+  const n10b = await inbound.replayPendingInbound({ DB: db, BUCKET: bucket, INBOUND_QUEUE: undefined });
+  const row10b = db.queryOne('SELECT * FROM inbound_raw WHERE id = ?', id10b);
+  ok(n10b >= 1, '⭐ 未配队列时 replay 自己解析（返回入库条数）', n10b);
+  ok(row10b && row10b.parsed_at !== null && !!row10b.message_row, '⭐ 该行被内联解析入库，不再滞留待办',
+    row10b && `${row10b.parsed_at}/${row10b.message_row}`);
 
   /* ---- T11 ⭐ store transient failure exceeds threshold -> still kept as pending, awaiting cron replay (no permanent deadlock) ---- */
   section('T11 ⭐ save 瞬时失败超阈值仍保留待办');

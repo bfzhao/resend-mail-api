@@ -13,6 +13,7 @@ import { nowSec, parseReferences, rootThreadId, stripAngle, stripHtml, uuid } fr
  *
  *   1. `handleInboundEmail()` (the `email()` handler)
  *      — read headers + **stream** `message.raw` into R2 + register a row in `inbound_raw` + enqueue (sending only an id pointer).
+ *        ⚠️ The queue binding is **optional**: without it the message is parsed inline right here (same routine), and the
  *      The cost of this stage is independent of message size (it is not fully read into memory), so the Free tier's 10ms CPU can handle it.
  *   2. `handleInboundQueue()` (the `queue()` consumer)
  *      — fetch the raw message from R2 → parse with postal-mime → **reuse the existing `saveInbound()`** to write messages/attachments
@@ -257,7 +258,16 @@ export async function handleInboundEmail(env: Env, message: ForwardableEmailMess
     return;
   }
 
-  if (!env.INBOUND_QUEUE) return; // No queue configured: raw + index are still there and can be replayed by the recovery cron, so it is not lost
+  if (!env.INBOUND_QUEUE) {
+    // No queue configured (the one-click deploy template leaves it out): parse inline instead. Raw message + index row are
+    // already durable, so a failure here is not a loss — the */15 cron parses whatever is still pending.
+    try {
+      await storeRawMessage(env, rawId);
+    } catch (err) {
+      console.error('inbound: inline parse failed:', rawId, err);
+    }
+    return;
+  }
   try {
     await withRetry(() => env.INBOUND_QUEUE!.send({ rawId }));
   } catch (err) {
@@ -293,6 +303,94 @@ async function markRawErrorQuiet(env: Env, rawId: string, error: string): Promis
  * ⚠️ Queue is **at-least-once**: rely on `inbound_raw.message_row` (non-empty = already stored) and
  * `findInboundByResendId` for double idempotency, so the same message consumed twice is not stored twice.
  */
+/** Outcome of turning one registered raw message into an inbox row. */
+export type RawStoreResult = 'stored' | 'skipped' | 'permanent' | 'transient';
+
+/**
+ * Parse + store **one** registered raw message (idempotent).
+ *
+ * Shared by the `queue()` consumer and the no-queue inline path, so both behave identically:
+ *   · `skipped`   — nothing to do (unknown id, or the message row already exists from an at-least-once delivery)
+ *   · `permanent` — can never succeed (raw object missing, unparsable, D1 row over the 2 MB limit, constraint conflict):
+ *                     the reason is recorded and `parsed_at` is set so the recovery cron stops replaying it
+ *   · `transient` — a momentary D1/R2 failure; `parsed_at` stays NULL so the cron retries later (never lose mail)
+ *   · `stored`    — the message is in the inbox
+ */
+export async function storeRawMessage(env: Env, rawId: string): Promise<RawStoreResult> {
+  const row = await env.DB.prepare('SELECT * FROM inbound_raw WHERE id = ?')
+    .bind(rawId)
+    .first<InboundRawRow>();
+  if (!row) return 'skipped';
+  if (row.message_row) return 'skipped'; // Already stored (duplicate consumption from at-least-once delivery)
+
+  const obj = await env.BUCKET.get(row.r2_key);
+  if (!obj) {
+    await markRawError(env, rawId, 'raw object missing in R2');
+    return 'permanent';
+  }
+
+  let input: InboundInput;
+  try {
+    const bytes = new Uint8Array(await obj.arrayBuffer());
+    input = await buildInboundInput(env, bytes, {
+      from: row.from_email || '',
+      to: row.to_email || '',
+      rawId,
+    });
+  } catch (err) {
+    // A parse failure is **permanent** (retrying the same bytes yields the same result): record the reason; the raw message stays in R2.
+    await markRawError(env, rawId, `parse failed: ${err instanceof Error ? err.message : String(err)}`);
+    return 'permanent';
+  }
+
+  // Before storing, check "does the row size exceed the D1 hard limit (2MB)". On a hit it **permanently** cannot be written:
+  // mark terminal (error + parsed_at) so the cron does not replay it every 15 minutes forever.
+  const rowBytes =
+    utf8Bytes(input.html) + utf8Bytes(input.text) + utf8Bytes(input.references) + utf8Bytes(input.subject);
+  if (rowBytes > MAX_MESSAGE_ROW_BYTES) {
+    await markRawError(env, rawId, `message too large for D1 row (~${Math.round(rowBytes / 1024)}KB > 2MB limit); raw kept in R2`);
+    return 'permanent';
+  }
+
+  try {
+    const existing = await findInboundByResendId(env, input.resendId);
+    if (existing) {
+      await markRawParsed(env, rawId, existing);
+      return 'stored';
+    }
+    await saveInbound(env, input, rawId);
+    await markRawParsed(env, rawId, input.rowId);
+    return 'stored';
+  } catch (err) {
+    const detail = (err instanceof Error ? err.message : String(err)).slice(0, 400);
+    // Permanent failure (over limit / constraint conflict): retrying the same data is useless → mark terminal, stop retrying.
+    if (isPermanentSaveError(err)) {
+      await markRawError(env, rawId, `permanent save failure: ${detail}`);
+      return 'permanent';
+    }
+    // Transient (momentary D1/R2 failure): retry; if it still fails after retrying, **keep it pending** (do not clear parsed_at)
+    // for the recovery cron to come back to later.
+    // ⚠️ Never just mark it error+parsed_at — a message that happens to hit a brief failure would then be stuck forever.
+    const attempts = (row.attempts || 0) + 1;
+    console.error(`inbound: save failed (attempt ${attempts}):`, rawId, err);
+    if (attempts >= MAX_RAW_ATTEMPTS) {
+      await env.DB.prepare('UPDATE inbound_raw SET attempts = 0, error = ? WHERE id = ?')
+        .bind(`save kept failing (×${attempts}): ${detail}`, rawId)
+        .run();
+      return 'permanent'; // the cron still replays it as a fallback, so a poisonous message does not block the batch
+    }
+    await env.DB.prepare('UPDATE inbound_raw SET attempts = ? WHERE id = ?').bind(attempts, rawId).run();
+    return 'transient';
+  }
+}
+
+/**
+ * The body of the `queue()` consumer: parse and store one by one.
+ *
+ * ⚠️ `ack()` / `retry()` per message — Queue retries batches all-or-nothing by default, and one poisonous message stalls the whole batch.
+ * ⚠️ Queue is **at-least-once**: `storeRawMessage` relies on `inbound_raw.message_row` and `findInboundByResendId` for
+ * double idempotency, so the same message consumed twice is not stored twice.
+ */
 export async function handleInboundQueue(batch: MessageBatch<InboundQueueMessage>, env: Env): Promise<void> {
   for (const msg of batch.messages) {
     const rawId = msg.body?.rawId;
@@ -300,83 +398,9 @@ export async function handleInboundQueue(batch: MessageBatch<InboundQueueMessage
       msg.ack();
       continue;
     }
-
-    const row = await env.DB.prepare('SELECT * FROM inbound_raw WHERE id = ?')
-      .bind(rawId)
-      .first<InboundRawRow>();
-    if (!row) {
-      msg.ack();
-      continue;
-    }
-    if (row.message_row) {
-      msg.ack(); // Already stored (duplicate consumption from at-least-once delivery)
-      continue;
-    }
-
-    const obj = await env.BUCKET.get(row.r2_key);
-    if (!obj) {
-      await markRawError(env, rawId, 'raw object missing in R2');
-      msg.ack();
-      continue;
-    }
-
-    let input: InboundInput;
-    try {
-      const bytes = new Uint8Array(await obj.arrayBuffer());
-      input = await buildInboundInput(env, bytes, {
-        from: row.from_email || '',
-        to: row.to_email || '',
-        rawId,
-      });
-    } catch (err) {
-      // A parse failure is **permanent** (retrying the same bytes yields the same result): record the reason and let it pass; the raw message stays in R2.
-      await markRawError(env, rawId, `parse failed: ${err instanceof Error ? err.message : String(err)}`);
-      msg.ack();
-      continue;
-    }
-
-    // Before storing, check "does the row size exceed the D1 hard limit (2MB)". On a hit it **permanently** cannot be written:
-    // mark terminal (error + parsed_at), remove from the queue, do not retry — otherwise this message is pointlessly replayed by the cron every 15 minutes.
-    const rowBytes =
-      utf8Bytes(input.html) + utf8Bytes(input.text) + utf8Bytes(input.references) + utf8Bytes(input.subject);
-    if (rowBytes > MAX_MESSAGE_ROW_BYTES) {
-      await markRawError(env, rawId, `message too large for D1 row (~${Math.round(rowBytes / 1024)}KB > 2MB limit); raw kept in R2`);
-      msg.ack();
-      continue;
-    }
-
-    try {
-      const existing = await findInboundByResendId(env, input.resendId);
-      if (existing) {
-        await markRawParsed(env, rawId, existing);
-        msg.ack();
-        continue;
-      }
-      await saveInbound(env, input, rawId);
-      await markRawParsed(env, rawId, input.rowId);
-      msg.ack();
-    } catch (err) {
-      const detail = (err instanceof Error ? err.message : String(err)).slice(0, 400);
-      // Permanent failure (over limit / constraint conflict): retrying the same data is useless → mark terminal, remove from the queue, stop retrying.
-      if (isPermanentSaveError(err)) {
-        await markRawError(env, rawId, `permanent save failure: ${detail}`);
-        msg.ack();
-        continue;
-      }
-      // Transient (momentary D1/R2 failure): retry; if it still fails after retrying, **keep it as pending** (do not clear parsed_at) for the recovery cron to come back to later.
-      // ⚠️ Never just mark it error+parsed_at — a message that happens to hit a brief failure would then be stuck forever and never replayed by any mechanism.
-      const attempts = (row.attempts || 0) + 1;
-      console.error(`inbound: save failed (attempt ${attempts}):`, rawId, err);
-      if (attempts >= MAX_RAW_ATTEMPTS) {
-        await env.DB.prepare('UPDATE inbound_raw SET attempts = 0, error = ? WHERE id = ?')
-          .bind(`save kept failing (×${attempts}): ${detail}`, rawId)
-          .run();
-        msg.ack(); // Let this one pass; the cron replays it as a fallback, so a poisonous message does not block the whole batch
-      } else {
-        await env.DB.prepare('UPDATE inbound_raw SET attempts = ? WHERE id = ?').bind(attempts, rawId).run();
-        msg.retry();
-      }
-    }
+    const result = await storeRawMessage(env, rawId);
+    if (result === 'transient') msg.retry();
+    else msg.ack();
   }
 }
 
@@ -392,7 +416,6 @@ export async function handleInboundQueue(batch: MessageBatch<InboundQueueMessage
  * Returns the number successfully enqueued this time. CF does not store mail, so this cron is the self-healing loop for "received but not in the inbox".
  */
 export async function replayPendingInbound(env: Env, limit = 100): Promise<number> {
-  if (!env.INBOUND_QUEUE) return 0;
   const rows = await env.DB.prepare(
     'SELECT id FROM inbound_raw WHERE parsed_at IS NULL ORDER BY received_at ASC LIMIT ?'
   )
@@ -400,8 +423,19 @@ export async function replayPendingInbound(env: Env, limit = 100): Promise<numbe
     .all<{ id: string }>();
   let n = 0;
   for (const r of rows.results ?? []) {
+    const queue = env.INBOUND_QUEUE;
+    // No queue binding: parse here and now with the very same routine the consumer would run.
+    if (!queue) {
+      try {
+        const result = await storeRawMessage(env, r.id);
+        if (result === 'stored') n++;
+      } catch (err) {
+        console.error('inbound: inline replay failed:', r.id, err);
+      }
+      continue;
+    }
     try {
-      await withRetry(() => env.INBOUND_QUEUE!.send({ rawId: r.id }));
+      await withRetry(() => queue.send({ rawId: r.id }));
       n++;
     } catch (err) {
       console.error('inbound: replay enqueue failed:', r.id, err);
