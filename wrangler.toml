@@ -10,10 +10,18 @@ name = "resend-mail-api"
 main = "src/index.ts"
 compatibility_date = "2024-12-01"
 
-# D1: database_name is what the Deploy Button creates; database_id is a placeholder that gets filled in on deploy.
+# ⚠️ These must stay in the **root** table (above the first [section]): a TOML key belongs to the table header that
+# precedes it, so placing them after [assets] would make wrangler report
+#   "Unexpected fields found in assets field: workers_dev, preview_urls".
+# Declared explicitly so a fresh deploy does not emit the "workers_dev / preview_urls is not in your Wrangler file" warnings.
+workers_dev = true
+preview_urls = false
+
+# D1: `database_id` is the placeholder the Deploy Button fills in; `database_name` is only a label (the binding uses the
+# id). scripts/predeploy.js rewrites both so they follow **your project name**: "<project>-db", "<project>-bucket".
+# That is the only input the Deploy Button reliably passes on, so the resource names are derived from it rather than
+# from the (ignored) resource-name fields of its setup page. A name you type here explicitly is honoured as an override.
 # The schema for a brand-new empty database is created automatically on the Worker's first request (no migrations needed).
-# ⚠️ scripts/predeploy.js appends "-(worker name)" to `database_name` when that name already exists in the account but is
-# not ours, so a second deployment in the same account never ends up writing into the first one's database.
 [[d1_databases]]
 binding = "DB"
 database_name = "resend-webhooks-db"
@@ -29,10 +37,6 @@ directory = "./public"
 binding = "ASSETS"
 run_worker_first = true
 not_found_handling = "none"
-
-# Declared explicitly so a fresh deploy does not emit the "workers_dev / preview_urls is not in your Wrangler file" warnings.
-workers_dev = true
-preview_urls = false
 
 [vars]
 # ⚠️ Intentionally no SEND_FROM_ADDRESS / SEND_FROM_NAME / WORKER_NAME: the in-app wizard writes the real domain, sender
@@ -64,3 +68,4 @@ crons = ["*/15 * * * *"]
 
 [dev]
 port = 8787
+

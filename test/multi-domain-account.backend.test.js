@@ -252,9 +252,9 @@ const RESEND_KEY = 're_totally_secret_key';
   ok(acc.domain === 'old.com', 'domain（主域）= old.com', acc.domain);
   ok(Array.isArray(acc.senders) && acc.senders[0] === 'support@old.com',
     '⭐ senders[0] 是配置的默认发件人（没有历史邮箱也有发件人）', JSON.stringify(acc.senders));
-  ok(cfg('resend_api_key') === 're_env_key', '⭐ 环境变量里的 Key 已自动导入数据库（之后可删掉该环境变量）', cfg('resend_api_key'));
-  ok(cfg('from_address') === 'support@old.com', '环境变量里的默认发件人已导入数据库', cfg('from_address'));
-  ok(cfg('domain') === 'old.com', '环境变量里的主域已导入数据库', cfg('domain'));
+  ok(cfg('resend_api_key') === null, '⭐ app_config 里不再有全局 Key（Key 只跟随域名）', cfg('resend_api_key'));
+  ok(cfg('from_address') === null, 'app_config 里不再有全局发件人', cfg('from_address'));
+  ok(cfg('domain') === null, 'app_config 里不再有全局主域', cfg('domain'));
   // The domain itself is adopted into the domains table too, otherwise it would vanish from the switcher / sender set
   // once the database becomes authoritative for the key and the default sender.
   const adoptedRow = domainsTable().find((d) => d.domain === 'old.com');
@@ -274,8 +274,8 @@ const RESEND_KEY = 're_totally_secret_key';
   ok(acc.domains.includes('old.com') && acc.domains.includes('new.com'),
     '⭐ domains 同时包含 old.com 与 new.com（旧域没消失）', JSON.stringify(acc.domains));
   ok(acc.domains[0] === 'old.com', '旧域仍排在第一位（主域未被新域顶替）', JSON.stringify(acc.domains));
-  ok(cfg('domain') === 'old.com', '⭐ 未把 app_config.domain 改写成 new.com（已导入的主域不被劫持）', cfg('domain'));
-  ok(cfg('from_address') === 'support@old.com', '⭐ 未改写 app_config.from_address（默认发件人仍是 support@old.com）', cfg('from_address'));
+  ok(acc.domain === 'old.com', '⭐ 主域仍由数据推导（最早配置的 old.com），不会被新域顶替', acc.domain);
+  ok(acc.senders[0] === 'support@old.com', '⭐ 默认发件人仍是 support@old.com（来自 old.com 的 domains 行）', JSON.stringify(acc.senders));
 
   const rows = domainsTable();
   ok(rows.length === 2 && rows.map((r) => r.domain).join(',') === 'old.com,new.com',
@@ -284,7 +284,9 @@ const RESEND_KEY = 're_totally_secret_key';
   ok(newRow && newRow.from_address === 'noreply@new.com', 'new.com 的默认发件地址落库', newRow && newRow.from_address);
   ok(newRow && newRow.resend_api_key === RESEND_KEY,
     '⭐ 新增域名的 Key 存为该域的**专属** Key（另一个 Resend 账号也能共存）', newRow && newRow.resend_api_key);
-  ok(cfg('resend_api_key') === 're_env_key', '⭐ 全局 Key 没有被第二个域的 Key 覆盖（旧域继续用它自己账号的 Key）', cfg('resend_api_key'));
+  const keysByDomain = Object.fromEntries(rows.map((x) => [x.domain, x.resend_api_key]));
+  ok(keysByDomain['old.com'] === 're_env_key' && keysByDomain['new.com'] === RESEND_KEY,
+    '⭐ 两个域各用自己账号的 Key（互不覆盖）', JSON.stringify(keysByDomain));
   ok((r.json.steps || []).some((s) => s.name === '发信 Key' && /专属发信 Key/.test(s.detail || '')),
     '配置结果说明保存的是该域专属 Key', JSON.stringify((r.json.steps || []).filter((s) => s.name === '发信 Key')));
 
@@ -314,22 +316,36 @@ const RESEND_KEY = 're_totally_secret_key';
   ok(send.sendingDomains({ SEND_FROM_ADDRESS: 'x@legacy.com' }).join(',') === 'legacy.com',
     '负控制：只有默认地址时仍取该地址的域', JSON.stringify(send.sendingDomains({ SEND_FROM_ADDRESS: 'x@legacy.com' })));
 
-  section('T5 已有 app_config 主域（老向导库）再加域：主域保持不变');
+  section('T5 老的 app_config 主域行已无意义：主域完全由 domains 表推导');
+  // Simulate an old database that still carries the single-domain keys, with *wrong* values on purpose: if anything
+  // still read them, the primary domain / default sender would now change.
   db.run(
-    "INSERT INTO app_config (key, value, updated_at) VALUES ('domain', 'old.com', 1) ON CONFLICT(key) DO UPDATE SET value='old.com'"
+    "INSERT INTO app_config (key, value, updated_at) VALUES ('domain', 'bogus.com', 1) ON CONFLICT(key) DO UPDATE SET value='bogus.com'"
   );
   db.run(
-    "INSERT INTO app_config (key, value, updated_at) VALUES ('from_address', 'support@old.com', 1) ON CONFLICT(key) DO UPDATE SET value='support@old.com'"
+    "INSERT INTO app_config (key, value, updated_at) VALUES ('from_address', 'bogus@bogus.com', 1) ON CONFLICT(key) DO UPDATE SET value='bogus@bogus.com'"
   );
+  acc = await account(cookie);
+  ok(acc.domain === 'old.com', '⭐ 主域仍是 old.com（来自 domains 表最早的那行，不是 app_config.domain）', acc.domain);
+  ok(acc.from_address === 'support@old.com', '⭐ 默认发件人仍是 support@old.com（来自 old.com 那行）', acc.from_address);
+  ok(!acc.domains.includes('bogus.com'), '⭐ 失效的 app_config.domain 不会变成合法发送域', JSON.stringify(acc.domains));
+
   r = await call('POST', '/api/setup/domain', {
     domain: 'third.com', cf_token: CF_TOKEN, resend_key: RESEND_KEY, from_address: 'hi@third.com',
   }, cookie);
   ok(r.status === 200 && r.json && r.json.ok === true, '向导配置 third.com 成功', r.json && JSON.stringify(r.json.steps));
-  ok(cfg('domain') === 'old.com', '⭐ app_config.domain 仍是 old.com', cfg('domain'));
-  ok(cfg('from_address') === 'support@old.com', '⭐ app_config.from_address 仍是 support@old.com', cfg('from_address'));
+  ok(cfg('domain') === null, '⭐ 脏值已被自动清除（下一次请求就退役单域键）', cfg('domain'));
   acc = await account(cookie);
-  ok(acc.domains.join(',') === 'old.com,new.com,third.com', '三个域都在域名清单里', JSON.stringify(acc.domains));
+  ok(acc.domains.join(',') === 'old.com,new.com,third.com', '三个域都在域名清单里（主域 still first）', JSON.stringify(acc.domains));
+  ok(acc.domain === 'old.com', '⭐ 加了第三个域，主域仍是 old.com', acc.domain);
   ok(acc.senders.includes('hi@third.com'), 'third.com 的默认发件地址出现在 senders 里', JSON.stringify(acc.senders));
+
+  // The stale keys are retired automatically on the next request — no manual migration needed.
+  const retired = db.query("SELECT key FROM app_config WHERE key IN ('domain','from_address','zone_id','from_name','worker_name','resend_domain_id')");
+  ok(retired.length === 0, '⭐ 遗留的单域键被自动清除（不用手工迁移）', JSON.stringify(retired));
+  acc = await account(cookie);
+  ok(acc.domain === 'old.com' && acc.from_address === 'support@old.com',
+    '⭐ 清除后行为完全不变（domains 表才是唯一来源）', `${acc.domain}/${acc.from_address}`);
 
   section('T6 自检：Key 按域绑定（没有全局 Key 一级）与该 Key 在 Resend 侧能看到哪些域');
   let chk = (await call('GET', '/api/setup/check', undefined, cookie)).json;
@@ -352,7 +368,8 @@ const RESEND_KEY = 're_totally_secret_key';
   // 格式不合法 -> 400，且不写库
   r = await settings({ domain: 'new.com', resend_key: 'not-a-key' });
   ok(r.status === 400, '格式不对的 Key -> 400', r.json && r.json.error);
-  ok(cfg('resend_api_key') === 're_env_key', '校验失败不落库（全局 Key 未变）', cfg('resend_api_key'));
+  ok((domainsTable().find((d) => d.domain === 'new.com') || {}).resend_api_key === RESEND_KEY,
+    '校验失败不落库（该域原有的 Key 未变）', (domainsTable().find((d) => d.domain === 'new.com') || {}).resend_api_key);
   // Resend 说这把 Key 无效 -> 400，且不覆盖该域原有的 Key
   r = await settings({ domain: 'new.com', resend_key: 're_broken_key123456' });
   ok(r.status === 400 && /校验失败/.test((r.json && r.json.error) || ''), 'Resend 拒绝的 Key -> 400 且不覆盖', r.json && r.json.error);
@@ -366,7 +383,8 @@ const RESEND_KEY = 're_totally_secret_key';
   ok(r.json.domain === 'new.com', '响应标明改的是哪个域', r.json.domain);
   ok((domainsTable().find((d) => d.domain === 'new.com') || {}).resend_api_key === 're_fixed_key',
     '⭐ Key 写入该域的 domains 行', (domainsTable().find((d) => d.domain === 'new.com') || {}).resend_api_key);
-  ok(cfg('resend_api_key') === 're_env_key', '⭐ 全局 Key 不受影响（另一个域不被牵连）', cfg('resend_api_key'));
+  ok((domainsTable().find((d) => d.domain === 'old.com') || {}).resend_api_key === 're_env_key',
+    '⭐ 另一个域的 Key 不受影响', (domainsTable().find((d) => d.domain === 'old.com') || {}).resend_api_key);
   const seen = (r.json.key_check && r.json.key_check.domains) || [];
   ok(seen.length === 3, '保存时回显这把 Key 能看到 3 个域', JSON.stringify(seen));
   // 与域名不匹配的 Key 会给出警告（仍允许保存：可能是仅发送权限 / 域限制）
@@ -397,19 +415,23 @@ const RESEND_KEY = 're_totally_secret_key';
     '⭐ 默认发件人写进该域的行', (domainsTable().find((d) => d.domain === 'new.com') || {}).from_address);
   acc = await account(cookie);
   ok(acc.senders.includes('hello@new.com'), '新发件人立即出现在 /api/account.senders', JSON.stringify(acc.senders.slice(0, 4)));
-  // 全局默认发件人仍可单独设置
+  // 不带 domain 时改的是「主域（最早配置的那个域）」的默认发件人 —— 没有全局默认发件人了
   r = await settings({ from_address: 'global@old.com', from_name: 'Hi' });
-  ok(r.status === 200 && cfg('from_address') === 'global@old.com' && cfg('from_name') === 'Hi',
-    '⭐ 不带 domain 时改的是全局默认发件人', `${cfg('from_address')}/${cfg('from_name')}`);
+  ok(r.status === 200, '不带 domain 的保存成功', r.status);
+  ok(r.json.domain === 'old.com', '⭐ 落到主域 old.com 的 domains 行', r.json.domain);
+  const oldRowNow = domainsTable().find((d) => d.domain === 'old.com') || {};
+  ok(oldRowNow.from_address === 'global@old.com', '⭐ 主域 from_address 被更新', oldRowNow.from_address);
+  const cfgKeysNow = db.query('SELECT key FROM app_config').map((x) => x.key);
+  ok(!cfgKeysNow.includes('from_address') && !cfgKeysNow.includes('from_name'), 'app_config 里不写全局发件人', JSON.stringify(cfgKeysNow));
   acc = await account(cookie);
-  ok(acc.from_address === 'global@old.com', '全局发件人立即生效', acc.from_address);
+  ok(acc.from_address === 'global@old.com', '主域发件人立即生效', acc.from_address);
 
-  section('T8 已有域名缺专属 Key：自动从环境变量回填（线上迁移路径）');
+  section('T8 已有域名缺专属 Key：不再自动回填，发信时用 env 兜底（bootstrap 语义）');
   db.run("UPDATE domains SET resend_api_key = NULL WHERE domain = 'old.com'");
   ok((domainsTable().find((d) => d.domain === 'old.com') || {}).resend_api_key === null, '前置：old.com 暂时没有专属 Key');
-  await account(cookie); // any /api request runs withRuntimeConfig → backfill
-  ok((domainsTable().find((d) => d.domain === 'old.com') || {}).resend_api_key === 're_env_key',
-    '⭐ 回填成环境变量里的 Key（该域本来就用它），不需要人工操作',
+  await account(cookie); // any /api request runs withRuntimeConfig
+  ok((domainsTable().find((d) => d.domain === 'old.com') || {}).resend_api_key === null,
+    '⭐ 环境变量不再被悄悄写进域名（只有 bootstrap 首次吸收时才写）',
     (domainsTable().find((d) => d.domain === 'old.com') || {}).resend_api_key);
 
   section('T9 真正发信：Key 跟着发件域走（含 "名字 <地址>" 形式）');
@@ -425,10 +447,11 @@ const RESEND_KEY = 're_totally_secret_key';
     '⭐ new.com 发信用的是它自己绑定的 Key（不是环境变量那把）', `${sentAuth[0]} vs ${newKey}`);
 
   sentAuth.length = 0;
-  const oldKey = (domainsTable().find((d) => d.domain === 'old.com') || {}).resend_api_key;
+  const oldRowKey = (domainsTable().find((d) => d.domain === 'old.com') || {}).resend_api_key;
   r = await call('POST', '/api/messages', { to: ['x@y.com'], subject: 't2', body: 'hi', mailbox: 'billing@old.com' }, cookie);
   ok(r.status === 200, '用 old.com 上的地址发信成功', r.json && JSON.stringify(r.json));
-  ok(sentAuth[0] === `Bearer ${oldKey}`, '⭐ old.com 发信用它绑定的 Key', `${sentAuth[0]} vs ${oldKey}`);
+  ok(!oldRowKey && sentAuth[0] === 'Bearer re_env_key',
+    '⭐ 没有专属 Key 时发信回退到环境变量那把（而不是被静默写库）', `${sentAuth[0]} vs row=${oldRowKey}`);
 
   // 直接对 resendKeyFor 做一次断言：带显示名的 from 也要解析出正确域名
   const sendMod = require(path.join(entry, 'send.js'));
@@ -470,6 +493,15 @@ const RESEND_KEY = 're_totally_secret_key';
   ok(re.explainResendError('invalid recipient') === 'invalid recipient', '未知错误原样返回（不臆造提示）');
   ok(re.maskSecret('re_1234567890abcdef') === 're_123…cdef', '掩码不泄露完整 Key', re.maskSecret('re_1234567890abcdef'));
   ok(re.domainOfFrom('Name <a@b.com>') === 'b.com', 'from 字段里取域（支持 Name <addr> 形式）');
+
+  section('T12 环境变量只在 bootstrap 生效：删掉的域不会被 env 复活，也不会被 env Key 回填');
+  db.run("DELETE FROM domains WHERE domain = 'third.com'");
+  acc = await account(cookie); // any /api request runs withRuntimeConfig
+  ok(!acc.domains.includes('third.com'), '⭐ 删掉的 third.com 没有因为 env 重新出现', JSON.stringify(acc.domains));
+  ok(acc.domains.join(',') === 'old.com,new.com', '剩下的两个域不变', JSON.stringify(acc.domains));
+  const keysNow = Object.fromEntries(domainsTable().map((d) => [d.domain, d.resend_api_key]));
+  ok(!keysNow['old.com'], '⭐ 没有专属 Key 的域仍保持为空（env Key 不会被悄悄写入）', JSON.stringify(keysNow));
+  ok(keysNow['new.com'] === 're_fixed_key', '有专属 Key 的域不受影响', keysNow['new.com']);
 
   console.log(`\n===== 结果: ${pass} passed, ${failures.length} failed =====`);
   if (failures.length) console.log(`失败项：\n- ${failures.join('\n- ')}`);

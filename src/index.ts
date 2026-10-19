@@ -132,8 +132,10 @@ async function setupStatus(request: Request, env: Env): Promise<Response> {
     domain: rt.SENDING_DOMAIN || '',
     from_address: rt.SEND_FROM_ADDRESS || '',
     from_name: rt.SEND_FROM_NAME || '',
-    // Whether the wizard completed once (a domain was resolved and a key is available)
-    complete: cfg.setup_complete === '1',
+    // Whether the wizard completed: `setup_complete` is a historical flag, the domains table is the real signal (so a
+    // database whose app_config was cleaned up does not drop the user back into the wizard).
+    complete:
+      cfg.setup_complete === '1' || (env.DB ? (await repo.listDomains(env).catch(() => [] as repo.DomainRow[])).length > 0 : false),
     sending_configured: Boolean(rt.RESEND_API_KEY),
   });
 }
@@ -167,8 +169,17 @@ async function login(request: Request, env: Env): Promise<Response> {
   if (!user || !(await verifyPassword(password, user.password_hash))) {
     return json({ error: '用户名或密码错误' }, 401);
   }
-  const secret = await repo.getConfig(env, 'session_secret');
-  if (!secret) return json({ error: '尚未完成初始化' }, 409);
+  // The signing key normally comes into being together with the first admin (see setupAdmin). When it is missing — the
+  // row was cleaned up, lost, or the database was restored without app_config — mint a new one here instead of refusing
+  // to log in. The password check above has already proved who this is, so this cannot be an auth bypass, and the old
+  // state is unrecoverable anyway: every existing cookie was signed with the vanished key and is invalid either way.
+  // Refusing (409) used to be a one-way trap, because setup/admin rejects creating an admin that already exists.
+  let secret = await repo.getConfig(env, 'session_secret');
+  if (!secret) {
+    secret = randomHex(32);
+    await repo.setConfig(env, 'session_secret', secret);
+    console.warn('[auth] session_secret was missing; minted a new one on login (older sessions are now invalid)');
+  }
   const token = await signSession(secret, user.id);
   return withCookie(json({ ok: true, username: user.username }), sessionCookie(token, SESSION_TTL_SEC));
 }
@@ -282,10 +293,19 @@ async function routeApi(request: Request, env: Env, path: string, url: URL): Pro
       | { domain?: unknown; resend_key?: unknown; from_address?: unknown; from_name?: unknown }
       | null;
     if (!body) return json({ error: '参数错误' }, 400);
-    const targetDomain = typeof body.domain === 'string' ? body.domain.trim().toLowerCase() : '';
+    let targetDomain = typeof body.domain === 'string' ? body.domain.trim().toLowerCase() : '';
     const updates: Array<[string, string]> = [];
     const domainPatch: { apiKey?: string; fromAddress?: string; fromName?: string } = {};
     let keyCheck: { domains?: Array<{ name: string; status: string }>; warning?: string } | null = null;
+    // A sender without an explicit domain is the **primary** domain's default sender. There is no global one any more:
+    // a from-address that belongs to no domain cannot be sent with, and keeping it in app_config is exactly how a stale
+    // "global sender" used to shadow the per-domain one.
+    const primaryDomainFor = async (): Promise<string> => {
+      if (targetDomain) return targetDomain;
+      const rows = await repo.listDomains(env).catch(() => [] as repo.DomainRow[]);
+      const first = rows.find((r) => r.enabled !== 0 && String(r.domain || '').trim());
+      return first ? String(first.domain).trim().toLowerCase() : '';
+    };
 
     if (typeof body.resend_key === 'string' && body.resend_key.trim()) {
       const key = body.resend_key.trim();
@@ -314,13 +334,15 @@ async function routeApi(request: Request, env: Env, path: string, url: URL): Pro
     if (typeof body.from_address === 'string' && body.from_address.trim()) {
       const addr = body.from_address.trim().toLowerCase();
       if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(addr)) return json({ error: '发件地址格式不正确' }, 400);
-      if (targetDomain) domainPatch.fromAddress = addr;
-      else updates.push(['from_address', addr]);
+      targetDomain = await primaryDomainFor();
+      if (!targetDomain) return json({ error: '还没有域名：请先在向导里添加一个域名' }, 400);
+      domainPatch.fromAddress = addr;
     }
     // An empty display name is a legitimate value ("send without a name"), so it is always written when provided.
     if (typeof body.from_name === 'string') {
-      if (targetDomain) domainPatch.fromName = body.from_name.trim();
-      else updates.push(['from_name', body.from_name.trim()]);
+      targetDomain = await primaryDomainFor();
+      if (!targetDomain) return json({ error: '还没有域名：请先在向导里添加一个域名' }, 400);
+      domainPatch.fromName = body.from_name.trim();
     }
     const hasDomainPatch = Object.keys(domainPatch).length > 0;
     if (!updates.length && !hasDomainPatch) return json({ error: '没有需要保存的内容' }, 400);
@@ -332,10 +354,9 @@ async function routeApi(request: Request, env: Env, path: string, url: URL): Pro
       }
       const ok = await repo.updateDomainSettings(env, targetDomain, domainPatch);
       if (!ok) {
-        // Database predates per-domain keys (migration 012 missing): keep the key usable by storing it globally.
-        if (domainPatch.apiKey) await repo.setConfig(env, 'resend_api_key', domainPatch.apiKey);
-        if (domainPatch.fromAddress) await repo.setConfig(env, 'from_address', domainPatch.fromAddress);
-        if (domainPatch.fromName !== undefined) await repo.setConfig(env, 'from_name', domainPatch.fromName);
+        // The database predates migration 012 (no domains.resend_api_key column): nothing to write, so say so instead of
+        // silently storing a global key that would then shadow the per-domain model.
+        return json({ error: '数据库版本过旧（缺少 domains.resend_api_key），请先执行 migrations/012_domain_api_keys.sql' }, 400);
       }
     }
     for (const [k, v] of updates) await repo.setConfig(env, k, v);

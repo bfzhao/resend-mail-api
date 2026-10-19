@@ -72,10 +72,29 @@ function workerName(toml) {
   return readValue(toml, '', 'name') || (/^name\s*=\s*"([^"]+)"/m.exec(toml) || [])[1] || '';
 }
 
-function suffixed(name, worker) {
-  const suffix = String(worker || '').trim();
-  if (!suffix) return `${name}-${Math.random().toString(36).slice(2, 8)}`;
-  return name.endsWith(`-${suffix}`) ? name : `${name}-${suffix}`;
+/** The names the template ships with. They are placeholders: the defaults below are derived from the project name. */
+const TEMPLATE_DB = 'resend-webhooks-db';
+const TEMPLATE_BUCKET = 'resend-mail-attachments';
+
+/** R2 / D1 resource names: lowercase, letters/digits/hyphens, <= 60 chars (leave room for "-attachments"). */
+function sanitizeName(raw, fallback) {
+  const base = String(raw || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '')
+    .slice(0, 50);
+  return base && !/^[0-9]+$/.test(base) ? base : fallback;
+}
+
+/**
+ * Derive this deployment's resource names from the project name — the one value the Deploy Button reliably writes into
+ * the repository. `name` is the Worker name, so two projects never fight over the same database or bucket.
+ */
+function derivedNames(rawWorker) {
+  const base = sanitizeName(rawWorker, 'resend-mail');
+  return { db: `${base}-db`, bucket: `${base}-bucket` };
 }
 
 function isFresh(createdAt) {
@@ -142,99 +161,102 @@ function makeApi(token, accountId, fetchImpl) {
 }
 
 /**
- * Decide (and if needed provision) the final D1 / R2 names + ids.
- * Returns { toml, notes: string[], conflicts: string[] } — `conflicts` non-empty means: stop the deploy.
+ * Decide (and if needed provision) the final D1 / R2 names + ids, then write them back into wrangler.toml.
+ *
+ * The rule follows the user's intent: **their input (the project name) decides the resource names.**
+ *
+ *   1. The worker already has the binding  -> keep exactly that resource (it holds the mail; a renamed binding would
+ *      silently point at an empty one).
+ *   2. Otherwise the name comes from the project name: `<project>-db` / `<project>-bucket` — unless wrangler.toml
+ *      carries an explicit name (anything other than the template default), which is honoured as a manual override.
+ *   3. That name is free -> create it, write the name + id back.
+ *      It already exists -> **stop**: it belongs to another deployment, and silently reusing it is exactly how a "test"
+ *      deployment ended up writing into the production database.
+ *
+ * Returns { toml, notes, conflicts } — a non-empty `conflicts` means the deploy must be aborted.
  */
 async function resolveResources(toml, api, opts = {}) {
   const name = opts.workerName || workerName(toml);
   const notes = [];
   const conflicts = [];
+  const derived = derivedNames(name);
 
-  const d1Name = readValue(toml, '[[d1_databases]]', 'database_name');
-  const d1Id = readValue(toml, '[[d1_databases]]', 'database_id');
-  const bucketName = readValue(toml, '[[r2_buckets]]', 'bucket_name');
+  const fileD1Name = readValue(toml, '[[d1_databases]]', 'database_name');
+  const fileD1Id = readValue(toml, '[[d1_databases]]', 'database_id');
+  const fileBucket = readValue(toml, '[[r2_buckets]]', 'bucket_name');
+
+  // An explicit edit (anything that is not the template default) is a manual override.
+  const dbName = fileD1Name && fileD1Name !== TEMPLATE_DB ? fileD1Name : null;
+  const bucketName = fileBucket && fileBucket !== TEMPLATE_BUCKET ? fileBucket : null;
 
   const own = api ? await api.ownBindings(name) : { exists: false, d1Ids: [], bucketNames: [] };
-  if (own.error) notes.push(`could not read the existing worker bindings (${own.error}); treating every match as foreign`);
+  if (own.error) notes.push(`could not read the existing worker bindings (${own.error}); assuming this is a new worker`);
+  const boundDbId = (own.d1Ids || [])[0] || null;
+  const boundBucket = (own.bucketNames || [])[0] || null;
 
   /* ---------------- D1 ---------------- */
-  if (api && d1Name) {
+  if (api) {
     const listed = await api.listD1();
     if (listed.error) {
-      notes.push(`could not list D1 databases (${listed.error}); leaving "${d1Name}" untouched`);
+      notes.push(`could not list D1 databases (${listed.error}); leaving the name in wrangler.toml untouched`);
     } else {
-      const mine = listed.list.find((d) => d.id && own.d1Ids.includes(d.id));
-      const same = listed.list.find((d) => d.name === d1Name);
-      if (same && mine && mine.id === same.id) {
-        notes.push(`D1 ${same.name} is already bound to this worker — reusing it`);
-      } else if (!same) {
-        if (!d1Id || d1Id === '<DATABASE_ID>') {
-          const created = await api.createD1(d1Name);
-          if (created.error) conflicts.push(`could not create D1 "${d1Name}": ${created.error}`);
-          else {
-            toml = setValue(toml, '[[d1_databases]]', 'database_id', created.id);
-            notes.push(`created D1 ${d1Name} (${created.id})`);
-          }
-        } else {
-          notes.push(`D1 ${d1Name} does not exist yet — the id in wrangler.toml (${d1Id}) will be used`);
-        }
-      } else if (isFresh(same.created)) {
-        notes.push(`D1 ${same.name} was created moments ago by this deploy — reusing it`);
+      const bound = boundDbId ? listed.list.find((d) => d.id === boundDbId) : null;
+      const byFileId = fileD1Id && fileD1Id !== '<DATABASE_ID>' ? listed.list.find((d) => d.id === fileD1Id) : null;
+      const target = dbName || (bound ? bound.name : derived.db);
+      const existing = listed.list.find((d) => d.name === target);
+
+      if (bound) {
+        toml = setValue(toml, '[[d1_databases]]', 'database_name', bound.name);
+        toml = setValue(toml, '[[d1_databases]]', 'database_id', bound.id);
+        notes.push(`keeping the D1 database this worker is bound to: ${bound.name}`);
+      } else if (byFileId && byFileId.name === target && isFresh(byFileId.created)) {
+        toml = setValue(toml, '[[d1_databases]]', 'database_name', byFileId.name);
+        toml = setValue(toml, '[[d1_databases]]', 'database_id', byFileId.id);
+        notes.push(`using D1 ${byFileId.name} (provisioned for this deployment)`);
+      } else if (existing) {
+        conflicts.push(
+          `D1 database "${target}" already exists and is not this worker's (it belongs to another deployment). ` +
+            `Cloudflare would bind it, which is how data gets mixed — rename your project (the resource names follow it) or delete that database.`
+        );
       } else {
-        const next = suffixed(d1Name, name);
-        const taken = listed.list.find((d) => d.name === next);
-        if (taken && !(mine && mine.id === taken.id)) {
-          conflicts.push(
-            `D1 "${d1Name}" already exists in this account (it belongs to another deployment) and the fallback name "${next}" is taken too. ` +
-              `Rename database_name in wrangler.toml to something unique and deploy again.`
-          );
-        } else if (taken) {
-          toml = setValue(toml, '[[d1_databases]]', 'database_id', taken.id);
-          notes.push(`D1 ${next} already belongs to this worker — reusing it`);
-        } else {
-          const created = await api.createD1(next);
-          if (created.error) conflicts.push(`could not create D1 "${next}": ${created.error}`);
-          else {
-            toml = setValue(toml, '[[d1_databases]]', 'database_name', next);
-            toml = setValue(toml, '[[d1_databases]]', 'database_id', created.id);
-            notes.push(`⚠️ D1 "${d1Name}" belongs to another deployment — using "${next}" (${created.id}) instead`);
-          }
+        const created = await api.createD1(target);
+        if (created.error) conflicts.push(`could not create D1 "${target}": ${created.error}`);
+        else {
+          toml = setValue(toml, '[[d1_databases]]', 'database_name', created.name || target);
+          toml = setValue(toml, '[[d1_databases]]', 'database_id', created.id);
+          notes.push(`created D1 ${created.name || target} (${created.id})`);
         }
       }
     }
   }
 
   /* ---------------- R2 ---------------- */
-  if (api && bucketName) {
+  if (api) {
     const listed = await api.listR2();
     if (listed.error) {
-      notes.push(`could not list R2 buckets (${listed.error}); leaving "${bucketName}" untouched`);
+      notes.push(`could not list R2 buckets (${listed.error}); leaving the name in wrangler.toml untouched`);
     } else {
-      const mine = listed.list.find((b) => own.bucketNames.includes(b.name));
-      const same = listed.list.find((b) => b.name === bucketName);
-      if (same && mine && mine.name === same.name) {
-        notes.push(`R2 ${same.name} is already bound to this worker — reusing it`);
-      } else if (!same) {
-        notes.push(`R2 ${bucketName} does not exist yet — leaving it to the deploy`);
-      } else if (isFresh(same.created)) {
-        notes.push(`R2 ${same.name} was created moments ago by this deploy — reusing it`);
+      const bound = boundBucket ? listed.list.find((b) => b.name === boundBucket) : null;
+      const target = bucketName || (bound ? bound.name : derived.bucket);
+      const existing = listed.list.find((b) => b.name === target);
+
+      if (bound) {
+        toml = setValue(toml, '[[r2_buckets]]', 'bucket_name', bound.name);
+        notes.push(`keeping the R2 bucket this worker is bound to: ${bound.name}`);
+      } else if (existing && isFresh(existing.created)) {
+        toml = setValue(toml, '[[r2_buckets]]', 'bucket_name', existing.name);
+        notes.push(`using R2 bucket ${existing.name} (provisioned for this deployment)`);
+      } else if (existing) {
+        conflicts.push(
+          `R2 bucket "${target}" already exists and is not this worker's. Rename your project (the resource names follow ` +
+            `it) or delete that bucket — binding it would mix two deployments' mail and attachments.`
+        );
       } else {
-        const next = suffixed(bucketName, name);
-        const taken = listed.list.find((b) => b.name === next);
-        if (taken && !(mine && mine.name === taken.name)) {
-          conflicts.push(
-            `R2 bucket "${bucketName}" already exists in this account (another deployment owns it) and the fallback name "${next}" is taken too. ` +
-              `Rename bucket_name in wrangler.toml to something unique and deploy again.`
-          );
-        } else if (taken) {
-          notes.push(`R2 ${next} already belongs to this worker — reusing it`);
-        } else {
-          const created = await api.createR2(next);
-          if (created.error) conflicts.push(`could not create R2 bucket "${next}": ${created.error}`);
-          else {
-            toml = setValue(toml, '[[r2_buckets]]', 'bucket_name', next);
-            notes.push(`⚠️ R2 "${bucketName}" belongs to another deployment — using "${next}" instead`);
-          }
+        const created = await api.createR2(target);
+        if (created.error) conflicts.push(`could not create R2 bucket "${target}": ${created.error}`);
+        else {
+          toml = setValue(toml, '[[r2_buckets]]', 'bucket_name', target);
+          notes.push(`created R2 bucket ${target}`);
         }
       }
     }
@@ -275,7 +297,7 @@ async function main() {
   return 0;
 }
 
-module.exports = { readValue, setValue, workerName, suffixed, isFresh, resolveResources, makeApi, main };
+module.exports = { readValue, setValue, workerName, sanitizeName, derivedNames, isFresh, resolveResources, makeApi, main };
 
 if (require.main === module) {
   main()

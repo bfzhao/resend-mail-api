@@ -139,6 +139,9 @@ CREATE TABLE IF NOT EXISTS app_stats (
 -- Application config (key/value written by the setup wizard). Keys such as: domain / zone_id / from_address / from_name /
 -- resend_api_key / session_secret / routing_enabled / setup_complete.
 -- Stored in the **user's own** D1 (BYO: secrets never leave the user's account). See migrations/010_setup_auth.sql.
+-- Installation state only: `session_secret` (HMAC key for session cookies) and `setup_complete`. Everything that is
+-- scoped to a domain lives in `domains` — the single-domain keys this table used to hold (domain / zone_id /
+-- resend_domain_id / from_address / from_name / worker_name / resend_api_key) are ignored and retired automatically.
 CREATE TABLE IF NOT EXISTS app_config (
     key        TEXT PRIMARY KEY,
     value      TEXT,

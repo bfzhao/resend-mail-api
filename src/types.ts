@@ -13,7 +13,10 @@ export interface Env {
   RESEND_API_KEYS?: string;
   SEND_FROM_ADDRESS?: string;
   SEND_FROM_NAME?: string;
-  /** The configured sending domain (written by the wizard into app_config). Any address on this domain may send. */
+  /**
+   * The "primary" sending domain: the oldest enabled row of the domains table (derived on every request by
+   * withRuntimeConfig — there is no stored primary). Any address on this domain may send.
+   */
   SENDING_DOMAIN?: string;
   /** Comma-separated list of **all** configured domains (multi-domain). Supersedes SENDING_DOMAIN; populated by withRuntimeConfig. */
   SENDING_DOMAINS?: string;

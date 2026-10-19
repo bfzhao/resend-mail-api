@@ -578,7 +578,7 @@ export interface DomainInput {
 export async function listDomains(env: Env): Promise<DomainRow[]> {
   try {
     const rows = (
-      await env.DB.prepare('SELECT * FROM domains ORDER BY created_at ASC, domain ASC').all<DomainRow>()
+      await env.DB.prepare('SELECT * FROM domains ORDER BY created_at ASC, rowid ASC').all<DomainRow>()
     ).results;
     return rows ?? [];
   } catch {
@@ -1503,6 +1503,14 @@ export async function setConfig(env: Env, key: string, value: string | null): Pr
   )
     .bind(key, value, nowSec())
     .run();
+}
+
+/** Drop several app_config entries in one statement (used to retire the single-domain keys the domains table replaced). */
+export async function deleteConfigKeys(env: Env, keys: string[]): Promise<void> {
+  const list = keys.filter(Boolean);
+  if (!list.length) return;
+  const placeholders = list.map(() => '?').join(', ');
+  await env.DB.prepare(`DELETE FROM app_config WHERE key IN (${placeholders})`).bind(...list).run();
 }
 
 /** Drop one app_config entry (used to retire the legacy global Resend key after it was migrated per domain). */

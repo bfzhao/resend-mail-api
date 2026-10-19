@@ -217,6 +217,28 @@ function sessionCookieOf(res) {
   const cleared = typeof r.setCookie === 'string' && r.setCookie.startsWith('mail_session=');
   ok(cleared, 'logout 下发清理 cookie（同名覆盖）', r.setCookie);
 
+  section('T5b session_secret 丢失：登录现场补一把（不再 409 锁死）');
+  const secretBefore = db.queryOne('SELECT value FROM app_config WHERE key = ?', 'session_secret');
+  db.prepare('DELETE FROM app_config WHERE key = ?').bind('session_secret').run();
+  ok(!db.queryOne('SELECT value FROM app_config WHERE key = ?', 'session_secret'), '前置：签名密钥已被删除');
+  r = await call('GET', '/api/account', undefined, loginCookie);
+  ok(r.status === 401, '旧 cookie 立刻失效（签名密钥已变）', r.status);
+
+  r = await call('POST', '/api/login', { username: 'admin', password: 'secret123' });
+  ok(r.status === 200 && r.json && r.json.ok === true, '⭐ 密钥缺失时登录仍然成功（不再返回 409）', r.status);
+  const healedCookie = r.setCookie;
+  ok(!!healedCookie, '登录重新下发 cookie', healedCookie);
+  const secretAfter = db.queryOne('SELECT value FROM app_config WHERE key = ?', 'session_secret');
+  ok(!!secretAfter && String(secretAfter.value).length >= 32, '⭐ 新的 session_secret 已落库', secretAfter && String(secretAfter.value).length);
+  ok(secretAfter && secretBefore && secretAfter.value !== secretBefore.value, '新密钥与旧的不同（不复用）');
+  r = await call('GET', '/api/account', undefined, healedCookie);
+  ok(r.status === 200, '⭐ 新 cookie 可正常访问', r.status);
+  r = await call('GET', '/api/setup/status', undefined, healedCookie);
+  ok(r.json && r.json.authenticated === true, 'status 也认得新 cookie', r.json && r.json.authenticated);
+
+  r = await call('POST', '/api/login', { username: 'admin', password: 'wrong' });
+  ok(r.status === 401 && !r.setCookie, '错误口令时不会顺手重建密钥', r.status);
+
   section('T6 env Basic Auth 模式：向导禁用，走 Basic 校验');
   const db2 = makeD1();
   const envBasic = { DB: db2, API_USERNAME: 'u', API_PASSWORD: 'p' };

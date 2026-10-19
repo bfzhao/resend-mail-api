@@ -62,8 +62,9 @@ export function senderIdentity(env: Env, mailbox: string): SenderIdentity {
 }
 
 /**
- * All domains allowed to send, in display order: the primary domain (SENDING_DOMAIN, i.e. app_config.domain),
- * the default from address's domain, then the configured set (SENDING_DOMAINS, derived from the domains table).
+ * All domains allowed to send, in display order: the primary domain (SENDING_DOMAIN — derived from the oldest enabled
+ * row of the domains table), the default from address's domain, then the configured set (SENDING_DOMAINS, also derived
+ * from the domains table). No part of this comes from app_config any more.
  *
  * ⚠️ The set must be a **union**, not "SENDING_DOMAINS else the single domain": a deployment configured only through
  * env vars (SEND_FROM_ADDRESS / SENDING_DOMAIN) has no app_config.domain, so the moment the wizard adds the first

@@ -56,6 +56,13 @@ export function normalizeDomain(raw: unknown): string | null {
  * a deployment that only ever configured env vars keeps working (see seedSendConfigFromEnv, which copies the first run
  * into D1), and after that everything is editable in the app.
  */
+/**
+ * The keys the single-domain era kept in `app_config`. Every one of them has a home in the `domains` table now
+ * (domain / zone_id / resend_domain_id / from_address / from_name / worker_name), so they are deleted on sight:
+ * `resend_api_key` is handled separately by seedLegacyGlobalKey, because it is migrated into keyless domains first.
+ */
+const LEGACY_SINGLE_DOMAIN_KEYS = ['domain', 'zone_id', 'resend_domain_id', 'from_address', 'from_name', 'worker_name'];
+
 export async function withRuntimeConfig(env: Env): Promise<Env> {
   const merged: Env = { ...env };
   let cfg: Record<string, string> = {};
@@ -65,31 +72,44 @@ export async function withRuntimeConfig(env: Env): Promise<Env> {
     return merged; // older database without app_config: pure env config
   }
 
-  // First run of a purely env-configured deployment: copy those values into D1 once, then treat D1 as authoritative.
-  await seedSendConfigFromEnv(env, cfg);
-
-  // NOTE: `app_config.resend_api_key` is **legacy** — the key is now bound to the domain (`domains.resend_api_key`) or
-  // comes from env. A global DB key cannot be right for two domains in two Resend accounts, so it is only migrated into
-  // the domains that have none (see seedLegacyGlobalKey) and then never consulted again.
-  const dbFrom = (cfg.from_address || '').trim();
-  if (dbFrom) merged.SEND_FROM_ADDRESS = dbFrom;
-  if (Object.prototype.hasOwnProperty.call(cfg, 'from_name')) merged.SEND_FROM_NAME = cfg.from_name;
-  const dbDomain = (cfg.domain || '').trim().toLowerCase();
-  if (dbDomain) merged.SENDING_DOMAIN = dbDomain;
-
-  // Multi-domain: the domains table is the source of truth for the sending-domain set. Domains that only exist in env
-  // vars (the pre-multi-domain deployment style) are adopted into the table first, so they keep working *and* stop
-  // depending on the env vars.
+  // The **domains table is the only source of truth** for domain-scoped config (domain / zone / Resend domain id / key /
+  // from address / from name / worker name). `app_config` used to mirror the "primary" one of each; that duplication
+  // meant two places could disagree (a deleted domain lived on in app_config, a stale global key shadowed a per-domain
+  // one). Only env stays as a bootstrap fallback for a deployment that has not been configured in the app yet.
   let rows: repo.DomainRow[] = [];
   try {
     rows = await repo.listDomains(env);
   } catch {
-    rows = []; // older database without the domains table: fall back to SENDING_DOMAIN / the default address
+    rows = []; // older database without the domains table: fall back to the env config
   }
+  // Adopts env-implied domains **only while the table is still empty** (see adoptEnvDomains).
   rows = await adoptEnvDomains(env, rows).catch(() => rows);
-  await seedLegacyGlobalKey(env, rows, cfg).catch(() => undefined);
+  // Legacy global key: migrate into keyless domains, then retire the row so it can never resurface.
+  rows = await seedLegacyGlobalKey(env, rows, cfg).catch(() => rows);
+
+  // Retire the remaining single-domain keys. They are already ignored above (the domains table is the source of truth),
+  // but leaving them behind is how a stale global sender / zone id used to shadow the per-domain value — and it made
+  // every "why does it still say old.com?" investigation take an hour. Deleting them is a no-op if they are absent.
+  const staleKeys = LEGACY_SINGLE_DOMAIN_KEYS.filter((k) => Object.prototype.hasOwnProperty.call(cfg, k));
+  if (staleKeys.length) {
+    await repo.deleteConfigKeys(env, staleKeys).catch(() => undefined);
+    for (const k of staleKeys) delete cfg[k];
+    console.log(`[config] retired single-domain app_config keys: ${staleKeys.join(', ')}`);
+  }
+
   const enabled = rows.filter((d) => d.enabled !== 0);
   if (enabled.length) merged.SENDING_DOMAINS = enabled.map((d) => d.domain).join(',');
+
+  // "Primary" = the oldest enabled domain. It is not a stored flag any more: it is derived, so deleting the oldest
+  // domain simply promotes the next one instead of leaving a phantom behind in app_config.
+  const primary = enabled[0]; // listDomains() is ordered by (created_at, rowid): the oldest row is the primary
+  if (primary) {
+    const primaryDomain = String(primary.domain || '').trim().toLowerCase();
+    if (primaryDomain) merged.SENDING_DOMAIN = primaryDomain;
+    const primaryFrom = String(primary.from_address || '').trim();
+    if (primaryFrom) merged.SEND_FROM_ADDRESS = primaryFrom;
+    if (primary.from_name !== undefined && primary.from_name !== null) merged.SEND_FROM_NAME = String(primary.from_name);
+  }
 
   // Per-domain Resend keys: two domains may live in **different Resend accounts**, so each domain's own key wins over
   // the env one (see resendKeyFor in src/send.ts). Domains without a key fall back to env RESEND_API_KEY.
@@ -110,10 +130,10 @@ export async function withRuntimeConfig(env: Env): Promise<Env> {
  * Runs after adoptEnvDomains, so a domain that came from env vars already took the env key (its own account) and is not
  * touched here.
  */
-async function seedLegacyGlobalKey(env: Env, rows: repo.DomainRow[], cfg: Record<string, string>): Promise<void> {
-  if (!env.DB) return;
+async function seedLegacyGlobalKey(env: Env, rows: repo.DomainRow[], cfg: Record<string, string>): Promise<repo.DomainRow[]> {
+  if (!env.DB) return rows;
   const legacy = (cfg.resend_api_key || '').trim();
-  if (!legacy) return;
+  if (!legacy) return rows;
   let migrated = 0;
   for (const r of rows) {
     if (r.enabled === 0) continue;
@@ -124,14 +144,17 @@ async function seedLegacyGlobalKey(env: Env, rows: repo.DomainRow[], cfg: Record
       migrated++;
     }
   }
-  if (!migrated) return;
-  // Only drop the legacy row once every domain that needed it got a copy.
+  // Retire the row once every domain that needed it has a copy — **also when nothing needed it**, otherwise a dead
+  // global key sits in the database forever and is silently handed to the next domain created without a key (which is
+  // exactly how "Resend says the domain is verified, sending says it is not" happened).
   const stillMissing = rows.some((r) => r.enabled !== 0 && !String(r.resend_api_key ?? '').trim());
   if (!stillMissing) {
     await repo.deleteConfig(env, 'resend_api_key').catch(() => undefined);
     delete cfg.resend_api_key;
+    if (migrated) console.log(`[config] migrated the legacy global Resend key into ${migrated} domain(s)`);
+    else console.log('[config] retired the unused legacy global Resend key');
   }
-  console.log(`[config] migrated the legacy global Resend key into ${migrated} domain(s)`);
+  return rows;
 }
 
 /**
@@ -147,6 +170,12 @@ async function seedLegacyGlobalKey(env: Env, rows: repo.DomainRow[], cfg: Record
  */
 async function adoptEnvDomains(env: Env, rows: repo.DomainRow[]): Promise<repo.DomainRow[]> {
   if (!env.DB) return rows;
+  // ⚠️ **Bootstrap only.** The env vars are what a deployment used before the in-app domain mechanism existed, so they
+  // are adopted into D1 exactly once, while the table is still empty. Running this on every request (the old behaviour)
+  // had two nasty consequences: deleting a domain in the app silently brought it back on the next page load, and an env
+  // key was pushed into every domain that had no key of its own — even though an env key can only ever be right for the
+  // account it came from.
+  if (rows.length) return rows;
   const known = new Set(rows.map((r) => String(r.domain).trim().toLowerCase()));
   const envFrom = (env.SEND_FROM_ADDRESS || '').trim().toLowerCase();
   const envFromDomain = domainOf(envFrom);
@@ -197,45 +226,7 @@ async function adoptEnvDomains(env: Env, rows: repo.DomainRow[]): Promise<repo.D
     console.log(`[config] adopted env domain into D1: ${domain}`);
   }
 
-  // Backfill: a domain that was adopted earlier (before per-domain keys existed) but still has no key of its own gets the
-  // env key — without it, the global (possibly other-account) key would be used and sending from this domain would fail
-  // with "domain is not verified".
-  if (envKey) {
-    for (const r of rows) {
-      const d = String(r.domain).trim().toLowerCase();
-      if (!candidates.includes(d) || String(r.resend_api_key ?? '').trim()) continue;
-      const ok = await repo.setDomainKey(env, d, envKey).catch(() => false);
-      if (ok) {
-        r.resend_api_key = envKey;
-        console.log(`[config] backfilled per-domain key from env: ${d}`);
-      }
-    }
-  }
   return added.length ? rows.concat(added) : rows;
-}
-
-/**
- * Copy an env-provided send config into `app_config` **once** (only the keys D1 does not have yet), so the database
- * becomes the single source of truth and the env vars can be deleted afterwards. Idempotent: with nothing to do it
- * performs no writes at all.
- */
-async function seedSendConfigFromEnv(env: Env, cfg: Record<string, string>): Promise<void> {
-  if (!env.DB) return;
-  const writes: Array<[string, string]> = [];
-  const key = (env.RESEND_API_KEY || '').trim();
-  if (key && !(cfg.resend_api_key || '').trim()) writes.push(['resend_api_key', key]);
-  const from = (env.SEND_FROM_ADDRESS || '').trim();
-  if (from && !(cfg.from_address || '').trim()) writes.push(['from_address', from]);
-  const name = (env.SEND_FROM_NAME || '').trim();
-  if (name && !Object.prototype.hasOwnProperty.call(cfg, 'from_name')) writes.push(['from_name', name]);
-  const domain = ((env.SENDING_DOMAIN || '').trim().toLowerCase() || domainOf(from) || '');
-  if (domain && !isPlaceholderDomain(domain) && !(cfg.domain || '').trim()) writes.push(['domain', domain]);
-  if (!writes.length) return;
-  for (const [k, v] of writes) {
-    await repo.setConfig(env, k, v).catch(() => undefined);
-    cfg[k] = v;
-  }
-  console.log(`[config] imported from env into D1: ${writes.map((w) => w[0]).join(', ')}`);
 }
 
 export async function configureDomain(
@@ -256,16 +247,8 @@ export async function configureDomain(
   if (!cfToken) return { ok: false, steps, error: '缺少 Cloudflare API Token' };
   if (!resendKey) return { ok: false, steps, error: '缺少 Resend API Key' };
 
-  // The first configured domain becomes the "primary" stored in app_config (drives sending / account defaults).
-  // Adding a later domain must only append to the domains table, never flip the primary domain or default sender.
-  // A deployment may also have been configured purely through env vars (SEND_FROM_ADDRESS / SENDING_DOMAIN) — that
-  // counts as "already has a primary" too, otherwise the first in-app domain would silently take over the default sender.
-  const existingDomain =
-    (await repo.getConfig(env, 'domain').catch(() => null)) ||
-    (env.SENDING_DOMAIN || '').trim().toLowerCase() ||
-    domainOf((env.SEND_FROM_ADDRESS || '').trim().toLowerCase()) ||
-    '';
-  const isPrimary = !existingDomain || existingDomain === domain;
+  // The primary domain is not stored anywhere: it is the oldest enabled row of the domains table (see withRuntimeConfig),
+  // so configuring a new domain only appends a row and can never flip the default sender.
 
   // 1) find the zone
   let zoneId: string | null;
@@ -322,7 +305,6 @@ export async function configureDomain(
     await rd.verifyDomain(resendKey, dom.id).catch(() => undefined);
     const after = await rd.getDomain(resendKey, dom.id).catch(() => dom);
     steps.push({ name: '发信认证', ok: true, detail: `${records.length} 条记录写入 ${written} 条，Resend 状态：${after.status}` });
-    if (isPrimary) await repo.setConfig(env, 'resend_domain_id', dom.id);
   } catch (e) {
     steps.push({ name: '发信认证', ok: false, detail: (e as Error).message });
   }
@@ -332,14 +314,8 @@ export async function configureDomain(
   const fromName = typeof input.fromName === 'string' ? input.fromName.trim() : '';
   // The key is **bound to this domain** (a second domain may belong to a different Resend account). There is no global
   // key level anymore — the legacy app_config one is migrated into the domains that lack a key and then deleted.
-  if (isPrimary) {
-    await repo.setConfig(env, 'domain', domain);
-    await repo.setConfig(env, 'zone_id', zoneId);
-    await repo.setConfig(env, 'from_address', fromAddress);
-    await repo.setConfig(env, 'from_name', fromName);
-    await repo.setConfig(env, 'worker_name', workerName);
-    await repo.setConfig(env, 'setup_complete', '1');
-  }
+  // Only the installation flag lives in app_config now; everything domain-scoped is written to the domains row below.
+  await repo.setConfig(env, 'setup_complete', '1');
 
   steps.push({
     name: '发信 Key',
@@ -408,16 +384,16 @@ export async function selfCheck(env: Env): Promise<{
     domains: Record<string, { key_source: 'domain' | 'env' | 'none'; key_masked: string; from_address: string }>;
   };
 }> {
-  const cfg = env.DB ? await repo.getConfigMap(env).catch(() => ({} as Record<string, string>)) : {};
   const items: StepResult[] = [];
 
-  // The primary domain: app_config.domain, else whatever the env vars define (a self-hosted deployment may never have
-  // written app_config at all — see configureDomain's isPrimary).
+  const rows = await repo.listDomains(env).catch(() => [] as repo.DomainRow[]);
+  const primaryRow = rows.find((r) => r.enabled !== 0);
+  // The primary domain is the oldest enabled domains row; env only matters for a deployment that has not been configured
+  // in the app at all (pure bootstrap).
   const primary =
-    (cfg.domain || '').trim().toLowerCase() ||
+    String(primaryRow?.domain || '').trim().toLowerCase() ||
     (env.SENDING_DOMAIN || '').trim().toLowerCase() ||
     (domainOf(env.SEND_FROM_ADDRESS) || '');
-  const rows = await repo.listDomains(env).catch(() => [] as repo.DomainRow[]);
   const domains: string[] = [];
   const addDomain = (d: string | null | undefined): void => {
     const v = String(d ?? '').trim().toLowerCase();
@@ -436,8 +412,8 @@ export async function selfCheck(env: Env): Promise<{
     if (envKey) return { key: envKey, source: 'env' };
     return { key: '', source: 'none' };
   };
-  const fromAddress = (cfg.from_address || '').trim() || env.SEND_FROM_ADDRESS || '';
-  const fromName = Object.prototype.hasOwnProperty.call(cfg, 'from_name') ? cfg.from_name : (env.SEND_FROM_NAME || '');
+  const fromAddress = String(primaryRow?.from_address || '').trim() || env.SEND_FROM_ADDRESS || '';
+  const fromName = primaryRow ? String(primaryRow.from_name ?? '') : (env.SEND_FROM_NAME || '');
 
   // Every row is per domain (`<label> · <domain>`) so the panel can show exactly one domain; there is no global row.
   // The default from address is intentionally **not** a check item: the sender is chosen per message in the composer,

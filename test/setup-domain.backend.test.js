@@ -287,11 +287,11 @@ const RESEND_KEY = 're_totally_secret_key';
     'catch-all 指向本 Worker', JSON.stringify(catchAll && catchAll.body.actions));
 
   section('T6 落库 + ⭐ CF Token 用完即弃');
-  ok(cfg('domain') === 'example.com', 'domain 落库', cfg('domain'));
-  ok(cfg('zone_id') === 'zone1', 'zone_id 落库', cfg('zone_id'));
-  ok(cfg('resend_api_key') === null, '⭐ 不再写全局 Key（Key 只绑定到域名）', cfg('resend_api_key'));
-  ok(cfg('from_address') === 'noreply@example.com', '发件地址默认 noreply@<domain>', cfg('from_address'));
-  ok(cfg('from_name') === 'Support', '发件显示名落库', cfg('from_name'));
+  // ⭐ After the cleanup app_config only carries installation flags; everything domain-scoped lives in the domains row.
+  const cfgKeys = db.query('SELECT key FROM app_config').map((x) => x.key).sort();
+  const legacyKeys = cfgKeys.filter((k) => ['domain', 'zone_id', 'resend_domain_id', 'from_address', 'from_name', 'worker_name', 'resend_api_key'].includes(k));
+  ok(legacyKeys.length === 0, '⭐ app_config 只剩安装级键（domain/zone_id/from_*/Key 不再落这里）', JSON.stringify(cfgKeys));
+  ok(cfgKeys.every((k) => ['setup_complete', 'session_secret'].includes(k)), '只允许 setup_complete / session_secret', JSON.stringify(cfgKeys));
   ok(cfg('setup_complete') === '1', 'setup_complete 标记');
   const allValues = db.query('SELECT value FROM app_config').map((row) => String(row.value));
   ok(!allValues.some((v) => v.includes(CF_TOKEN)), '⭐ app_config 中不含 CF Token（用完即弃）');
@@ -373,15 +373,17 @@ const RESEND_KEY = 're_totally_secret_key';
   ok(listOne.total === 2, '负控制：单个域名仍是 2 封（没有把逗号逻辑写坏）', `total=${listOne.total}`);
 
   section('T11 应用内新增第二个域名：domains 表追加，主域/发件配置不被覆盖');
-  const primaryBefore = { domain: cfg('domain'), from: cfg('from_address'), name: cfg('from_name'), zone: cfg('zone_id') };
+  const primaryRowBefore = db.queryOne('SELECT * FROM domains WHERE domain = ?', 'example.com');
+  const primaryBefore = { domain: primaryRowBefore.domain, from: primaryRowBefore.from_address, name: primaryRowBefore.from_name, zone: primaryRowBefore.zone_id };
   r = await call('POST', '/api/setup/domain', {
     domain: 'second.com', cf_token: CF_TOKEN, resend_key: RESEND_KEY, from_address: 'hi@second.com', from_name: 'Second',
   }, cookie);
   ok(r.status === 200 && r.json && r.json.ok === true, '第二个域名配置成功', r.json && r.json.ok);
-  ok(cfg('domain') === primaryBefore.domain, '⭐ 主域 app_config.domain 未被覆盖', cfg('domain'));
-  ok(cfg('from_address') === primaryBefore.from, '⭐ 主域 from_address 未被覆盖', cfg('from_address'));
-  ok(cfg('from_name') === primaryBefore.name, '⭐ 主域 from_name 未被覆盖', cfg('from_name'));
-  ok(cfg('zone_id') === primaryBefore.zone, '主域 zone_id 未被覆盖', cfg('zone_id'));
+  const primaryRowAfter = db.queryOne('SELECT * FROM domains WHERE domain = ?', 'example.com');
+  ok(primaryRowAfter.domain === primaryBefore.domain, '⭐ 主域行仍在（不被新域顶替）', primaryRowAfter.domain);
+  ok(primaryRowAfter.from_address === primaryBefore.from, '⭐ 主域 from_address 未被覆盖', primaryRowAfter.from_address);
+  ok(primaryRowAfter.from_name === primaryBefore.name, '⭐ 主域 from_name 未被覆盖', primaryRowAfter.from_name);
+  ok(primaryRowAfter.zone_id === primaryBefore.zone, '主域 zone_id 未被覆盖', primaryRowAfter.zone_id);
   const dom2 = db.query("SELECT * FROM domains WHERE domain = 'second.com'");
   ok(dom2.length === 1, 'domains 表追加 second.com', JSON.stringify(db.query('SELECT domain FROM domains').map((d) => d.domain)));
   ok(dom2[0] && dom2[0].from_address === 'hi@second.com', 'second.com 的 from_address 记入 domains 表', dom2[0] && dom2[0].from_address);
