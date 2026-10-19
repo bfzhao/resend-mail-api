@@ -558,6 +558,8 @@ export interface DomainRow {
   from_address: string | null;
   from_name: string | null;
   worker_name: string | null;
+  /** Optional hostname this deployment serves the app on (mail.example.com). NULL = use the workers.dev URL. */
+  app_host?: string | null;
   enabled: number;
   created_at: number;
   updated_at: number;
@@ -571,6 +573,7 @@ export interface DomainInput {
   fromAddress?: string | null;
   fromName?: string | null;
   workerName?: string | null;
+  appHost?: string | null;
   enabled?: boolean;
 }
 
@@ -629,17 +632,6 @@ export async function setDomainKey(env: Env, domain: string, apiKey: string | nu
 export async function upsertDomain(env: Env, d: DomainInput): Promise<void> {
   const domain = d.domain.trim().toLowerCase();
   const now = nowSec();
-  const args = [
-    domain,
-    d.zoneId ?? null,
-    d.resendDomainId ?? null,
-    d.fromAddress ?? null,
-    d.fromName ?? null,
-    d.workerName ?? null,
-    d.enabled === false ? 0 : 1,
-    now,
-    now,
-  ];
   const base = `INSERT INTO domains (domain, zone_id, resend_domain_id, from_address, from_name, worker_name, enabled, created_at, updated_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(domain) DO UPDATE SET
@@ -650,27 +642,70 @@ export async function upsertDomain(env: Env, d: DomainInput): Promise<void> {
        worker_name = excluded.worker_name,
        enabled = excluded.enabled,
        updated_at = excluded.updated_at`;
+  const baseArgs = [
+    domain,
+    d.zoneId ?? null,
+    d.resendDomainId ?? null,
+    d.fromAddress ?? null,
+    d.fromName ?? null,
+    d.workerName ?? null,
+    d.enabled === false ? 0 : 1,
+    now,
+    now,
+  ];
+  // COALESCE keeps the existing key/host when the caller does not provide one (re-running the wizard must not wipe them).
+  const full = `INSERT INTO domains (domain, zone_id, resend_domain_id, resend_api_key, from_address, from_name, worker_name, app_host, enabled, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(domain) DO UPDATE SET
+       zone_id = excluded.zone_id,
+       resend_domain_id = excluded.resend_domain_id,
+       resend_api_key = COALESCE(excluded.resend_api_key, domains.resend_api_key),
+       from_address = excluded.from_address,
+       from_name = excluded.from_name,
+       worker_name = excluded.worker_name,
+       app_host = COALESCE(excluded.app_host, domains.app_host),
+       enabled = excluded.enabled,
+       updated_at = excluded.updated_at`;
   try {
-    await env.DB.prepare(
-      `INSERT INTO domains (domain, zone_id, resend_domain_id, resend_api_key, from_address, from_name, worker_name, enabled, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(domain) DO UPDATE SET
-         zone_id = excluded.zone_id,
-         resend_domain_id = excluded.resend_domain_id,
-         resend_api_key = COALESCE(excluded.resend_api_key, domains.resend_api_key),
-         from_address = excluded.from_address,
-         from_name = excluded.from_name,
-         worker_name = excluded.worker_name,
-         enabled = excluded.enabled,
-         updated_at = excluded.updated_at`
-    )
-      .bind(domain, args[1], args[2], d.resendApiKey ?? null, ...args.slice(3))
+    await env.DB.prepare(full)
+      .bind(
+        domain,
+        baseArgs[1],
+        baseArgs[2],
+        d.resendApiKey ?? null,
+        baseArgs[3],
+        baseArgs[4],
+        baseArgs[5],
+        d.appHost ?? null,
+        baseArgs[6],
+        baseArgs[7],
+        baseArgs[8]
+      )
       .run();
   } catch (e) {
-    // Database predates migration 012 (no `resend_api_key` column): write the rest so the domain still works, and let
-    // the caller decide what to do with the key (it can still be kept as the global key).
-    if (!/resend_api_key|no column|has no column/i.test(String(e))) throw e;
-    await env.DB.prepare(base).bind(...args).run();
+    // Database predates a column this statement uses (012: resend_api_key, 013: app_host): fall back step by step so the
+    // domain still works on older databases.
+    if (!/resend_api_key|app_host|no column|has no column/i.test(String(e))) throw e;
+    try {
+      await env.DB.prepare(
+        `INSERT INTO domains (domain, zone_id, resend_domain_id, resend_api_key, from_address, from_name, worker_name, enabled, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(domain) DO UPDATE SET
+           zone_id = excluded.zone_id,
+           resend_domain_id = excluded.resend_domain_id,
+           resend_api_key = COALESCE(excluded.resend_api_key, domains.resend_api_key),
+           from_address = excluded.from_address,
+           from_name = excluded.from_name,
+           worker_name = excluded.worker_name,
+           enabled = excluded.enabled,
+           updated_at = excluded.updated_at`
+      )
+        .bind(domain, baseArgs[1], baseArgs[2], d.resendApiKey ?? null, baseArgs[3], baseArgs[4], baseArgs[5], baseArgs[6], baseArgs[7], baseArgs[8])
+        .run();
+    } catch (e2) {
+      if (!/resend_api_key|app_host|no column|has no column/i.test(String(e2))) throw e2;
+      await env.DB.prepare(base).bind(...baseArgs).run();
+    }
   }
 }
 

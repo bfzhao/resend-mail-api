@@ -138,6 +138,9 @@ const RESEND_KEY = 're_totally_secret_key';
   /* ---- external API stubs ---- */
   const externalCalls = [];
   const dnsRecords = [];
+  /** Workers custom domains created by the access-hostname option, plus a switch for a missing permission. */
+  const customDomains = [];
+  let customDomainFails = false;
   let zoneFound = true;
   let routingEnabled = false;
   let dmarcMissing = false; // T9b: a domain without a _dmarc record is advisory and must not fail the check
@@ -155,6 +158,19 @@ const RESEND_KEY = 're_totally_secret_key';
       if (!zoneFound) return jsonRes({ success: true, result: [] });
       // findZoneId returns result[0].id regardless of name; give each domain its own zone so a second domain is configurable.
       return jsonRes({ success: true, result: [{ id: name === 'second.com' ? 'zone2' : 'zone1', name }] });
+    }
+    // GET /zones/<id> — the wizard reads the account id from the zone to attach a custom domain.
+    if (/\/zones\/zone\d+$/.test(u) && method === 'GET') {
+      return jsonRes({ success: true, result: { id: 'zone1', name: 'example.com', account: { id: 'acct-1', name: 'test' } } });
+    }
+    if (u === 'https://api.cloudflare.com/client/v4/accounts/acct-1/workers/domains' && method === 'GET') {
+      return jsonRes({ success: true, result: customDomains.slice() });
+    }
+    if (u === 'https://api.cloudflare.com/client/v4/accounts/acct-1/workers/domains' && method === 'PUT') {
+      if (customDomainFails) return jsonRes({ success: false, errors: [{ code: 10000, message: 'Authentication error' }] }, 403);
+      const rec = { id: `cd-${customDomains.length + 1}`, hostname: body.hostname, service: body.service, zone_id: body.zone_id };
+      customDomains.push(rec);
+      return jsonRes({ success: true, result: rec });
     }
     if (/\/zones\/zone\d+\/email\/routing$/.test(u)) {
       return jsonRes({ success: true, result: { enabled: routingEnabled } });
@@ -417,6 +433,42 @@ const RESEND_KEY = 're_totally_secret_key';
   ok(dmarcItem.ok === true && dmarcItem.warn === true, '⭐ DMARC 缺失 -> ok + warn（前端显示橙色 ! 而不是红叉）', JSON.stringify(dmarcItem));
   ok(/可选/.test(dmarcItem.detail || ''), '文案说明是可选项', dmarcItem.detail);
   dmarcMissing = false;
+
+  section('T12 访问域名（可选）：把二级域名绑到本站');
+  customDomains.length = 0;
+  r = await call('POST', '/api/setup/domain', {
+    domain: 'app.com', cf_token: CF_TOKEN, resend_key: RESEND_KEY, from_address: 'hi@app.com', app_host: 'mail',
+  }, cookie);
+  ok(r.status === 200 && r.json && r.json.ok === true, '带 app_host 的配置成功', r.json && JSON.stringify((r.json.steps || []).map((x) => [x.name, x.ok])));
+  const appHostStep = (r.json.steps || []).find((x) => x.name === '访问域名') || {};
+  ok(appHostStep.ok === true && /mail\.app\.com/.test(appHostStep.detail || ''), '⭐ 只填 mail 会补成 mail.app.com 并绑定', appHostStep.detail);
+  ok(customDomains.length === 1 && customDomains[0].hostname === 'mail.app.com', '⭐ 调用了 Workers Custom Domains', JSON.stringify(customDomains));
+  ok(customDomains[0].service === 'resend-mail-api', '绑到本 Worker', customDomains[0].service);
+  const appHostRow = db.query("SELECT app_host FROM domains WHERE domain = 'app.com'");
+  ok(appHostRow.length === 1 && appHostRow[0].app_host === 'mail.app.com', '⭐ 访问域名记在 domains 行里', JSON.stringify(appHostRow));
+
+  r = await call('POST', '/api/setup/domain', {
+    domain: 'app.com', cf_token: CF_TOKEN, resend_key: RESEND_KEY, app_host: 'mail.app.com',
+  }, cookie);
+  const appHostDup = (r.json.steps || []).find((x) => x.name === '访问域名') || {};
+  ok(appHostDup.ok === true && customDomains.length === 1, '重复配置不会重复绑定（幂等）', JSON.stringify(appHostDup));
+
+  r = await call('POST', '/api/setup/domain', {
+    domain: 'app.com', cf_token: CF_TOKEN, resend_key: RESEND_KEY, app_host: 'mail.other.com',
+  }, cookie);
+  const appHostBad = (r.json.steps || []).find((x) => x.name === '访问域名') || {};
+  ok(appHostBad.ok === false && /不是本域下的有效主机名/.test(appHostBad.detail || ''), '⭐ 域外主机名被拒绝', appHostBad.detail);
+
+  customDomainFails = true;
+  r = await call('POST', '/api/setup/domain', {
+    domain: 'app.com', cf_token: CF_TOKEN, resend_key: RESEND_KEY, app_host: 'inbox',
+  }, cookie);
+  const appHostPerm = (r.json.steps || []).find((x) => x.name === '访问域名') || {};
+  ok(appHostPerm.ok === false, '权限不足时该步骤失败', (appHostPerm.detail || '').slice(0, 40));
+  ok(/Workers Routes/.test(appHostPerm.detail || '') && /控制台/.test(appHostPerm.detail || ''),
+    '⭐ 说明缺哪个权限 + 控制台手动添加的退路', (appHostPerm.detail || '').slice(0, 140));
+  ok((r.json.steps || []).some((x) => x.name === '发信认证' && x.ok === true), '邮件那部分不受影响');
+  customDomainFails = false;
 
   cleanup();
   console.log(`\n===== 总结：${pass} 通过，${failures.length} 失败 =====`);

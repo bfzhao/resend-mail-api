@@ -27,6 +27,8 @@ export class CfError extends Error {
 function permissionForPath(path: string): string {
   if (/\/dns_records/.test(path)) return 'DNS → Edit';
   if (/\/email\/routing/.test(path)) return 'Email Routing Rules → Edit';
+  // Workers Custom Domains (used for the "access it on mail.example.com" option).
+  if (/\/workers\/domains/.test(path)) return 'Workers Routes → Edit';
   if (/\/settings/.test(path)) return 'Zone Settings → Edit';
   if (/^\/zones(\?|$)/.test(path)) return 'Zone → Read';
   return '';
@@ -63,6 +65,58 @@ async function cfFetch<T>(token: string, path: string, init: RequestInit = {}): 
     throw new CfError(`Cloudflare API 错误：${msg}${hint}`, resp.status);
   }
   return body.result;
+}
+
+/** The account a zone belongs to (the zone read permission is already part of the wizard token). */
+export async function getZoneAccountId(token: string, zoneId: string): Promise<string | null> {
+  const zone = await cfFetch<{ account?: { id?: string } }>(token, `/zones/${encodeURIComponent(zoneId)}`);
+  return zone?.account?.id || null;
+}
+
+export interface WorkerCustomDomain {
+  id?: string;
+  hostname: string;
+  service?: string;
+  zone_id?: string;
+  zone_name?: string;
+}
+
+/** Every Worker custom domain in the account (each one is a hostname served by exactly one Worker). */
+export async function listWorkerCustomDomains(token: string, accountId: string): Promise<WorkerCustomDomain[]> {
+  const list = await cfFetch<WorkerCustomDomain[]>(
+    token,
+    `/accounts/${encodeURIComponent(accountId)}/workers/domains`
+  );
+  return Array.isArray(list) ? list : [];
+}
+
+/**
+ * Serve this Worker on `hostname` (e.g. mail.example.com).
+ *
+ * Cloudflare creates the DNS record and the certificate for a custom domain, so no extra DNS step is needed — but the
+ * token must carry the "Workers Routes → Edit" permission. Idempotent: attaching the same hostname twice is a no-op.
+ */
+export async function attachWorkerCustomDomain(
+  token: string,
+  accountId: string,
+  zoneId: string,
+  hostname: string,
+  workerName: string
+): Promise<{ created: boolean }> {
+  const existing = await listWorkerCustomDomains(token, accountId).catch(() => [] as WorkerCustomDomain[]);
+  const hit = existing.find((d) => String(d.hostname || '').toLowerCase() === hostname.toLowerCase());
+  if (hit && String(hit.service || '') === workerName) return { created: false };
+  if (hit && hit.service && String(hit.service) !== workerName) {
+    throw new CfError(
+      `${hostname} 已经绑定到另一个 Worker（${hit.service}）—— 请换一个二级域名，或先到 Cloudflare 控制台解绑。`,
+      409
+    );
+  }
+  await cfFetch<WorkerCustomDomain>(token, `/accounts/${encodeURIComponent(accountId)}/workers/domains`, {
+    method: 'PUT',
+    body: JSON.stringify({ zone_id: zoneId, hostname, service: workerName, environment: 'production' }),
+  });
+  return { created: true };
 }
 
 /** Find the zone in the account matching the domain (try the full domain first, then fall back to the apex). Returns null if not found. */

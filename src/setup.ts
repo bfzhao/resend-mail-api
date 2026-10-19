@@ -30,6 +30,23 @@ export interface ConfigureInput {
   fromAddress?: unknown;
   fromName?: unknown;
   workerName?: unknown;
+  /** Optional "serve the app on this hostname" (e.g. mail.example.com). Empty = keep using the workers.dev URL. */
+  appHost?: unknown;
+}
+
+/**
+ * Normalise the optional access hostname: `mail` / `mail.example.com` / `https://mail.example.com/` all become
+ * `mail.example.com`. A bare label gets the domain appended, because that is what people type.
+ */
+export function normalizeAppHost(raw: unknown, domain: string): string | null {
+  if (typeof raw !== 'string') return null;
+  let h = raw.trim().toLowerCase();
+  if (!h) return null;
+  h = h.replace(/^https?:\/\//, '').replace(/\/.*$/, '').replace(/\.$/, '');
+  if (!h.includes('.')) h = `${h}.${domain}`;
+  if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/.test(h)) return null;
+  if (!h.endsWith(`.${domain}`) && h !== domain) return null; // must live in this zone, otherwise the token cannot do it
+  return h;
 }
 
 /** Normalize a domain: strip protocol/path/trailing dot, lowercase, basic format validation. Returns null if invalid. */
@@ -309,7 +326,39 @@ export async function configureDomain(
     steps.push({ name: '发信认证', ok: false, detail: (e as Error).message });
   }
 
-  // 4) Persist (**do not store the CF token**)
+  // 4) Optional: serve the app on a hostname of this zone (mail.example.com) instead of the workers.dev URL. Cloudflare
+  //    creates the DNS record + certificate for a custom domain, so there is no separate DNS step; it needs the
+  //    "Workers Routes → Edit" token permission, which the template does not include by default (Cloudflare cannot
+  //    pre-select it from a link), so a missing permission is reported as an actionable step instead of a failure.
+  const appHost = normalizeAppHost(input.appHost, domain);
+  if (typeof input.appHost === 'string' && input.appHost.trim() && !appHost) {
+    steps.push({
+      name: '访问域名',
+      ok: false,
+      detail: `"${String(input.appHost).trim()}" 不是本域下的有效主机名（应形如 mail.${domain}）；邮件收发不受影响。`,
+    });
+  } else if (appHost) {
+    try {
+      const accountId = await cf.getZoneAccountId(cfToken, zoneId);
+      if (!accountId) throw new Error('无法确定该域所属的 Cloudflare 账号（Token 缺少 Zone → Read？）');
+      const attached = await cf.attachWorkerCustomDomain(cfToken, accountId, zoneId, appHost, workerName);
+      steps.push({
+        name: '访问域名',
+        ok: true,
+        detail: attached.created
+          ? `已绑定 https://${appHost}/（Cloudflare 会自动创建 DNS 记录与证书，通常几分钟内生效）`
+          : `https://${appHost}/ 之前已绑定到这个 Worker`,
+      });
+    } catch (e) {
+      steps.push({
+        name: '访问域名',
+        ok: false,
+        detail: `${(e as Error).message} —— 邮件收发不受影响；也可以到 Cloudflare 控制台 → Workers → 该 Worker → Settings → Domains & Routes 手动添加 ${appHost}`,
+      });
+    }
+  }
+
+  // 5) Persist (**do not store the CF token**)
   const fromAddress = (typeof input.fromAddress === 'string' && input.fromAddress.trim()) || `noreply@${domain}`;
   const fromName = typeof input.fromName === 'string' ? input.fromName.trim() : '';
   // The key is **bound to this domain** (a second domain may belong to a different Resend account). There is no global
@@ -333,6 +382,7 @@ export async function configureDomain(
       fromAddress,
       fromName,
       workerName,
+      appHost: appHost || null,
       enabled: true,
     });
   } catch {

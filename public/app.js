@@ -4474,6 +4474,9 @@ function detectWorkerName() {
  * If Cloudflare ever ignores the parameters the page simply opens with the normal token form — the same four
  * permissions are spelled out right next to the button, so the flow still works.
  */
+// Permission groups the wizard's one-click token link asks for. "Workers Routes" is what serves the app on
+// mail.example.com (Workers → Custom Domains); like Email Routing it cannot be pre-selected from a link, so the wizard
+// shows it as a manual click and the server names it if the API answers 403.
 const CF_TOKEN_PERMS = [
   { key: 'zone', type: 'read' },
   { key: 'dns', type: 'edit' },
@@ -4540,6 +4543,7 @@ function showDomainWizard(status, opts = {}) {
         <div class="cf-zone-hint" id="cf-zone-hint">先在上面填写域名，按钮才会激活。</div>
         <div class="cf-perms" id="cf-perms">
           <div>需要 4 项权限：Zone → Read · DNS → Edit · Zone Settings → Edit · Email Routing Rules → Edit</div>
+          <div>若填了「访问域名」，再加一项：Workers Routes → Edit（绑自定义域名用）。</div>
           <ul class="cf-perms-list">
             <li>打开后前 3 项已自动勾选；Email Routing Rules 若没有出现，点 Permissions 下的「+ Add more」→ 选 Zone → Email Routing Rules → Edit（Cloudflare 目前不支持用链接预选这一项）。</li>
             <li>Zone Resources 默认 All zones；想只授权这一个域，改成 Include → 你的域名。</li>
@@ -4549,6 +4553,11 @@ function showDomainWizard(status, opts = {}) {
       </div>
       ${gateField('gate-cf', '把创建好的 Token 粘贴到这里', 'password', '', 'Cloudflare API Token')}
       ${gateField('gate-resend', 'Resend API Key', 'password', '', 're_…（保存在你自己的数据库，用于发信）')}
+      <div class="gate-field">
+        <span>访问域名（可选）</span>
+        <input id="gate-aphost" type="text" placeholder="mail（留空则继续用 workers.dev 地址）" autocomplete="off" />
+        <div class="cf-zone-hint" id="gate-aphost-hint">填一个本域下的二级域名，例如 mail，就会自动把 https://mail.你的域名/ 绑定到本站。留空则不改。</div>
+      </div>
       ${adding ? '' : gateField('gate-from', '发件地址', 'text', (status && status.from_address) || '', 'noreply@example.com')}
       ${adding ? '' : gateField('gate-fromname', '发件显示名（可选）', 'text', '', '')}
       <div class="gate-error" id="gate-error"></div>
@@ -4561,6 +4570,21 @@ function showDomainWizard(status, opts = {}) {
     </div>`;
 
   const domainEl = $('#gate-domain');
+  const appHostEl = $('#gate-aphost');
+  const syncAppHostHint = () => {
+    const hint = $('#gate-aphost-hint');
+    if (!hint) return;
+    const d = normDomainInput(domainEl ? domainEl.value : '');
+    const raw = String((appHostEl && appHostEl.value) || '').trim().toLowerCase();
+    if (!raw) {
+      hint.textContent = '填一个本域下的二级域名，例如 mail，就会自动把 https://mail.你的域名/ 绑定到本站。留空则不改。';
+      return;
+    }
+    const host = raw.includes('.') ? raw : (d ? `${raw}.${d}` : raw);
+    hint.textContent = '将通过 {u} 访问（Cloudflare 会自动创建 DNS 记录与证书；需要 Token 具备 Workers Routes 权限）。'.replace('{u}', `https://${host}/`);
+  };
+  if (appHostEl) appHostEl.addEventListener('input', syncAppHostHint);
+  if (domainEl) domainEl.addEventListener('input', syncAppHostHint);
 
   /**
    * Enable the Cloudflare authorisation button only once the domain looks valid, and (re)build its link for exactly that
@@ -4634,6 +4658,7 @@ function showDomainWizard(status, opts = {}) {
     const resend_key = $('#gate-resend').value.trim();
     const from_address = fromEl ? fromEl.value.trim() : '';
     const from_name = $('#gate-fromname') ? $('#gate-fromname').value.trim() : '';
+    const app_host = appHostEl ? appHostEl.value.trim() : '';
     const err = $('#gate-error');
     err.textContent = '';
     if (!domain || !cf_token || !resend_key) {
@@ -4645,7 +4670,7 @@ function showDomainWizard(status, opts = {}) {
     btn.textContent = '配置中…';
     const r = await probe('/api/setup/domain', {
       method: 'POST',
-      body: JSON.stringify({ domain, cf_token, resend_key, from_address, from_name, worker_name: detectWorkerName() }),
+      body: JSON.stringify({ domain, cf_token, resend_key, from_address, from_name, app_host, worker_name: detectWorkerName() }),
     });
     btn.disabled = false;
     btn.textContent = submitLabel;
@@ -4666,7 +4691,9 @@ function showDomainWizard(status, opts = {}) {
         void loadMailboxes(true);
         void refreshCounts(true);
         void refreshDomainHealth(true); // a new domain must not keep showing the previous badge state
-        showToast('域名已添加');
+        const apStep = (data.steps || []).find((x) => x.name === '访问域名');
+        showToast(apStep && apStep.ok ? `域名已添加，可通过 ${app_host || '新地址'} 访问` : '域名已添加');
+        if (apStep && !apStep.ok) showToast(apStep.detail, true);
         return;
       }
       localStorage.removeItem('setup-skip');

@@ -104,7 +104,15 @@ async function routeGate(request: Request, env: Env, path: string): Promise<Resp
 
 async function setupDomain(request: Request, env: Env): Promise<Response> {
   const body = (await request.json().catch(() => null)) as
-    | { domain?: unknown; cf_token?: unknown; resend_key?: unknown; from_address?: unknown; from_name?: unknown; worker_name?: unknown }
+    | {
+        domain?: unknown;
+        cf_token?: unknown;
+        resend_key?: unknown;
+        from_address?: unknown;
+        from_name?: unknown;
+        worker_name?: unknown;
+        app_host?: unknown;
+      }
     | null;
   if (!body) return json({ error: '参数错误' }, 400);
   const result = await configureDomain(env, {
@@ -114,6 +122,7 @@ async function setupDomain(request: Request, env: Env): Promise<Response> {
     fromAddress: body.from_address,
     fromName: body.from_name,
     workerName: body.worker_name,
+    appHost: body.app_host,
   });
   return json(result, result.error && result.steps.length === 0 ? 400 : 200);
 }
@@ -263,16 +272,34 @@ async function routeApi(request: Request, env: Env, path: string, url: URL): Pro
   if (path === '/api/domains' && method === 'GET') {
     const rows = await repo.listDomains(env);
     const seen = new Set<string>();
-    const domains: Array<{ domain: string; from_address: string | null; from_name: string | null; zone_id: string | null }> = [];
+    const domains: Array<{
+      domain: string;
+      from_address: string | null;
+      from_name: string | null;
+      zone_id: string | null;
+      app_host?: string | null;
+    }> = [];
     for (const r of rows) {
       if (r.enabled === 0 || !r.domain || seen.has(r.domain)) continue;
       seen.add(r.domain);
-      domains.push({ domain: r.domain, from_address: r.from_address, from_name: r.from_name, zone_id: r.zone_id || null });
+      domains.push({
+        domain: r.domain,
+        from_address: r.from_address,
+        from_name: r.from_name,
+        zone_id: r.zone_id || null,
+        app_host: r.app_host || null,
+      });
     }
     for (const d of sendingDomains(env)) {
       if (!seen.has(d)) {
         seen.add(d);
-        domains.push({ domain: d, from_address: env.SEND_FROM_ADDRESS || null, from_name: env.SEND_FROM_NAME || null, zone_id: null });
+        domains.push({
+          domain: d,
+          from_address: env.SEND_FROM_ADDRESS || null,
+          from_name: env.SEND_FROM_NAME || null,
+          zone_id: null,
+          app_host: null,
+        });
       }
     }
     // Per-domain unread counts drive the new-mail badge on each chip (a separate GROUP BY keeps this cheap).

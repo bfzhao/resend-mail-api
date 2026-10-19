@@ -107,6 +107,16 @@
     '加载中': 'Loading',
     '加载中…': 'Loading…',
     '正文加载失败：{m}': 'Failed to load the body: {m}',
+  // ---- domain wizard: optional hostname that serves the app (mail.example.com) ----
+  '访问域名（可选）': 'Access hostname (optional)',
+  '填一个本域下的二级域名，例如 mail，就会自动把 https://mail.你的域名/ 绑定到本站。留空则不改。':
+    'Pick a subdomain of this zone, e.g. mail, to serve the app on it. Leave empty to keep the workers.dev URL.',
+  '将通过 {u} 访问（Cloudflare 会自动创建 DNS 记录与证书；需要 Token 具备 Workers Routes 权限）。':
+    'The app will be served on {u} (Cloudflare creates the DNS record and certificate; the token needs Workers Routes → Edit).',
+  'mail（留空则继续用 workers.dev 地址）': 'mail (leave empty to keep the workers.dev URL)',
+  '若填了「访问域名」，再加一项：Workers Routes → Edit（绑自定义域名用）。':
+    'If you fill in the access hostname, add one more: Workers Routes → Edit (for the custom domain).',
+  '访问域名': 'Access hostname',
     '（内容加载失败，请用「下载」按钮保存后打开）': '(Could not load the content — use Download and open it locally)',
     '（随正文下载中…）': ' (downloading with the body…)',
     '会话 · {n} 封': 'Conversation · {n}',

@@ -171,6 +171,7 @@ CREATE TABLE IF NOT EXISTS domains (
     from_address     TEXT,                          -- default sender for this domain (e.g. 'noreply@example.com')
     from_name        TEXT,                          -- default display name for this domain
     worker_name      TEXT,                          -- Worker script the catch-all points at
+    app_host         TEXT,                          -- optional hostname serving the app (mail.example.com)
     enabled          INTEGER NOT NULL DEFAULT 1,
     created_at       INTEGER NOT NULL,
     updated_at       INTEGER NOT NULL
