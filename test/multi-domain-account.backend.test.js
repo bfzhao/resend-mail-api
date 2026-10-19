@@ -151,6 +151,8 @@ const RESEND_KEY = 're_totally_secret_key';
   /** Authorization headers of the real send calls (POST /emails), in order — proves which domain's key was used. */
   const sentAuth = [];
   const jsonRes = (obj, status = 200) => new Response(JSON.stringify(obj), { status, headers: { 'content-type': 'application/json' } });
+  /** Failure switches for the self-check staleness test (T13): simulate rate limits / a genuinely missing record. */
+  const faults = { dns: 'ok', resend: 'ok' }; // 'ok' | 'rate' | 'missing'
   globalThis.fetch = async (url, init) => {
     const u = String(url);
     const method = String((init && init.method) || 'GET').toUpperCase();
@@ -180,7 +182,7 @@ const RESEND_KEY = 're_totally_secret_key';
       if (i >= 0) dnsRecords[i] = { id, ...body };
       return jsonRes({ success: true, result: { id, ...body } });
     }
-    if (u === 'https://api.resend.com/domains' && method === 'POST') {
+    if (u.split('?')[0] === 'https://api.resend.com/domains' && method === 'POST') {
       const nm = body.name;
       return jsonRes({
         id: `dom-${nm}`, name: nm, status: 'not_started',
@@ -199,8 +201,9 @@ const RESEND_KEY = 're_totally_secret_key';
     // GET /domains — "which domains does *this* key see". The saved key (RESEND_KEY) belongs to a team that only knows
     // old.com, which is exactly the production situation where the dashboard shows a verified domain the sending key
     // cannot use; 're_fixed_key' is a key that can see everything.
-    if (u === 'https://api.resend.com/domains' && method === 'GET') {
+    if (u.split('?')[0] === 'https://api.resend.com/domains' && method === 'GET') {
       const auth = String((init && init.headers && (init.headers.Authorization || init.headers.authorization)) || '');
+      if (faults.resend === 'rate') return new Response('{"message":"Too many requests"}', { status: 429 });
       if (auth.includes('re_broken_key')) return jsonRes({ message: 'API key is invalid' }, 401);
       if (auth.includes('re_send_only')) return jsonRes({ message: 'This API key is restricted to only send emails.' }, 401);
       const seen = auth.includes('re_fixed_key') ? ['old.com', 'new.com', 'third.com'] : ['old.com'];
@@ -212,9 +215,11 @@ const RESEND_KEY = 're_totally_secret_key';
       return jsonRes({ id: 're_sent_1' });
     }
     if (u.startsWith('https://dns.google/resolve')) {
+      if (faults.dns === 'rate') return new Response('Too Many Requests', { status: 429 });
       const q = new URL(u);
       const name = q.searchParams.get('name') || '';
       const type = q.searchParams.get('type') || '';
+      if (faults.dns === 'missing' && type === 'TXT' && /^resend\._domainkey\./.test(name)) return jsonRes({ Answer: [] });
       if (type === 'MX' && /^(old|new|third)\.com$/.test(name)) return jsonRes({ Answer: [{ name, type: 15, data: '10 route1.mx.cloudflare.net.' }] });
       if (type === 'MX' && /^send\./.test(name)) return jsonRes({ Answer: [{ name, type: 15, data: '10 feedback-smtp.us-east-1.amazonses.com.' }] });
       if (type === 'TXT' && /^resend\._domainkey\./.test(name)) return jsonRes({ Answer: [{ name, type: 16, data: '"p=MIGf..."' }] });
@@ -502,6 +507,33 @@ const RESEND_KEY = 're_totally_secret_key';
   const keysNow = Object.fromEntries(domainsTable().map((d) => [d.domain, d.resend_api_key]));
   ok(!keysNow['old.com'], '⭐ 没有专属 Key 的域仍保持为空（env Key 不会被悄悄写入）', JSON.stringify(keysNow));
   ok(keysNow['new.com'] === 're_fixed_key', '有专属 Key 的域不受影响', keysNow['new.com']);
+
+  section('T13 ⭐ 自检：查询失败 ≠ 记录不存在（同一域不会随机变叉）');
+  faults.dns = 'rate';
+  chk = (await call('GET', '/api/setup/check', undefined, cookie)).json;
+  const dnsRows = (chk.items || []).filter((i) => /^(收信 MX|发信 MX|DKIM|SPF|DMARC) · /.test(i.name));
+  ok(dnsRows.length >= 5, 'DNS 行都在', dnsRows.length);
+  ok(dnsRows.every((i) => i.ok === true && i.warn === true),
+    '⭐ 查询失败（429/超时）→ 全部显示为「未知(!)」，不判为失败', JSON.stringify(dnsRows.map((i) => [i.name, i.ok, i.warn])));
+  ok(dnsRows.every((i) => /没能查询/.test(i.detail || '')), 'detail 说明"这次没能查询"', dnsRows[0] && dnsRows[0].detail);
+  ok(!(chk.items || []).some((i) => /^(收信 MX|发信 MX|DKIM|SPF) · /.test(i.name) && i.ok === false),
+    '⭐ 没有一行因为限流被判成叉（之前就是这个 bug）');
+
+  faults.dns = 'missing';
+  chk = (await call('GET', '/api/setup/check', undefined, cookie)).json;
+  const dkimRow = (chk.items || []).find((i) => i.name === 'DKIM · old.com') || {};
+  ok(dkimRow.ok === false && !dkimRow.warn, '负控制：真的查不到记录 → 仍然是叉', JSON.stringify(dkimRow));
+  faults.dns = 'ok';
+
+  faults.resend = 'rate';
+  chk = (await call('GET', '/api/setup/check', undefined, cookie)).json;
+  const resendRow = (chk.items || []).find((i) => i.name === 'Resend · old.com') || {};
+  ok(resendRow.ok === true && resendRow.warn === true, '⭐ Resend 查询被限流 → 未知(!)', JSON.stringify(resendRow));
+  faults.resend = 'ok';
+
+  chk = (await call('GET', '/api/setup/check', undefined, cookie)).json;
+  const resendOkRow = (chk.items || []).find((i) => i.name === 'Resend · old.com') || {};
+  ok(resendOkRow.ok === true && !resendOkRow.warn, '恢复后重新变回正常', JSON.stringify(resendOkRow));
 
   console.log(`\n===== 结果: ${pass} passed, ${failures.length} failed =====`);
   if (failures.length) console.log(`失败项：\n- ${failures.join('\n- ')}`);

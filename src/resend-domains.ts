@@ -69,9 +69,29 @@ export async function addDomain(apiKey: string, name: string): Promise<ResendDom
   return resendFetch<ResendDomain>(apiKey, '/domains', { method: 'POST', body: JSON.stringify({ name }) });
 }
 
+/**
+ * List every domain this key can see.
+ *
+ * Follows pagination (a `has_more` flag, with the last id as the cursor). A deployment can have many domains in one Resend
+ * account, and an un-paginated call made a perfectly visible domain look like "this key cannot see it" — a red row in the
+ * self-check with nothing the user could fix.
+ */
 export async function listDomains(apiKey: string): Promise<ResendDomain[]> {
-  const r = await resendFetch<{ data?: ResendDomain[] }>(apiKey, '/domains');
-  return r.data || [];
+  const out: ResendDomain[] = [];
+  let after: string | null = null;
+  for (let page = 0; page < 10; page++) {
+    const qs: string = '?limit=100' + (after ? '&after=' + encodeURIComponent(after) : '');
+    const r: { data?: ResendDomain[]; has_more?: boolean } = await resendFetch<{ data?: ResendDomain[]; has_more?: boolean }>(
+      apiKey,
+      '/domains' + qs
+    );
+    const batch: ResendDomain[] = r.data || [];
+    out.push(...batch);
+    const last: ResendDomain | undefined = batch[batch.length - 1];
+    if (!r.has_more || !last || !last.id) break;
+    after = last.id;
+  }
+  return out;
 }
 
 export async function getDomain(apiKey: string, id: string): Promise<ResendDomain> {

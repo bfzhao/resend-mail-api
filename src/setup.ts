@@ -349,18 +349,37 @@ interface DnsAnswer {
   Status?: number;
 }
 
-/** Query one record via public DNS-over-HTTPS (dns.google), to truly verify whether DNS has taken effect (no token needed). */
-export async function resolvePublicDns(name: string, type: 'MX' | 'TXT' | 'CNAME'): Promise<string[]> {
-  try {
-    const resp = await fetch(`https://dns.google/resolve?name=${encodeURIComponent(name)}&type=${type}`, {
-      headers: { Accept: 'application/dns-json' },
-    });
-    if (!resp.ok) return [];
-    const body = (await resp.json()) as DnsAnswer;
-    return (body.Answer || []).map((a) => a.data);
-  } catch {
-    return [];
+/**
+ * Query one record via public DNS-over-HTTPS (dns.google), to truly verify whether DNS has taken effect (no token needed).
+ *
+ * ⚠️ `error` matters: an empty answer means "the record is not there", a failed lookup means "we could not ask". Folding
+ * both into `[]` used to turn a rate-limited / timed-out request into "DKIM 未发现" — so the same domain flipped between
+ * ✓ and ✕ on every refresh, and a working domain could look broken for no reason.
+ */
+export async function resolvePublicDns(
+  name: string,
+  type: 'MX' | 'TXT' | 'CNAME'
+): Promise<{ answers: string[]; error: string | null }> {
+  let lastError = '';
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (attempt) await new Promise((r) => setTimeout(r, 120 * attempt));
+    try {
+      const resp = await fetch(`https://dns.google/resolve?name=${encodeURIComponent(name)}&type=${type}`, {
+        headers: { Accept: 'application/dns-json' },
+      });
+      if (!resp.ok) {
+        // 429 = rate limited, 5xx = their side: both are "try again later", not "the record is missing".
+        lastError = `HTTP ${resp.status}`;
+        if (resp.status === 429 || resp.status >= 500) continue;
+        return { answers: [], error: lastError };
+      }
+      const body = (await resp.json()) as DnsAnswer;
+      return { answers: (body.Answer || []).map((a) => a.data), error: null };
+    } catch (e) {
+      lastError = e instanceof Error ? e.message : String(e);
+    }
   }
+  return { answers: [], error: lastError || 'unknown error' };
 }
 
 /**
@@ -452,6 +471,21 @@ export async function selfCheck(env: Env): Promise<{
     }
     const list = await listFor(key);
     if (list instanceof Error) {
+      // Rate limits / timeouts / 5xx say nothing about the domain: report "could not check" instead of "broken", or the
+      // panel flaps between ✓ and ✕ on every refresh (and a healthy domain looks broken half the time).
+      const transient =
+        /429|rate limit|too many requests|timed? ?out|timeout|network|fetch failed|ECONN|ETIMEDOUT|ENOTFOUND|\b5\d\d\b|internal error|temporarily/i.test(
+          list.message
+        );
+      if (transient) {
+        items.push({
+          name: `Resend · ${d}`,
+          ok: true,
+          warn: true,
+          detail: `这次没能查询 Resend（${list.message.slice(0, 120)}），无法确认；稍后刷新再看`,
+        });
+        continue;
+      }
       // A "sending access" key can send but cannot list domains — that is not a delivery problem, so it must not turn
       // the domain red (it would be a false alarm for every sending-only key).
       if (/restricted to only send emails/i.test(list.message)) {
@@ -485,36 +519,63 @@ export async function selfCheck(env: Env): Promise<{
   }
 
   // DNS side, per configured domain (public DoH, no token needed).
+  //
+  // Every lookup has three possible outcomes and they must look different:
+  //   record found      -> ✓
+  //   looked up, absent -> ✕ (the record really is missing)
+  //   lookup failed     -> ! (we could not ask: rate limit / timeout) — never ✕, and the detail says so, otherwise a
+  //                        healthy domain flickers between ✓ and ✕ on every refresh (the reported bug).
   for (const domain of domains) {
     const mx = await resolvePublicDns(domain, 'MX');
-    const mxOk = mx.some((d) => /mx\.cloudflare\.net/i.test(d));
-    items.push({ name: `收信 MX · ${domain}`, ok: mxOk, detail: mxOk ? mx.join(', ') : '未发现 Cloudflare 邮件路由 MX（收信可能尚未生效）' });
+    const mxOk = mx.answers.some((d) => /mx\.cloudflare\.net/i.test(d));
+    items.push(
+      mx.error
+        ? { name: `收信 MX · ${domain}`, ok: true, warn: true, detail: `这次没能查询（${mx.error}），无法确认；稍后刷新再看` }
+        : { name: `收信 MX · ${domain}`, ok: mxOk, detail: mxOk ? mx.answers.join(', ') : '未发现 Cloudflare 邮件路由 MX（收信可能尚未生效）' }
+    );
 
     // Resend's sending SPF also needs an MX at `send` pointing at Amazon SES. If it is missing, Resend marks the whole
     // domain unverified and rejects every send ("domain is not verified") — so this must be checked, not just the TXT.
     const sendMx = await resolvePublicDns(`send.${domain}`, 'MX');
-    const sendMxOk = sendMx.some((d) => /amazonses\.com/i.test(d));
-    items.push({
-      name: `发信 MX · ${domain}`,
-      ok: sendMxOk,
-      detail: sendMxOk ? sendMx.join(', ') : `未发现 send.${domain} 的 MX（Resend 会判定域名未验证，无法发信）`,
-    });
+    const sendMxOk = sendMx.answers.some((d) => /amazonses\.com/i.test(d));
+    items.push(
+      sendMx.error
+        ? { name: `发信 MX · ${domain}`, ok: true, warn: true, detail: `这次没能查询（${sendMx.error}），无法确认；稍后刷新再看` }
+        : {
+            name: `发信 MX · ${domain}`,
+            ok: sendMxOk,
+            detail: sendMxOk ? sendMx.answers.join(', ') : `未发现 send.${domain} 的 MX（Resend 会判定域名未验证，无法发信）`,
+          }
+    );
 
     const dkim = await resolvePublicDns(`resend._domainkey.${domain}`, 'TXT');
-    items.push({ name: `DKIM · ${domain}`, ok: dkim.length > 0, detail: dkim.length ? '已生效' : `未发现 resend._domainkey.${domain}（可能仍在传播中）` });
+    items.push(
+      dkim.error
+        ? { name: `DKIM · ${domain}`, ok: true, warn: true, detail: `这次没能查询（${dkim.error}），无法确认；稍后刷新再看` }
+        : { name: `DKIM · ${domain}`, ok: dkim.answers.length > 0, detail: dkim.answers.length ? '已生效' : `未发现 resend._domainkey.${domain}（可能仍在传播中）` }
+    );
 
     const spf = await resolvePublicDns(`send.${domain}`, 'TXT');
-    items.push({ name: `SPF · ${domain}`, ok: spf.some((d) => /spf1/i.test(d)), detail: spf.length ? spf.join(', ') : `未发现 send.${domain} 的 SPF` });
+    const spfOk = spf.answers.some((d) => /spf1/i.test(d));
+    items.push(
+      spf.error
+        ? { name: `SPF · ${domain}`, ok: true, warn: true, detail: `这次没能查询（${spf.error}），无法确认；稍后刷新再看` }
+        : { name: `SPF · ${domain}`, ok: spfOk, detail: spf.answers.length ? spf.answers.join(', ') : `未发现 send.${domain} 的 SPF` }
+    );
 
     const dmarc = await resolvePublicDns(`_dmarc.${domain}`, 'TXT');
     // DMARC is advisory: a missing record does not stop mail from being sent or received, so it must not read as a
     // failure (a red row while everything else is fine makes a healthy domain look broken).
-    items.push({
-      name: `DMARC · ${domain}`,
-      ok: true,
-      warn: dmarc.length === 0,
-      detail: dmarc.length ? dmarc.join(', ') : `未发现 _dmarc（可选，建议补一条 TXT：v=DMARC1; p=none;）`,
-    });
+    items.push(
+      dmarc.error
+        ? { name: `DMARC · ${domain}`, ok: true, warn: true, detail: `这次没能查询（${dmarc.error}），无法确认；稍后刷新再看` }
+        : {
+            name: `DMARC · ${domain}`,
+            ok: true,
+            warn: dmarc.answers.length === 0,
+            detail: dmarc.answers.length ? dmarc.answers.join(', ') : `未发现 _dmarc（可选，建议补一条 TXT：v=DMARC1; p=none;）`,
+          }
+    );
   }
 
   const perDomainConfig: Record<string, { key_source: 'domain' | 'env' | 'none'; key_masked: string; from_address: string }> = {};

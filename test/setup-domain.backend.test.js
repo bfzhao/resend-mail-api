@@ -178,7 +178,7 @@ const RESEND_KEY = 're_totally_secret_key';
       dnsRecords.push(rec);
       return jsonRes({ success: true, result: rec });
     }
-    if (u === 'https://api.resend.com/domains' && method === 'POST') {
+    if (u.split('?')[0] === 'https://api.resend.com/domains' && method === 'POST') {
       const nm = body.name;
       const id = nm === 'second.com' ? 'dom2' : 'dom1';
       return jsonRes({
@@ -196,7 +196,7 @@ const RESEND_KEY = 're_totally_secret_key';
     const gd = /^https:\/\/api\.resend\.com\/domains\/(dom\d+)$/.exec(u);
     if (gd) return jsonRes({ id: gd[1], name: gd[1] === 'dom2' ? 'second.com' : 'example.com', status: 'pending' });
     // GET /domains — the self-check asks with the key that actually sends "which of my domains does Resend see as verified".
-    if (u === 'https://api.resend.com/domains' && method === 'GET') {
+    if (u.split('?')[0] === 'https://api.resend.com/domains' && method === 'GET') {
       return jsonRes({
         data: [
           { id: 'dom1', name: 'example.com', status: 'verified' },
