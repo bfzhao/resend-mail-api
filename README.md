@@ -1,12 +1,12 @@
-# Resend Mail Inbox (Cloudflare Worker + D1 + R2)
+# Zero cost multi-domain Mailer
 
-Collect mail for your own domain into a **self-hosted** web inbox:
+Collect mail for your own domains into a **self-hosted** web inbox:
 
-- **Inbound**: Cloudflare Email Routing receives mail → the Worker stores the raw `.eml` in R2 + records it in D1 (body/metadata), parses it asynchronously, and **never loses mail**.
-- **Outbound**: send / reply through [Resend](https://resend.com) (HTML + attachments supported).
+- **Inbound**: Cloudflare Email Routing receives mail and **never loses mail**.
+- **Outbound**: send through [Resend](https://resend.com) (HTML + attachments supported).
 - **Web UI**: a simplified Gmail-style interface with read / unread / star / delete (trash) / compose / reply / multi-address switching / search.
 
-All data lives in **your own** Cloudflare account (D1 / R2 / Queue), and the Resend key is stored only in your own D1 — no secrets leave your account.
+All data lives in **your own** Cloudflare account (D1 / R2 / Queue), and the Resend key is stored in your own D1 — no secrets leave your account.
 
 ---
 
@@ -27,8 +27,8 @@ All data lives in **your own** Cloudflare account (D1 / R2 / Queue), and the Res
 
 1. Open the URL Cloudflare gives you: `https://<your-worker>.<subdomain>.workers.dev`
 2. The first visit opens the setup wizard:
-   - **Step 1 · Set up admin**: choose a username and password (used to sign in afterwards; you can also use the `API_USERNAME` / `API_PASSWORD` env vars for Basic Auth).
-   - **Step 2 · Connect your domain**: enter the domain + Cloudflare API Token + Resend API Key + from-address.
+   - **Step 1 · Set up admin**: choose a username and password (used to sign in afterwards).
+   - **Step 2 · Connect your domain**: enter the domain + Cloudflare API Token + Resend API Key.
      Clicking "Start setup" then automatically: finds the zone → enables Email Routing and points catch-all at this Worker → creates the sending domain in Resend → writes DKIM/SPF/DMARC into your DNS → triggers Resend verification.
 3. Done — you can now receive, compose, and reply.
 
@@ -38,8 +38,6 @@ All data lives in **your own** Cloudflare account (D1 / R2 / Queue), and the Res
 - **One manual click**: `Zone → Email Routing Rules → Edit` (Cloudflare does not allow pre-selecting this one from a link; the wizard tells you to use "+ Add more")
 - `Zone Resources` defaults to All zones — change it to `Include → your domain` to authorise just that zone
 
-The link already carries the required `accountId` / `zoneId` parameters. The button stays **disabled until a domain is typed**; when the app already knows that domain's zone id (a domain it is already configured for), the token page opens **scoped to that exact zone** — otherwise use `Zone Resources → Include → <your domain>`.
-
 If the token lacks a permission, the wizard step says "this operation needs the xxx permission" instead of failing silently.
 
 **Resend API Key — Full access.** A sending-only key can send but cannot create / read / verify domains (`This API key is restricted to only send emails`).
@@ -47,11 +45,10 @@ If the token lacks a permission, the wizard step says "this operation needs the 
 | Setting | Where it lives / how to change it |
 |---|---|
 | Resend key | **Per domain** (`domains.resend_api_key`). There is **no global database key** — env `RESEND_API_KEY` is only the fallback, which is why two domains in two different Resend accounts both work |
-| Env vars on first run | **One-time bootstrap**: imported into D1 on the first request, after which the database wins (they can then be deleted). `API_USERNAME` / `API_PASSWORD` stay env-only |
 | Cloudflare token | Used once during setup, **never stored** |
 | Changing a key | No redeploy needed: click the **health marker** after the domain name → *Edit the sending key for* `<domain>` → *Save and re-check* |
 
-**The domain chip** · **✓ / ? / !** right after the name is the automatic check (✓ passed · ? not checked yet · ! problem — click it for that domain's tables and key settings) · the number in the top-right corner is that domain's unread mail (`99+` above 99, hidden at zero).
+**The domain chip** · **✓ / ? / !** right after the name is the automatic check (✓ passed · ? not checked yet · ! problem — click it for that domain's tables and key settings)
 
 The check runs **by itself** (on page load, then at most every 30 minutes): using the key that actually sends, it reads the domain's Resend status and then verifies MX / DKIM / SPF / DMARC over public DNS (no token needed).
 
@@ -74,7 +71,7 @@ npm run db:migrate:local
 npm run dev            # http://localhost:8787
 ```
 
-> `RESEND_API_KEY` / `SEND_FROM_ADDRESS` in `.dev.vars` are **bootstrap only**: they are imported into the local D1 on the
+> `RESEND_API_KEY` in `.dev.vars` are **bootstrap only**: they are imported into the local D1 on the
 > first request, after which D1 wins (edit them in-app from the domain chip: health marker → Edit the sending key). `API_USERNAME` / `API_PASSWORD` stay env-only.
 
 To self-host on your own Cloudflare account, use the **local config file** (gitignored, never made public):
@@ -146,27 +143,6 @@ wrangler.toml      Deploy Button template config
 wrangler.local.toml self-host config (gitignored)
 ```
 
-## API
-
-| Method | Path | Description |
-|---|---|---|
-| GET | `/health` | Health check |
-| GET/POST | `/api/setup/status` `/api/setup/admin` `/api/setup/domain` `/api/setup/check` | Setup wizard / self-check (check = per-domain Resend status with the sending key + DNS records) |
-| POST | `/api/login` `/api/logout` | Session sign-in / sign-out |
-| POST | `/webhook/inbound` | Resend Inbound receipt (optional; signature verification + idempotency) |
-| POST | `/webhook/events` | Resend delivery events (optional; updates sent status) |
-| GET | `/api/folders/:folder` | List; folder ∈ `inbox/sent/starred/trash`; params `q`, `unread=1`, `mailbox`, `limit/offset` |
-| GET | `/api/counts` | Sidebar unread / total counts (optionally per `mailbox`) |
-| GET | `/api/mailboxes` | List of receiving addresses with their unread counts |
-| GET | `/api/account` | Sending capability and sender info |
-| POST | `/api/settings/send` | Update the sending config stored in D1 (`{domain?, resend_key?, from_address?, from_name?}`): a Resend key always needs `domain` (keys are bound per domain); without `domain` only the global default sender is changed. The key is verified against Resend first |
-| GET | `/api/messages/:id` | Detail + attachments + `thread` (conversation context) |
-| PATCH | `/api/messages/:id` | `{read?, starred?, deleted?}` |
-| POST | `/api/messages/batch` | `{ids, action}`, action ∈ `read/unread/star/unstar/trash/restore/delete` |
-| POST | `/api/messages` | Compose `{to, cc?, subject, body?, html?, mailbox?, attachments?}` |
-| POST | `/api/messages/:id/reply` | Reply |
-| GET | `/api/attachments/:id` | Attachment proxy: images inline, everything else forced download |
-
 ## Security
 
 - Inbound HTML bodies are sanitized with a front-end allowlist before rendering; the attachment proxy sends non-images with `Content-Disposition: attachment` + `X-Content-Type-Options: nosniff`.
@@ -174,58 +150,11 @@ wrangler.local.toml self-host config (gitignored)
 - Webhooks verify a 5-minute timestamp window; `webhook_deliveries` provides idempotency.
 - In production, configure via env vars / the wizard; never put secrets in `wrangler.toml`.
 
-## Troubleshooting
-
-### Sending fails with `The <domain> domain is not verified` even though Resend's dashboard shows it verified
-
-That error comes from the **API key used for sending**, not from DNS: the key cannot use that domain. The usual causes, in order:
-
-1. **Different Team / account** — the key that serves this domain belongs to another Resend team than the dashboard you are looking at. A domain sends with **its own** key (`domains.resend_api_key`, falling back only to env `RESEND_API_KEY`), so two domains in two Resend accounts each need their own key: **health marker → Edit the sending key**.
-2. **Domain-restricted sending key** — a `Sending access` key limited to another domain may only send from that domain.
-3. **Subdomain ≠ root domain** — verifying `mail.example.com` does not allow sending from `@example.com` (and vice versa).
-4. **A stale copy is still around** — the key used for this domain is not the one you think (for example an env var that still holds the old key). The health panel names the source per domain (`Sending key · <domain>`: bound to domain / environment fallback, plus the masked key), so you can see exactly which key is in play.
-
-Check all of it in one place: click the **health marker** after a domain's name (it also refreshes automatically, at most every 30 minutes), or call `GET /api/setup/check` directly. The panel describes **one domain only**, split into two tables — *Sending (Resend)* and *Receiving (Cloudflare Email Routing)* — and it queries `GET https://api.resend.com/domains` **with the key that actually sends**:
-
-| Sending (Resend) table row | Meaning |
-|---|---|
-| `Sending key` ✓ bound to domain | this domain uses its own key (`re_***`) — what you want when two domains live in two Resend accounts |
-| `Sending key` ✓ environment fallback | no key is bound to this domain, so env `RESEND_API_KEY` is used — bind a key to make it independent |
-| `Sending key` ✕ | no key at all → nothing can be sent from this domain (bind one right below the tables) |
-| `Resend` ✓ verified | this key can send from this domain |
-| `Resend` ✕ not listed | the key cannot see the domain → wrong Team or a restricted key (DNS is irrelevant) |
-| `Resend` ✕ status ≠ verified | the domain really is still pending in Resend — wait for DNS, then re-check |
-| `Sending MX` / `DKIM` / `SPF` | Resend sending records (`send.<domain>` MX + TXT, `resend._domainkey`) |
-| `DMARC` `!` | advisory only — a missing `_dmarc` never turns the health marker red |
-
-| Receiving (Cloudflare Email Routing) table row | Meaning |
-|---|---|
-| `Receiving MX` | `mx.cloudflare.net` records — required for inbound mail |
-
-Found a wrong key? Fix it right there: **health marker → Edit the sending key for <domain> → Save and re-check**. The new key is verified
-against Resend *before* it is stored (a typo never replaces a working key), and the panel re-runs immediately. Same thing over
-HTTP: `POST /api/settings/send {domain, resend_key}` — a key always needs `domain`; `from_address` / `from_name` still set the
-**global default sender** for API callers, but the UI no longer asks for them because the sender is chosen when you compose.
-
-### `This API key is restricted to only send emails`
-
-The key is `Sending access`. Creating / reading / verifying domains needs a **Full access** key (Resend → API Keys). After
-that, run the in-app **＋ Domain** flow again (or wait for the next automatic check / click the health marker to confirm the new key can see the domains).
-
-### Mail is not arriving
-
-In the health panel's **Receiving** table → `Receiving MX` must show a `mx.cloudflare.net` record. If it is missing, Email Routing is not enabled for
-that zone (re-run the wizard, or enable it in the Cloudflare dashboard).
-
 ## Known limitations
 
 - Cloudflare Email Routing enforces a 25 MiB inbound limit (larger mail is rejected), so practical attachment size is ~18–19 MB.
-- The list is flat per message (thread aggregation lives inside the detail view; **the Sent folder is never grouped** — one row per message). Drafts are a global list, never narrowed by the "all mailboxes / domain" filters.
-- Every domain has its own colour from a fixed eight-colour palette: the **chip background** carries it (light while the filter is off, solid while it is on) and the same hue tints the rows of mail sent from / received at that domain. Nothing to configure.
-- The domain chips are a **filter**, not a shortcut: with no domain ticked the list is empty (the empty state says so); ticking none never means "all domains".
 - Replies don't quote inline images, only plain-text quoting.
 - Single admin account only.
-- The UI is **bilingual**: one click on the language toggle in the top bar switches between Chinese and English and the choice is remembered in the browser (localStorage). Only interface elements are translated — **mail content (subject, sender, body, attachment names) is always shown verbatim**; server-side diagnostic errors stay in Chinese.
 
 ## License
 
