@@ -392,6 +392,157 @@ export async function configureDomain(
   return { ok: steps.every((s) => s.ok), steps };
 }
 
+/* ---------------- Deleting a domain / resetting the configuration ---------------- */
+
+export interface DeleteDomainInput {
+  domain?: unknown;
+  /** Optional: the user pastes the token when they want the Cloudflare side cleaned too (it is never stored). */
+  cfToken?: unknown;
+  /** Delete the sending domain in Resend as well (uses the key bound to that domain). */
+  deleteResend?: unknown;
+  /** Delete this domain's messages, attachments (including the R2 objects) and raw inbound rows. */
+  purgeMessages?: unknown;
+}
+
+/**
+ * Remove one domain.
+ *
+ * What can happen **without** the Cloudflare token: the domain row is deleted, and (if asked) the Resend sending domain
+ * and/or the stored mail go too — the Resend key is stored per domain, so that half needs no extra input. The
+ * Cloudflare half (the DKIM/SPF/DMARC records the wizard created, and the custom domain) needs the token, so it is
+ * skipped with an explicit reason instead of pretending the cleanup is complete. The zone's Email Routing catch-all is
+ * never touched: it is zone-wide and may still serve other domains.
+ */
+export async function deleteDomainAndCleanup(
+  env: Env,
+  input: DeleteDomainInput
+): Promise<{ ok: boolean; steps: StepResult[]; error?: string }> {
+  const steps: StepResult[] = [];
+  const domain = normalizeDomain(input.domain);
+  if (!domain) return { ok: false, steps, error: '域名格式不正确' };
+
+  const rows = await repo.listDomains(env).catch(() => [] as repo.DomainRow[]);
+  const row = rows.find((r) => String(r.domain).trim().toLowerCase() === domain);
+  if (!row) return { ok: false, steps, error: `没有这个域名：${domain}` };
+
+  const cfToken = typeof input.cfToken === 'string' ? input.cfToken.trim() : '';
+  const wantResend = input.deleteResend === true;
+  const wantPurge = input.purgeMessages === true;
+  const mailCount = await repo.countDomainMessages(env, domain).catch(() => 0);
+
+  // 1) Resend sending domain
+  const resendKey = String(row.resend_api_key ?? '').trim() || (env.RESEND_API_KEY || '').trim();
+  if (!wantResend) {
+    steps.push({ name: 'Resend 域名', ok: true, detail: '保留（未勾选删除）；resend.com 的 Domains 页仍会显示它' });
+  } else if (!resendKey) {
+    steps.push({ name: 'Resend 域名', ok: false, detail: '这个域没有绑定 Resend Key（环境变量里也没有），无法删除——请到 Resend 控制台手动删除' });
+  } else if (!row.resend_domain_id) {
+    steps.push({ name: 'Resend 域名', ok: false, detail: '没有记录 Resend 域名 id（该域是手工在 Resend 里验证的），请到 Resend 控制台手动删除' });
+  } else {
+    try {
+      await rd.deleteResendDomain(resendKey, row.resend_domain_id);
+      steps.push({ name: 'Resend 域名', ok: true, detail: '已在 Resend 里删除该发送域' });
+    } catch (e) {
+      steps.push({ name: 'Resend 域名', ok: false, detail: `删除失败：${(e as Error).message}` });
+    }
+  }
+
+  // 2) Cloudflare DNS records + custom domain (needs the token)
+  if (!cfToken) {
+    steps.push({
+      name: 'Cloudflare DNS',
+      ok: true,
+      warn: true,
+      detail:
+        '未提供 Cloudflare Token，跳过。想清理就重新删除并粘贴 Token（需要 DNS → Edit、Workers Routes → Edit），' +
+        `或到控制台手动删除 resend._domainkey.${domain} / send.${domain} 的 MX+TXT / _dmarc.${domain}`,
+    });
+  } else if (!row.zone_id) {
+    steps.push({ name: 'Cloudflare DNS', ok: false, detail: '没有记录该域的 zone id，无法自动清理 DNS 记录；请在控制台手动删除发送认证记录' });
+  } else {
+    try {
+      const removed = await cf.deleteSendingDnsRecords(cfToken, row.zone_id, domain);
+      steps.push({
+        name: 'Cloudflare DNS',
+        ok: true,
+        detail:
+          `已删除 ${removed} 条发送认证记录（DKIM / SPF / DMARC）。` +
+          '该域的收信路由（zone 级 catch-all）未改动——若其它域还要用它，保持原样即可。',
+      });
+      if (row.app_host) {
+        try {
+          const accountId = await cf.getZoneAccountId(cfToken, row.zone_id);
+          if (!accountId) throw new Error('无法确定账号 id（Token 缺少 Zone → Read？）');
+          const detached = await cf.detachWorkerCustomDomain(cfToken, accountId, String(row.app_host));
+          steps.push({
+            name: '访问域名',
+            ok: true,
+            detail: detached.removed ? `已解绑 ${row.app_host}` : `${row.app_host} 未绑定到本 Worker，无需解绑`,
+          });
+        } catch (e) {
+          steps.push({ name: '访问域名', ok: false, detail: `解绑失败：${(e as Error).message}` });
+        }
+      }
+    } catch (e) {
+      steps.push({ name: 'Cloudflare DNS', ok: false, detail: `清理失败：${(e as Error).message}` });
+    }
+  }
+
+  // 3) the row itself
+  const removed = await repo.deleteDomain(env, domain).catch(() => false);
+  steps.push({
+    name: '域名配置',
+    ok: removed,
+    detail: removed ? '已从本站删除该域名（不再出现在域名列表 / 发件人里）' : '删除失败：数据库里没有删掉这一行',
+  });
+
+  // 4) stored mail
+  if (!wantPurge) {
+    steps.push({ name: '邮件数据', ok: true, detail: `保留 ${mailCount} 封历史邮件（可在删除时勾选一并删除）` });
+  } else {
+    try {
+      const purged = await repo.purgeDomainData(env, domain);
+      steps.push({
+        name: '邮件数据',
+        ok: true,
+        detail: `已删除 ${purged.messages} 封邮件、${purged.attachments} 个附件记录（R2 对象 ${purged.objects} 个）、${purged.raws} 条原始件索引`,
+      });
+    } catch (e) {
+      steps.push({ name: '邮件数据', ok: false, detail: `清理失败：${(e as Error).message}` });
+    }
+  }
+
+  // A failed "keep" step is not a failure: the domain is gone either way. Only hard errors count.
+  return { ok: steps.every((s) => s.ok || s.warn), steps };
+}
+
+/** Remove every domain + the domain-scoped config (the admin account and session secret are kept). */
+export async function resetConfiguration(
+  env: Env,
+  input: { confirm?: unknown; purgeMessages?: unknown }
+): Promise<{ ok: boolean; steps: StepResult[]; error?: string }> {
+  if (input.confirm !== 'reset') return { ok: false, steps: [], error: '请确认（confirm: "reset"）' };
+  const steps: StepResult[] = [];
+  const rows = await repo.listDomains(env).catch(() => [] as repo.DomainRow[]);
+  if (input.purgeMessages === true) {
+    let messages = 0;
+    let objects = 0;
+    for (const r of rows) {
+      const purged = await repo.purgeDomainData(env, r.domain).catch(() => null);
+      if (purged) {
+        messages += purged.messages;
+        objects += purged.objects;
+      }
+    }
+    steps.push({ name: '邮件数据', ok: true, detail: `已删除 ${messages} 封邮件、${objects} 个 R2 对象` });
+  } else {
+    steps.push({ name: '邮件数据', ok: true, detail: '保留所有历史邮件（它们不再出现在任何域名下，但仍占存储）' });
+  }
+  const reset = await repo.resetConfig(env, { keepSession: true });
+  steps.push({ name: '配置', ok: true, detail: `已清空 ${reset.domains} 个域名与所有域名级配置（管理员账号保留）` });
+  return { ok: true, steps };
+}
+
 /* ---------------- Self-check ---------------- */
 
 interface DnsAnswer {

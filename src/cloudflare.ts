@@ -149,6 +149,47 @@ export async function listDnsRecords(token: string, zoneId: string, type: string
 }
 
 /** Idempotently write a DNS record: update if a same-name, same-type record exists, otherwise create. */
+/** Detach a Worker custom domain (the DNS record and certificate Cloudflare created for it go with it). */
+export async function detachWorkerCustomDomain(
+  token: string,
+  accountId: string,
+  hostname: string
+): Promise<{ removed: boolean }> {
+  const list = await listWorkerCustomDomains(token, accountId);
+  const hit = list.find((d) => String(d.hostname || '').toLowerCase() === hostname.toLowerCase());
+  if (!hit || !hit.id) return { removed: false };
+  await cfFetch(token, `/accounts/${encodeURIComponent(accountId)}/workers/domains/${encodeURIComponent(hit.id)}`, {
+    method: 'DELETE',
+  });
+  return { removed: true };
+}
+
+/** Delete the DNS records this wizard created for a domain (DKIM / SPF / DMARC). Returns how many were removed. */
+export async function deleteSendingDnsRecords(token: string, zoneId: string, domain: string): Promise<number> {
+  const wanted: Array<{ type: string; name: string }> = [
+    { type: 'TXT', name: `resend._domainkey.${domain}` },
+    { type: 'MX', name: `send.${domain}` },
+    { type: 'TXT', name: `send.${domain}` },
+    { type: 'TXT', name: `_dmarc.${domain}` },
+  ];
+  let removed = 0;
+  for (const w of wanted) {
+    const rows = await listDnsRecords(token, zoneId, w.type, w.name).catch(() => [] as CfDnsRecord[]);
+    for (const r of rows) {
+      if (String(r.name || '').toLowerCase() !== w.name) continue;
+      try {
+        await cfFetch(token, `/zones/${encodeURIComponent(zoneId)}/dns_records/${encodeURIComponent(r.id)}`, {
+          method: 'DELETE',
+        });
+        removed++;
+      } catch {
+        /* keep going: one stuck record must not block the rest */
+      }
+    }
+  }
+  return removed;
+}
+
 export async function upsertDnsRecord(
   token: string,
   zoneId: string,

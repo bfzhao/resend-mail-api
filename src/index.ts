@@ -4,7 +4,7 @@ import { hashPassword, verifyPassword, signSession, sessionCookie, clearSessionC
 import { handleInbound, handleEvents } from './webhook';
 import { handleInboundEmail, handleInboundQueue, replayPendingInbound } from './inbound-email';
 import * as repo from './repo';
-import { configureDomain, selfCheck, withRuntimeConfig } from './setup';
+import { deleteDomainAndCleanup, resetConfiguration, configureDomain, selfCheck, withRuntimeConfig } from './setup';
 import * as rd from './resend-domains';
 import { ensureSchema } from './schema';
 import { resendSend, replySubject, forwardSubject, textToHtml, senderIdentity, sendingDomain, sendingDomains } from './send';
@@ -96,6 +96,14 @@ async function routeGate(request: Request, env: Env, path: string): Promise<Resp
   if (path === '/api/setup/check' && method === 'GET') {
     if (!(await isAuthenticated(request, env))) return unauthorized();
     return json(await selfCheck(env));
+  }
+  // Start over: drop every domain + domain-scoped config (the admin account stays).
+  if (path === '/api/setup/reset' && method === 'POST') {
+    if (!(await isAuthenticated(request, env))) return unauthorized();
+    const body = (await request.json().catch(() => null)) as { confirm?: unknown; purge_messages?: unknown } | null;
+    if (!body) return json({ error: '参数错误' }, 400);
+    const result = await resetConfiguration(env, { confirm: body.confirm, purgeMessages: body.purge_messages === true });
+    return json(result, result.ok ? 200 : 400);
   }
   if (path === '/api/login' && method === 'POST') return login(request, env);
   if (path === '/api/logout' && method === 'POST') return logout();
@@ -310,6 +318,21 @@ async function routeApi(request: Request, env: Env, path: string, url: URL): Pro
   // Local contacts (recipient input suggestions for compose/reply/forward)
   if (path === '/api/contacts' && method === 'GET') {
     return json({ contacts: await repo.contacts(env) });
+  }
+
+  // Remove one domain (and, when asked, its Resend sending domain / stored mail / Cloudflare records).
+  if (path === '/api/domains/delete' && method === 'POST') {
+    const body = (await request.json().catch(() => null)) as
+      | { domain?: unknown; cf_token?: unknown; delete_resend?: unknown; purge_messages?: unknown }
+      | null;
+    if (!body) return json({ error: '参数错误' }, 400);
+    const result = await deleteDomainAndCleanup(env, {
+      domain: body.domain,
+      cfToken: body.cf_token,
+      deleteResend: body.delete_resend === true,
+      purgeMessages: body.purge_messages === true,
+    });
+    return json(result, result.ok ? 200 : 400);
   }
 
   // Sending settings (in-app editing). The key is **bound to a domain** (two domains may live in different Resend

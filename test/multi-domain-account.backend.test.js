@@ -148,6 +148,8 @@ const RESEND_KEY = 're_totally_secret_key';
 
   /* ---------------- external API stubs ---------------- */
   const dnsRecords = [];
+  /** Resend domain ids passed to DELETE /domains/:id (T14). */
+  const deletedResendDomains = [];
   /** Authorization headers of the real send calls (POST /emails), in order — proves which domain's key was used. */
   const sentAuth = [];
   const jsonRes = (obj, status = 200) => new Response(JSON.stringify(obj), { status, headers: { 'content-type': 'application/json' } });
@@ -176,6 +178,12 @@ const RESEND_KEY = 're_totally_secret_key';
       dnsRecords.push(rec);
       return jsonRes({ success: true, result: rec });
     }
+    if (/\/zones\/zone-1\/dns_records\/[^/]+$/.test(u) && method === 'DELETE') {
+      const id = u.split('/').pop();
+      const i = dnsRecords.findIndex((r) => r.id === id);
+      if (i >= 0) dnsRecords.splice(i, 1);
+      return jsonRes({ success: true, result: { id } });
+    }
     if (/\/zones\/zone-1\/dns_records\/[^/]+$/.test(u) && method === 'PUT') {
       const id = u.split('/').pop();
       const i = dnsRecords.findIndex((r) => r.id === id);
@@ -193,6 +201,11 @@ const RESEND_KEY = 're_totally_secret_key';
           { record: 'DMARC', name: '_dmarc', type: 'TXT', value: 'v=DMARC1; p=none;', ttl: 'Auto' },
         ],
       });
+    }
+    const delDom = /^https:\/\/api\.resend\.com\/domains\/([^/]+)$/.exec(u);
+    if (delDom && method === 'DELETE') {
+      deletedResendDomains.push(delDom[1]);
+      return jsonRes({ id: delDom[1], deleted: true });
     }
     const vf = /^https:\/\/api\.resend\.com\/domains\/([^/]+)\/verify$/.exec(u);
     if (vf && method === 'POST') return jsonRes({ id: vf[1] });
@@ -534,6 +547,44 @@ const RESEND_KEY = 're_totally_secret_key';
   chk = (await call('GET', '/api/setup/check', undefined, cookie)).json;
   const resendOkRow = (chk.items || []).find((i) => i.name === 'Resend · old.com') || {};
   ok(resendOkRow.ok === true && !resendOkRow.warn, '恢复后重新变回正常', JSON.stringify(resendOkRow));
+
+  section('T14 删除域名 / 清空配置');
+  // third.com 还在（T12 删过 old/new 之外的第三个域？这里重新建一个独立域，避免影响前面的断言）
+  db.run("INSERT INTO domains (domain, zone_id, resend_domain_id, resend_api_key, from_address, from_name, worker_name, enabled, created_at, updated_at) VALUES ('gone.com','zone-1','dom-gone','re_gone_key','hi@gone.com','', 'resend-mail-api', 1, 1792000000, 1792000000)");
+  db.run("INSERT INTO messages (id, direction, mailbox, mailbox_domain, from_email, to_emails, subject, received_at, status, read, starred, deleted, created_at, updated_at) VALUES ('msg-gone','inbound','hi@gone.com','gone.com','a@b.com','[\"hi@gone.com\"]','hello',1792000001,'received',0,0,0,1792000001,1792000001)");
+  let del = await call('POST', '/api/domains/delete', { domain: 'gone.com', delete_resend: true }, cookie);
+  ok(del.status === 200 && del.json && del.json.ok === true, '删除成功', JSON.stringify(del.json && del.json.steps && del.json.steps.map((x) => [x.name, x.ok])));
+  ok(!db.query("SELECT domain FROM domains WHERE domain='gone.com'").length, '⭐ 域名行已删除');
+  ok(deletedResendDomains.includes('dom-gone'), '⭐ 用该域绑定的 Key 删掉了 Resend 域名', JSON.stringify(deletedResendDomains));
+  const keptMail = db.query("SELECT id FROM messages WHERE id='msg-gone'");
+  ok(keptMail.length === 1, '⭐ 默认保留历史邮件（需显式勾选才删）');
+  const cfSkipped = (del.json.steps || []).find((x) => x.name === 'Cloudflare DNS') || {};
+  ok(cfSkipped.warn === true && /未提供 Cloudflare Token/.test(cfSkipped.detail || ''),
+    '⭐ 没有 Token 时明确说明跳过 + 手动清理指引', (cfSkipped.detail || '').slice(0, 60));
+
+  // 带 Token：清理 DNS 记录；并且勾选删除历史邮件
+  dnsRecords.length = 0;
+  dnsRecords.push({ id: 'dns-dkim', name: 'resend._domainkey.gone2.com', type: 'TXT', content: 'p=x' });
+  dnsRecords.push({ id: 'dns-spf', name: 'send.gone2.com', type: 'TXT', content: 'v=spf1' });
+  db.run("INSERT INTO domains (domain, zone_id, resend_domain_id, resend_api_key, from_address, from_name, worker_name, enabled, created_at, updated_at) VALUES ('gone2.com','zone-1','dom-gone2','re_gone2_key','hi@gone2.com','', 'resend-mail-api', 1, 1792000010, 1792000010)");
+  db.run("INSERT INTO messages (id, direction, mailbox, mailbox_domain, from_email, to_emails, subject, received_at, status, read, starred, deleted, created_at, updated_at) VALUES ('msg-gone2','inbound','hi@gone2.com','gone2.com','a@b.com','[\"hi@gone2.com\"]','hello2',1792000011,'received',0,0,0,1792000011,1792000011)");
+  del = await call('POST', '/api/domains/delete', { domain: 'gone2.com', cf_token: 'cf-secret-token-xyz', delete_resend: false, purge_messages: true }, cookie);
+  ok(del.status === 200 && del.json && del.json.ok === true, '带 Token + 删邮件也成功', JSON.stringify((del.json.steps || []).map((x) => [x.name, x.ok])));
+  const dnsStep = (del.json.steps || []).find((x) => x.name === 'Cloudflare DNS') || {};
+  ok(dnsStep.ok === true && /已删除 2 条/.test(dnsStep.detail || ''), '⭐ 删掉了 2 条发送认证记录', dnsStep.detail);
+  ok(dnsRecords.length === 0, 'DNS 记录确实被删除');
+  const mailStep = (del.json.steps || []).find((x) => x.name === '邮件数据') || {};
+  ok(/已删除 1 封/.test(mailStep.detail || ''), '⭐ 勾选后历史邮件被删除', mailStep.detail);
+  ok(!db.query("SELECT id FROM messages WHERE id='msg-gone2'").length, '邮件行已删除');
+
+  // 清空配置
+  let reset = await call('POST', '/api/setup/reset', { confirm: 'reset' }, cookie);
+  ok(reset.status === 200 && reset.json && reset.json.ok === true, '重置成功', reset.status);
+  ok(db.query('SELECT domain FROM domains').length === 0, '⭐ domains 表清空');
+  const cfgLeft = db.query('SELECT key FROM app_config ORDER BY key').map((r) => r.key).join(',');
+  ok(cfgLeft === 'session_secret', '⭐ app_config 只留 session_secret（管理员/登录不受影响）', cfgLeft);
+  const after = await call('GET', '/api/setup/status', undefined, cookie);
+  ok(after.json && after.json.authenticated === true, '重置后当前会话仍然有效', JSON.stringify(after.json && after.json.authenticated));
 
   console.log(`\n===== 结果: ${pass} passed, ${failures.length} failed =====`);
   if (failures.length) console.log(`失败项：\n- ${failures.join('\n- ')}`);

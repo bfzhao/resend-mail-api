@@ -4763,6 +4763,17 @@ async function showDomainCheck(domain) {
           <input id="set-key" type="password" value="" placeholder="re_…" autocomplete="off" /></label>
         <div class="gate-actions"><button class="btn btn-primary" id="set-save" type="button">保存并重新检查</button></div>
       </details>
+      ${only ? `<details class="gate-edit" id="gate-delete">
+        <summary>删除这个域名（${esc(only)}）</summary>
+        <div class="gate-field"><span>同时删除 Resend 里的发送域（用该域绑定的 Key，不需要额外输入）</span>
+          <label class="row"><input id="del-resend" type="checkbox" checked /> 删除 Resend 域名</label></div>
+        <div class="gate-field"><span>同时删除该域的历史邮件（含附件与 R2 原始件）</span>
+          <label class="row"><input id="del-mail" type="checkbox" /> 删除历史邮件</label></div>
+        <div class="gate-field"><span>想一并清理 Cloudflare 的 DKIM/SPF/DMARC 记录与访问域名？粘贴 Token（不保存，可留空）</span>
+          <input id="del-cf" type="password" placeholder="留空则只在控制台手动清理" autocomplete="off" /></div>
+        <div class="gate-actions"><button class="btn" id="del-run" type="button">确认删除</button></div>
+        <div class="cf-zone-hint">域名行会立即从本站删除；Cloudflare 的收信路由（zone 级 catch-all）不会改动。</div>
+      </details>` : ''}
       <div class="gate-actions">
         <button class="btn" id="gate-close" type="button">关闭</button>
         <button class="btn btn-primary" id="gate-rerun" type="button">重新检查</button>
@@ -4808,6 +4819,38 @@ async function showDomainCheck(domain) {
     applyDomainHealth(r.data); // keep the corner badges in sync with what the panel just showed
     if (!prefilled) { applyConfig(r.data.config); prefilled = true; }
   };
+  const delBtn = $('#del-run');
+  if (delBtn) delBtn.addEventListener('click', async () => {
+    if (!delBtn.isConnected) return;
+    err.textContent = '';
+    delBtn.disabled = true;
+    const r = await probe('/api/domains/delete', {
+      method: 'POST',
+      body: JSON.stringify({
+        domain: only,
+        delete_resend: $('#del-resend') ? $('#del-resend').checked : false,
+        purge_messages: $('#del-mail') ? $('#del-mail').checked : false,
+        cf_token: $('#del-cf') ? $('#del-cf').value.trim() : '',
+      }),
+    });
+    delBtn.disabled = false;
+    const data = (r && r.data) || {};
+    if (data.steps) renderSteps(data.steps);
+    if (r && r.res && r.res.ok && data.ok) {
+      const mail = (data.steps || []).find((s) => s.name === '邮件数据');
+      showToast(only + ' 已删除' + (mail && /保留/.test(mail.detail) ? '（历史邮件保留）' : ''));
+      hideGate();
+      await loadAccount();
+      state.cache.mailboxesAt = 0;
+      state.cache.countsAt = 0;
+      void loadMailboxes(true);
+      void refreshCounts(true);
+      void refreshDomainHealth(true);
+    } else {
+      err.textContent = (data && data.error) || '删除未完成，请看上面的步骤';
+    }
+  });
+
   $('#set-save').addEventListener('click', async () => {
     const saveBtn = $('#set-save');
     err.textContent = '';

@@ -709,6 +709,109 @@ export async function upsertDomain(env: Env, d: DomainInput): Promise<void> {
   }
 }
 
+/** Drop one configured domain (the row only — messages are a separate decision, see purgeDomainData). */
+export async function deleteDomain(env: Env, domain: string): Promise<boolean> {
+  const d = String(domain || '').trim().toLowerCase();
+  if (!d) return false;
+  const r = await env.DB.prepare('DELETE FROM domains WHERE domain = ?').bind(d).run();
+  return Number((r.meta && r.meta.changes) || 0) > 0;
+}
+
+/** How many messages belong to a domain (single query: the compose/list views derive the same way). */
+export async function countDomainMessages(env: Env, domain: string): Promise<number> {
+  const d = String(domain || '').trim().toLowerCase();
+  if (!d) return 0;
+  const row = await env.DB.prepare(
+    'SELECT COUNT(*) AS n FROM messages WHERE mailbox_domain = ? OR mailbox_domain IS NULL AND lower(trim(mailbox)) LIKE ?'
+  )
+    .bind(d, `%@${d}`)
+    .first<{ n: number }>();
+  return Number(row?.n || 0);
+}
+
+/**
+ * Delete every message of a domain, its attachment rows **and the objects in R2**, plus the raw inbound rows.
+ * Returns what was removed so the caller can report it instead of silently dropping storage.
+ */
+export async function purgeDomainData(
+  env: Env,
+  domain: string
+): Promise<{ messages: number; attachments: number; raws: number; objects: number }> {
+  const d = String(domain || '').trim().toLowerCase();
+  if (!d) return { messages: 0, attachments: 0, raws: 0, objects: 0 };
+  const ids = (
+    await env.DB.prepare(
+      'SELECT id FROM messages WHERE mailbox_domain = ? OR (mailbox_domain IS NULL AND lower(trim(mailbox)) LIKE ?)'
+    )
+      .bind(d, `%@${d}`)
+      .all<{ id: string }>()
+  ).results || [];
+  const messageIds = ids.map((r) => r.id);
+  if (!messageIds.length) {
+    const rawsOnly = await purgeRaws(env, d);
+    return { messages: 0, attachments: 0, raws: rawsOnly.raws, objects: rawsOnly.objects };
+  }
+
+  const placeholders = messageIds.map(() => '?').join(', ');
+  const atts =
+    (await env.DB.prepare(`SELECT r2_key FROM attachments WHERE message_id IN (${placeholders})`)
+      .bind(...messageIds)
+      .all<{ r2_key: string }>()
+    ).results || [];
+
+  let objects = 0;
+  for (const a of atts) {
+    if (!a.r2_key) continue;
+    try {
+      await env.BUCKET.delete(a.r2_key);
+      objects++;
+    } catch {
+      /* a missing object must not abort the purge */
+    }
+  }
+  await env.DB.prepare(`DELETE FROM attachments WHERE message_id IN (${placeholders})`).bind(...messageIds).run();
+  await env.DB.prepare(`DELETE FROM delivery_events WHERE message_id IN (${placeholders})`).bind(...messageIds).run();
+  await env.DB.prepare(`DELETE FROM messages WHERE id IN (${placeholders})`).bind(...messageIds).run();
+  const raws = await purgeRaws(env, d);
+  return { messages: messageIds.length, attachments: atts.length, raws: raws.raws, objects: objects + raws.objects };
+}
+
+/** Raw .eml rows whose envelope recipient is on the domain (the "never lose" index), with their R2 objects. */
+async function purgeRaws(env: Env, domain: string): Promise<{ raws: number; objects: number }> {
+  const rows =
+    (await env.DB.prepare(`SELECT id, r2_key FROM inbound_raw WHERE lower(substr(to_email, instr(to_email, '@') + 1)) = ?`)
+      .bind(domain)
+      .all<{ id: string; r2_key: string }>()).results || [];
+  let objects = 0;
+  for (const r of rows) {
+    if (!r.r2_key) continue;
+    try {
+      await env.BUCKET.delete(r.r2_key);
+      objects++;
+    } catch {
+      /* ignore */
+    }
+  }
+  if (rows.length) {
+    const ph = rows.map(() => '?').join(', ');
+    await env.DB.prepare(`DELETE FROM inbound_raw WHERE id IN (${ph})`).bind(...rows.map((r) => r.id)).run();
+  }
+  return { raws: rows.length, objects };
+}
+
+/** Delete every domain row and the domain-scoped config (installation state is kept unless asked otherwise). */
+export async function resetConfig(env: Env, opts: { keepSession?: boolean } = {}): Promise<{ domains: number }> {
+  const before = Number((await env.DB.prepare('SELECT COUNT(*) AS n FROM domains').first<{ n: number }>())?.n || 0);
+  await env.DB.prepare('DELETE FROM domains').run();
+  const keep = opts.keepSession === false ? [] : ['session_secret'];
+  if (keep.length) {
+    await env.DB.prepare(`DELETE FROM app_config WHERE key NOT IN (${keep.map(() => '?').join(', ')})`).bind(...keep).run();
+  } else {
+    await env.DB.prepare('DELETE FROM app_config').run();
+  }
+  return { domains: before };
+}
+
 export interface ContactRow {
   name: string | null;
   email: string;

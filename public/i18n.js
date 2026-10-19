@@ -117,6 +117,18 @@
   '若填了「访问域名」，再加一项：Workers Routes → Edit（绑自定义域名用）。':
     'If you fill in the access hostname, add one more: Workers Routes → Edit (for the custom domain).',
   '访问域名': 'Access hostname',
+  '删除这个域名（{d}）': 'Delete this domain ({d})',
+  '同时删除 Resend 里的发送域（用该域绑定的 Key，不需要额外输入）':
+    'Also delete the sending domain in Resend (uses the key bound to it, no extra input needed)',
+  '删除 Resend 域名': 'Delete the Resend domain',
+  '同时删除该域的历史邮件（含附件与 R2 原始件）': 'Also delete this domain\'s mail (attachments and raw originals in R2)',
+  '删除历史邮件': 'Delete the stored mail',
+  '想一并清理 Cloudflare 的 DKIM/SPF/DMARC 记录与访问域名？粘贴 Token（不保存，可留空）':
+    'Also clean up the Cloudflare DKIM/SPF/DMARC records and the access hostname? Paste a token (not stored; optional)',
+  '留空则只在控制台手动清理': 'Leave empty to clean up manually in the dashboard',
+  '确认删除': 'Delete',
+  '域名行会立即从本站删除；Cloudflare 的收信路由（zone 级 catch-all）不会改动。':
+    'The domain row is removed from this app immediately; the zone-wide Email Routing catch-all is not changed.',
     '（内容加载失败，请用「下载」按钮保存后打开）': '(Could not load the content — use Download and open it locally)',
     '（随正文下载中…）': ' (downloading with the body…)',
     '会话 · {n} 封': 'Conversation · {n}',

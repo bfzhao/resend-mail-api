@@ -102,6 +102,11 @@ export async function verifyDomain(apiKey: string, id: string): Promise<void> {
   await resendFetch(apiKey, `/domains/${id}/verify`, { method: 'POST' });
 }
 
+/** Remove a domain from Resend (sending authentication). The Resend dashboard shows it under Domains. */
+export async function deleteResendDomain(apiKey: string, id: string): Promise<void> {
+  await resendFetch(apiKey, `/domains/${encodeURIComponent(id)}`, { method: 'DELETE' });
+}
+
 /** The `name` in a Resend record is a relative subdomain ('send' / 'resend._domainkey'); join it into a full FQDN. */
 export function fqdn(name: string, domain: string): string {
   const n = (name || '').trim();
