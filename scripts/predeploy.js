@@ -68,6 +68,22 @@ function setValue(toml, section, key, value) {
   return toml;
 }
 
+/**
+ * Write key/value pairs into a TOML section, **adding the section** when the file does not declare it.
+ * The Deploy Button template ships with the D1 / R2 blocks commented out (so its setup page shows no resource pickers),
+ * which means the guard has to create the blocks rather than edit existing lines.
+ */
+function upsertSection(toml, header, values) {
+  const exists = toml.split('\n').some((line) => line.trim() === header);
+  if (exists) {
+    let out = toml;
+    for (const [k, v] of Object.entries(values)) out = setValue(out, header, k, v);
+    return out;
+  }
+  const block = `\n${header}\n` + Object.entries(values).map(([k, v]) => `${k} = "${v}"`).join('\n') + '\n';
+  return toml.replace(/\s*$/, '\n') + block;
+}
+
 function workerName(toml) {
   return readValue(toml, '', 'name') || (/^name\s*=\s*"([^"]+)"/m.exec(toml) || [])[1] || '';
 }
@@ -136,6 +152,12 @@ function makeApi(token, accountId, fetchImpl) {
         bucketNames: bindings.filter((b) => b.type === 'r2_bucket').map((b) => b.bucket_name).filter(Boolean),
       };
     },
+    /** Every worker script in the account (used to detect "this resource already belongs to another deployment"). */
+    async listScripts() {
+      const r = await call('GET', '/workers/scripts');
+      if (!r.ok) return { error: (r.json && r.json.errors && r.json.errors[0] && r.json.errors[0].message) || `HTTP ${r.status}` };
+      return { list: (r.json.result || []).map((x) => x.id).filter(Boolean) };
+    },
     async listD1() {
       const r = await call('GET', '/d1/database?per_page=100');
       if (!r.ok) return { error: (r.json && r.json.errors && r.json.errors[0] && r.json.errors[0].message) || `HTTP ${r.status}` };
@@ -161,19 +183,21 @@ function makeApi(token, accountId, fetchImpl) {
 }
 
 /**
- * Decide (and if needed provision) the final D1 / R2 names + ids, then write them back into wrangler.toml.
+ * Resolve the D1 / R2 bindings, then write the result back into wrangler.toml.
  *
- * The rule follows the user's intent: **their input (the project name) decides the resource names.**
+ * The Deploy Button's setup page lets the user **pick an existing resource or create a new one**, and writes the resolved
+ * id (or bucket name) into the repository. So the guard's job is not to invent names — it is to make sure the deploy
+ * cannot silently end up sharing another deployment's data, and to fill in what the page could not.
  *
- *   1. The worker already has the binding  -> keep exactly that resource (it holds the mail; a renamed binding would
- *      silently point at an empty one).
- *   2. Otherwise the name comes from the project name: `<project>-db` / `<project>-bucket` — unless wrangler.toml
- *      carries an explicit name (anything other than the template default), which is honoured as a manual override.
- *   3. That name is free -> create it, write the name + id back.
- *      It already exists -> **stop**: it belongs to another deployment, and silently reusing it is exactly how a "test"
- *      deployment ended up writing into the production database.
+ * Priority:
+ *   1. A real id in the file  -> that is what the page resolved; use it.
+ *      · created moments ago            -> it was just created for this deployment.
+ *      · used by another worker         -> **stop** (this is the "test deployment wrote into production" case).
+ *      · not used by anyone             -> use it (an existing, unbound resource was picked on purpose).
+ *   2. No id (placeholder)    -> keep the resource this worker is already bound to, otherwise derive
+ *      "<project>-db" / "<project>-bucket" from the project name and create it when that name is free.
  *
- * Returns { toml, notes, conflicts } — a non-empty `conflicts` means the deploy must be aborted.
+ * Returns { toml, notes, conflicts }; a non-empty `conflicts` aborts the deploy.
  */
 async function resolveResources(toml, api, opts = {}) {
   const name = opts.workerName || workerName(toml);
@@ -181,50 +205,86 @@ async function resolveResources(toml, api, opts = {}) {
   const conflicts = [];
   const derived = derivedNames(name);
 
-  const fileD1Name = readValue(toml, '[[d1_databases]]', 'database_name');
-  const fileD1Id = readValue(toml, '[[d1_databases]]', 'database_id');
-  const fileBucket = readValue(toml, '[[r2_buckets]]', 'bucket_name');
-
-  // An explicit edit (anything that is not the template default) is a manual override.
-  const dbName = fileD1Name && fileD1Name !== TEMPLATE_DB ? fileD1Name : null;
-  const bucketName = fileBucket && fileBucket !== TEMPLATE_BUCKET ? fileBucket : null;
+  const d1Name = readValue(toml, '[[d1_databases]]', 'database_name');
+  const d1Id = readValue(toml, '[[d1_databases]]', 'database_id');
+  const bucketName = readValue(toml, '[[r2_buckets]]', 'bucket_name');
+  const hasRealId = Boolean(d1Id && d1Id !== '<DATABASE_ID>');
 
   const own = api ? await api.ownBindings(name) : { exists: false, d1Ids: [], bucketNames: [] };
-  if (own.error) notes.push(`could not read the existing worker bindings (${own.error}); assuming this is a new worker`);
+  if (own.error) notes.push(`could not read this worker's bindings (${own.error}); assuming none`);
   const boundDbId = (own.d1Ids || [])[0] || null;
   const boundBucket = (own.bucketNames || [])[0] || null;
+
+  /** Who else (besides this worker) already binds that database / bucket? */
+  const ownerOfD1 = async (id) => {
+    if (!api || !id) return null;
+    if ((own.d1Ids || []).includes(id)) return null; // ours
+    const scripts = await api.listScripts();
+    if (scripts.error) return { unknown: scripts.error };
+    for (const script of scripts.list.filter((x) => x !== name).slice(0, 15)) {
+      const b = await api.ownBindings(script).catch(() => null);
+      if (b && (b.d1Ids || []).includes(id)) return { script };
+    }
+    return null;
+  };
+  const ownerOfBucket = async (bucket) => {
+    if (!api || !bucket) return null;
+    if ((own.bucketNames || []).includes(bucket)) return null;
+    const scripts = await api.listScripts();
+    if (scripts.error) return { unknown: scripts.error };
+    for (const script of scripts.list.filter((x) => x !== name).slice(0, 15)) {
+      const b = await api.ownBindings(script).catch(() => null);
+      if (b && (b.bucketNames || []).includes(bucket)) return { script };
+    }
+    return null;
+  };
 
   /* ---------------- D1 ---------------- */
   if (api) {
     const listed = await api.listD1();
     if (listed.error) {
-      notes.push(`could not list D1 databases (${listed.error}); leaving the name in wrangler.toml untouched`);
+      notes.push(`could not list D1 databases (${listed.error}); leaving the binding untouched`);
     } else {
-      const bound = boundDbId ? listed.list.find((d) => d.id === boundDbId) : null;
-      const byFileId = fileD1Id && fileD1Id !== '<DATABASE_ID>' ? listed.list.find((d) => d.id === fileD1Id) : null;
-      const target = dbName || (bound ? bound.name : derived.db);
-      const existing = listed.list.find((d) => d.name === target);
-
-      if (bound) {
-        toml = setValue(toml, '[[d1_databases]]', 'database_name', bound.name);
-        toml = setValue(toml, '[[d1_databases]]', 'database_id', bound.id);
-        notes.push(`keeping the D1 database this worker is bound to: ${bound.name}`);
-      } else if (byFileId && byFileId.name === target && isFresh(byFileId.created)) {
-        toml = setValue(toml, '[[d1_databases]]', 'database_name', byFileId.name);
-        toml = setValue(toml, '[[d1_databases]]', 'database_id', byFileId.id);
-        notes.push(`using D1 ${byFileId.name} (provisioned for this deployment)`);
-      } else if (existing) {
+      const byFileId = hasRealId ? listed.list.find((d) => d.id === d1Id) : null;
+      if (hasRealId && !byFileId) {
         conflicts.push(
-          `D1 database "${target}" already exists and is not this worker's (it belongs to another deployment). ` +
-            `Cloudflare would bind it, which is how data gets mixed — rename your project (the resource names follow it) or delete that database.`
+          `wrangler.toml points at a D1 database id (${d1Id}) that does not exist in this account. Pick an existing ` +
+            `database (or "+ Create new") in the setup page and deploy again.`
         );
+      } else if (byFileId) {
+        const owner = await ownerOfD1(byFileId.id);
+        if (owner && owner.script) {
+          conflicts.push(
+            `the database selected in the setup page ("${byFileId.name}") is already used by the worker "${owner.script}". ` +
+              `Binding it would mix two deployments' mail — choose "+ Create new" instead.`
+          );
+        } else {
+          toml = upsertSection(toml, '[[d1_databases]]', { binding: 'DB', database_name: byFileId.name, database_id: byFileId.id });
+          notes.push(
+            isFresh(byFileId.created)
+              ? `using D1 ${byFileId.name} (created for this deployment)`
+              : `using D1 ${byFileId.name} (selected in the setup page; not used by any other worker)`
+          );
+        }
+      } else if (boundDbId && listed.list.some((d) => d.id === boundDbId)) {
+        const bound = listed.list.find((d) => d.id === boundDbId);
+        toml = upsertSection(toml, '[[d1_databases]]', { binding: 'DB', database_name: bound.name, database_id: bound.id });
+        notes.push(`keeping the D1 database this worker is bound to: ${bound.name}`);
       } else {
-        const created = await api.createD1(target);
-        if (created.error) conflicts.push(`could not create D1 "${target}": ${created.error}`);
-        else {
-          toml = setValue(toml, '[[d1_databases]]', 'database_name', created.name || target);
-          toml = setValue(toml, '[[d1_databases]]', 'database_id', created.id);
-          notes.push(`created D1 ${created.name || target} (${created.id})`);
+        const target = derived.db;
+        const existing = listed.list.find((d) => d.name === target);
+        const owner = existing ? await ownerOfD1(existing.id) : null;
+        if (existing && owner && owner.script) {
+          conflicts.push(`D1 "${target}" already exists and belongs to "${owner.script}". Rename the project (resource names follow it) or delete that database.`);
+        } else {
+          const created = existing
+            ? { id: existing.id, name: existing.name }
+            : await api.createD1(target);
+          if (created.error) conflicts.push(`could not create D1 "${target}": ${created.error}`);
+          else {
+            toml = upsertSection(toml, '[[d1_databases]]', { binding: 'DB', database_name: created.name || target, database_id: created.id });
+            notes.push(existing ? `reusing unused D1 ${target}` : `created D1 ${created.name || target} (${created.id})`);
+          }
         }
       }
     }
@@ -234,29 +294,35 @@ async function resolveResources(toml, api, opts = {}) {
   if (api) {
     const listed = await api.listR2();
     if (listed.error) {
-      notes.push(`could not list R2 buckets (${listed.error}); leaving the name in wrangler.toml untouched`);
+      notes.push(`could not list R2 buckets (${listed.error}); leaving the binding untouched`);
     } else {
-      const bound = boundBucket ? listed.list.find((b) => b.name === boundBucket) : null;
-      const target = bucketName || (bound ? bound.name : derived.bucket);
-      const existing = listed.list.find((b) => b.name === target);
+      const target = bucketName || boundBucket || derived.bucket;
+      const picked = listed.list.find((b) => b.name === target);
 
-      if (bound) {
-        toml = setValue(toml, '[[r2_buckets]]', 'bucket_name', bound.name);
-        notes.push(`keeping the R2 bucket this worker is bound to: ${bound.name}`);
-      } else if (existing && isFresh(existing.created)) {
-        toml = setValue(toml, '[[r2_buckets]]', 'bucket_name', existing.name);
-        notes.push(`using R2 bucket ${existing.name} (provisioned for this deployment)`);
-      } else if (existing) {
-        conflicts.push(
-          `R2 bucket "${target}" already exists and is not this worker's. Rename your project (the resource names follow ` +
-            `it) or delete that bucket — binding it would mix two deployments' mail and attachments.`
-        );
+      if (picked) {
+        const owner = await ownerOfBucket(picked.name);
+        if (owner && owner.script) {
+          conflicts.push(
+            `the R2 bucket selected in the setup page ("${picked.name}") is already used by the worker "${owner.script}". ` +
+              `Binding it would mix two deployments' attachments — choose "+ Create new" instead.`
+          );
+        } else {
+          toml = upsertSection(toml, '[[r2_buckets]]', { binding: 'BUCKET', bucket_name: picked.name });
+          notes.push(
+            isFresh(picked.created)
+              ? `using R2 bucket ${picked.name} (created for this deployment)`
+              : `using R2 bucket ${picked.name} (selected in the setup page; not used by any other worker)`
+          );
+        }
       } else {
-        const created = await api.createR2(target);
-        if (created.error) conflicts.push(`could not create R2 bucket "${target}": ${created.error}`);
+        // Nothing by that name exists. A still-default name is only a placeholder, so create the project-derived bucket;
+        // an explicit name (typed in the setup page) is created as asked.
+        const createName = !bucketName || bucketName === TEMPLATE_BUCKET ? derived.bucket : bucketName;
+        const created = await api.createR2(createName);
+        if (created.error) conflicts.push(`could not create R2 bucket "${createName}": ${created.error}`);
         else {
-          toml = setValue(toml, '[[r2_buckets]]', 'bucket_name', target);
-          notes.push(`created R2 bucket ${target}`);
+          toml = upsertSection(toml, '[[r2_buckets]]', { binding: 'BUCKET', bucket_name: createName });
+          notes.push(`created R2 bucket ${createName}`);
         }
       }
     }
@@ -297,7 +363,7 @@ async function main() {
   return 0;
 }
 
-module.exports = { readValue, setValue, workerName, sanitizeName, derivedNames, isFresh, resolveResources, makeApi, main };
+module.exports = { readValue, setValue, upsertSection, workerName, sanitizeName, derivedNames, isFresh, resolveResources, makeApi, main };
 
 if (require.main === module) {
   main()

@@ -1,11 +1,13 @@
 # Template config for the "Deploy to Cloudflare button".
 #
-# The button clones this repo into your GitHub account and then runs `npm run deploy`. That command first runs
-# scripts/predeploy.js, which makes sure the D1 / R2 names below cannot be silently *shared* with another deployment in
-# the same account. The generated D1 id is written back into the cloned repository on cloud deploy.
+# The button clones this repo into your GitHub account, then builds it with `npm run deploy`. That command first runs
+# scripts/predeploy.js, which makes the deploy safe: the setup page lets you **pick an existing D1 / R2 or create a new
+# one** (the "+ Create new" entry), and this file is where that choice is written back (database name + id). The guard
+# refuses to bind a resource that another worker already uses, so a second deployment can never write into the first
+# one's mail — and it fills in sensible defaults when the page left the placeholder behind.
 #
-# For your own production deployment use wrangler.local.toml (see the README "self-hosting" section); do not put your
-# real ids in this file.
+# For your own production deployment use wrangler.local.toml (see the README "self-hosting" section); for local
+# development use wrangler.dev.toml (`npm run dev`). Do not put real ids in this file.
 name = "resend-mail-api"
 main = "src/index.ts"
 compatibility_date = "2024-12-01"
@@ -17,16 +19,15 @@ compatibility_date = "2024-12-01"
 workers_dev = true
 preview_urls = false
 
-# D1: `database_id` is the placeholder the Deploy Button fills in; `database_name` is only a label (the binding uses the
-# id). scripts/predeploy.js rewrites both so they follow **your project name**: "<project>-db", "<project>-bucket".
-# That is the only input the Deploy Button reliably passes on, so the resource names are derived from it rather than
-# from the (ignored) resource-name fields of its setup page. A name you type here explicitly is honoured as an override.
+# D1: `database_id` is what actually binds (the name is a label). The Deploy Button fills both in from the setup page.
+# Left as the placeholder, the guard keeps the database this worker is already bound to, or creates "<project>-db".
 # The schema for a brand-new empty database is created automatically on the Worker's first request (no migrations needed).
 [[d1_databases]]
 binding = "DB"
 database_name = "resend-webhooks-db"
 database_id = "<DATABASE_ID>"
 
+# R2 has no id: the bucket name is the identity, so renaming it means a different (empty) bucket.
 [[r2_buckets]]
 binding = "BUCKET"
 bucket_name = "resend-mail-attachments"
@@ -68,4 +69,3 @@ crons = ["*/15 * * * *"]
 
 [dev]
 port = 8787
-

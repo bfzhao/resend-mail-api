@@ -5,15 +5,15 @@
   "private": true,
   "type": "commonjs",
   "scripts": {
-    "dev": "wrangler dev",
+    "dev": "wrangler dev -c wrangler.dev.toml",
     "deploy": "node scripts/predeploy.js && wrangler deploy",
     "predeploy": "node scripts/predeploy.js",
     "typecheck": "tsc --noEmit",
     "schema:sync": "node scripts/sync-schema.js",
-    "db:migrate": "wrangler d1 execute resend-webhooks-db --file=./schema.sql --remote",
-    "db:migrate:local": "wrangler d1 execute resend-webhooks-db --file=./schema.sql --local",
-    "db:migrate:up": "wrangler d1 execute resend-webhooks-db --file=./migrations/001_thread_mailbox.sql --remote",
-    "db:migrate:up:local": "wrangler d1 execute resend-webhooks-db --file=./migrations/001_thread_mailbox.sql --local"
+    "db:migrate": "wrangler d1 execute resend-webhooks-db -c wrangler.local.toml --file=./schema.sql --remote",
+    "db:migrate:local": "wrangler d1 execute resend-mail-local -c wrangler.dev.toml --file=./schema.sql --local",
+    "db:migrate:up": "wrangler d1 execute resend-webhooks-db -c wrangler.local.toml --file=./migrations/001_thread_mailbox.sql --remote",
+    "db:migrate:up:local": "wrangler d1 execute resend-mail-local -c wrangler.dev.toml --file=./migrations/001_thread_mailbox.sql --local"
   },
   "keywords": [
     "cloudflare",
