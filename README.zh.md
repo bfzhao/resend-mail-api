@@ -35,7 +35,9 @@
      - **需手动补 1 项**：`Zone → Email Routing Rules → Edit`（Cloudflare 目前不允许用链接预选这一项，向导里会提示点「+ Add more」补上）
      - `Zone Resources` 默认 All zones，可改成 `Include → 你的域名` 只授权这一个域
 
-     若 Token 缺某项权限，向导那一步会直接报「该操作需要 Token 具备 xxx 权限」，不用猜。
+     按钮在**填了域名之后才会激活**；若该域名的 zone id 已知（这个域此前配置过），Token 页面打开时就**锁定到那个 zone**，否则按上面的提示在 `Zone Resources` 里选 `Include → 你的域名`。
+
+若 Token 缺某项权限，向导那一步会直接报「该操作需要 Token 具备 xxx 权限」，不用猜。
      点「开始配置」后自动完成：找 zone → 开启 Email Routing 并把 catch-all 指向本 Worker → 在 Resend 建发送域名 → 把 DKIM/SPF/DMARC 写进你的 DNS → 触发 Resend 校验。
 3. 完成后即可收信、写信、回复。
 
@@ -49,9 +51,9 @@
 | Zone | Email Routing Rules → Edit |
 
 > Resend API Key 必须是 **Full access** 权限（「仅发送」的 Key 能发信，但建域 / 读域 / 触发验证都会被拒，Resend 会回 `This API key is restricted to only send emails`）。
-> ✅ **数据库是权威来源，而且每个域名有自己的一把 Resend Key**：Key **绑定在域名上**（`domains.resend_api_key`），唯一的兜底是环境变量 `RESEND_API_KEY` —— 特意**没有「数据库全局 Key」这一级**，因为一把 Key 不可能同时适配两个不同 Resend 账号下的域。所以**两个域分属不同 Resend 账号也能同时发信** —— 「控制台明明验证过了却报未验证」正是因为这个域落到了另一个账号的 Key 上。Key / 默认发件人在**域名按钮右上角状态点 → 修改该域专属 Key / 默认发件人** 里改，保存即生效、不用重新部署。
+> ✅ **数据库是权威来源，而且每个域名有自己的一把 Resend Key**：Key **绑定在域名上**（`domains.resend_api_key`），唯一的兜底是环境变量 `RESEND_API_KEY` —— 特意**没有「数据库全局 Key」这一级**，因为一把 Key 不可能同时适配两个不同 Resend 账号下的域。所以**两个域分属不同 Resend 账号也能同时发信** —— 「控制台明明验证过了却报未验证」正是因为这个域落到了另一个账号的 Key 上。每个域的 Key 可在站内直接改、不用重新部署：点域名后面的**状态标记**（**✓** 正常 · **?** 未检查 · **!** 有问题）→ **修改该域的发信 Key** → **保存并重新检查**。
 > 该 Cloudflare Token **只在配置时用一次，绝不保存**。
-> DNS 记录写入后可能有几分钟传播时间。每个域名按钮右上角都有一个**状态点**：蓝 **✓** 正常、灰 **?** 还没检查、红 **✕** 有问题。检查是**自动的**（页面加载时一次，之后最多每 30 分钟一次），用真正发信的 Key 查逐域 Resend 状态 + 用公共 DNS 验证 MX/DKIM/SPF/DMARC（不需要 Token）。点状态点可看明细、改发信 Key 与默认发件人。
+> DNS 记录写入后可能有几分钟传播时间。每个域名按钮在两处显示状态：**域名后面的状态标记** —— 蓝 **✓** 正常、灰 **?** 还没检查、红 **!** 有问题；以及**按钮右上角的未读数**（超过 99 显示 `99+`，为 0 时隐藏）。检查是**自动的**（页面加载时一次，之后最多每 30 分钟一次），用真正发信的 Key 查逐域 Resend 状态 + 用公共 DNS 验证 MX/DKIM/SPF/DMARC（不需要 Token）。点状态标记可看该域的明细表格与 Key 设置。
 
 ---
 
@@ -73,7 +75,7 @@ npm run dev            # http://localhost:8787
 ```
 
 > `.dev.vars` 里的 `RESEND_API_KEY` / `SEND_FROM_ADDRESS` 只作**首次兜底**：首次请求会被导入本地 D1，之后以数据库为准
-> （从域名按钮的状态点进去改发信 Key）。`API_USERNAME` / `API_PASSWORD` 仍然只走环境变量。
+> （从域名按钮的状态标记进去改发信 Key）。`API_USERNAME` / `API_PASSWORD` 仍然只走环境变量。
 
 自部署到自己的 Cloudflare 账号时，用**本地配置文件**（已被 `.gitignore` 忽略，不会公开）：
 
@@ -149,7 +151,7 @@ wrangler.local.toml 自部署配置（gitignored）
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/health` | 健康检查 |
-| GET/POST | `/api/setup/status` `/api/setup/admin` `/api/setup/domain` `/api/setup/check` | 安装向导 / 自检（自检 = 用发信 Key 查每域的 Resend 状态 + 公共 DNS 记录；前端每 30 分钟自动调用，结果显示为域名按钮右上角状态点） |
+| GET/POST | `/api/setup/status` `/api/setup/admin` `/api/setup/domain` `/api/setup/check` | 安装向导 / 自检（自检 = 用发信 Key 查每域的 Resend 状态 + 公共 DNS 记录；前端每 30 分钟自动调用，结果显示为域名后面的状态标记） |
 | POST | `/api/login` `/api/logout` | 会话登录 / 登出 |
 | POST | `/webhook/inbound` | Resend Inbound 收信（可选，签名校验 + 幂等） |
 | POST | `/webhook/events` | Resend 发送回执（可选，更新已发送状态） |
@@ -178,41 +180,49 @@ wrangler.local.toml 自部署配置（gitignored）
 
 这条错误来自**发信用的那把 API Key**，不是 DNS：这把 Key 用不了那个域。常见原因按可能性排序：
 
-1. **不是同一个 Team / 账号** —— 服务这个域的 Key 属于 A 团队，你看的控制台是 B 团队。每个域优先用**它自己的** Key（`domains.resend_api_key`），没有才退回全局 Key；所以两个域在不同 Resend 账号时，各配一把即可：**状态点 → 修改该域专属 Key**。
+1. **不是同一个 Team / 账号** —— 服务这个域的 Key 属于 A 团队，你看的控制台是 B 团队。每个域只用**它自己绑定的** Key（`domains.resend_api_key`，兜底只有环境变量 `RESEND_API_KEY`，没有「数据库全局 Key」这一级）；所以两个域在不同 Resend 账号时，各配一把即可：**状态标记 → 修改该域的 Key**。
 2. **Key 被限制在别的域名上** —— `Sending access` 的 Key 如果选了某个域名，就只能从那个域发。
 3. **子域 ≠ 根域** —— 验证了 `mail.example.com` 不代表能用 `@example.com` 发（反之亦然）。
-4. **服务这个域的 Key 不是你以为的那把** —— 比如它没有专属 Key，落到了旧的全局 Key 上。自检面板里 `发信 Key · <域名>` 一行会写明来源（域名绑定 / 环境变量）。
+4. **服务这个域的 Key 不是你以为的那把** —— 比如环境变量里还留着一把旧 Key。自检面板里 `Sending key · <域名>` 一行会写明来源（域名绑定 / 环境变量兜底）并给出掩码后的 Key。
 
-一个地方全查：点域名按钮右上角的**状态点**（它也会自动刷新，最多每 30 分钟一次；等价接口 `GET /api/setup/check`）。它会用**真正发信的那把 Key** 调
-`GET https://api.resend.com/domains`，并对每个已配置域名显示：
+一个地方全查：点域名后面的**状态标记**（它也会自动刷新，最多每 30 分钟一次；等价接口 `GET /api/setup/check`）。面板**只描述当前这个域**，并分成两张表 —— *发信（Resend）* 与 *收信（Cloudflare Email Routing）* —— 用**真正发信的那把 Key** 调 `GET https://api.resend.com/domains`：
 
-| 自检行 | 含义 |
+| 发信（Resend）表格行 | 含义 |
 |---|---|
-| `Resend · <域名>` ✓ 已验证 | 这把 Key 可以用该域发信 |
-| `Resend · <域名>` ✕ 看不到 | 这把 Key 看不到该域 → Team 不对或 Key 被限制到别的域名（与 DNS 无关） |
-| `Resend · <域名>` ✕ 状态不是 verified | Resend 侧确实还没验证完 —— 等 DNS 生效后刷新 |
-| `发信 Key` 出现 `!` | 环境变量里还留着**另一把** Key（已不生效，数据库优先）—— 建议删掉避免混淆 |
+| `Sending key` ✓ 域名绑定 | 该域用自己绑定的 Key（`re_***`）—— 两个域分属不同 Resend 账号时就该是这样 |
+| `Sending key` ✓ 环境变量兜底 | 该域没绑 Key，用的是环境变量 `RESEND_API_KEY`；在表格下方给它绑一把就独立了 |
+| `Sending key` ✕ | 完全没有可用 Key → 该域发不了信（在下方给它绑一把） |
+| `Resend` ✓ 已验证 | 这把 Key 可以用该域发信 |
+| `Resend` ✕ 看不到 | 这把 Key 看不到该域 → Team 不对或 Key 被限制到别的域名（与 DNS 无关） |
+| `Resend` ✕ 状态不是 verified | Resend 侧确实还没验证完 —— 等 DNS 生效后重新检查 |
+| `Sending MX` / `DKIM` / `SPF` | Resend 的发信记录（`send.<域名>` 的 MX + TXT、`resend._domainkey`） |
+| `DMARC` `!` | 只是建议项 —— 缺 `_dmarc` 永远不会把状态标记变红 |
 
-发现 Key 不对？就地改：**状态点 → 修改发信 Key / 默认发件人 → 保存并重新检查**。新 Key 会**先拿去 Resend 校验**再入库
-（打错字不会顶掉正在用的 Key），保存后自动重跑检查。等价的 HTTP 接口：`POST /api/settings/send {domain, resend_key?, from_address?, from_name?}`。
+| 收信（Cloudflare Email Routing）表格行 | 含义 |
+|---|---|
+| `Receiving MX` | `mx.cloudflare.net` 记录 —— 收信必需 |
+
+发现 Key 不对？就地改：**状态标记 → 修改该域的 Key → 保存并重新检查**。新 Key 会**先拿去 Resend 校验**再入库
+（打错字不会顶掉正在用的 Key），保存后自动重跑检查。等价的 HTTP 接口：`POST /api/settings/send {domain, resend_key}` —— Key 必须带 `domain`；`from_address` / `from_name` 仍可设置**全局默认发件人**（给 API 调用方用），但界面不再询问，发件人是写信时选择的。
 
 ### `This API key is restricted to only send emails`
 
 这把 Key 是「仅发送」权限。建域 / 读域 / 触发验证都需要 **Full access** 的 Key（Resend → API Keys）。
-换成 Full access 后重新走一次站内 **＋ 域名** 流程（或等下一次自动检查 / 点状态点确认新 Key 能看到哪些域）。
+换成 Full access 后重新走一次站内 **＋ 域名** 流程（或等下一次自动检查 / 点状态标记确认新 Key 能看到哪些域）。
 
 ### 收不到信
 
-状态点面板里 `收信 MX · <域名>` 必须是 `mx.cloudflare.net`。没有的话说明该 zone 没开 Email Routing（重跑向导，或在 Cloudflare 控制台开启）。
+状态面板的**收信**表格里**收信**表格的 `Receiving MX` 必须是 `mx.cloudflare.net`。没有的话说明该 zone 没开 Email Routing（重跑向导，或在 Cloudflare 控制台开启）。
 
 ## 已知限制
 
 - Cloudflare Email Routing 入站上限 25 MiB（超限会被拒），实际可收附件约 18–19 MB。
 - 列表按单封平铺（会话聚合在详情内；**发件箱不做聚合**，每封一行）。草稿是全局列表，不受「全部邮箱 / 域名」筛选影响。
-- 每个域名有自己的颜色（域名按钮上的圆点，以及该域发出/收到的邮件底色与左侧色条），颜色由域名计算得出、无需配置。
+- 每个域名有自己的颜色（固定 8 色调色板）：**域名按钮的背景**就是该颜色（未勾选浅色、勾选实色），该域发出/收到的邮件行也用同一色系的底色与左侧色条；无需配置。
+- 域名按钮是**筛选器**，不是「全选」：一个都不勾选时列表为空（空状态会说明），不再等价于显示全部。
 - 回复不引用内嵌图片，仅普通文本引用。
 - 仅单管理员账号。
-- 界面为**中英文双语**：顶栏右上角 `EN / 中文` 一键切换，选择记在浏览器（localStorage）。只翻译界面元素，**邮件内容（主题、发件人、正文、附件名）永远原样显示**；服务端返回的诊断错误信息仍是中文。
+- 界面为**中英文双语**：顶栏的语言按钮一键切换（中文界面显示 `EN`，英文界面显示 `中文`），选择记在浏览器（localStorage）。只翻译界面元素，**邮件内容（主题、发件人、正文、附件名）永远原样显示**；服务端返回的诊断错误信息仍是中文。
 
 ## License
 

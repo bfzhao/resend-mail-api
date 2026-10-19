@@ -38,6 +38,8 @@ The wizard's **"Open the Cloudflare authorisation page"** button opens Cloudflar
 - **One manual click**: `Zone → Email Routing Rules → Edit` (Cloudflare does not allow pre-selecting this one from a link; the wizard tells you to use "+ Add more")
 - `Zone Resources` defaults to All zones — change it to `Include → your domain` to authorise just that zone
 
+The button stays **disabled until a domain is typed**; when the app already knows that domain's zone id (a domain it is already configured for), the token page opens **scoped to that exact zone** — otherwise use `Zone Resources → Include → <your domain>`.
+
 If the token lacks a permission, the wizard step says "this operation needs the xxx permission" instead of failing silently.
 
 **Cloudflare API Token permissions** (zone-level, four in total):
@@ -50,9 +52,9 @@ If the token lacks a permission, the wizard step says "this operation needs the 
 | Zone | Email Routing Rules → Edit |
 
 > The Resend API Key must have **Full access** (a sending-only key can send, but cannot create / read / verify domains — Resend answers `This API key is restricted to only send emails`).
-> ✅ **The database is the source of truth, and every domain has its own Resend key.** A key is **bound to a domain** (`domains.resend_api_key`) with env `RESEND_API_KEY` as the only fallback — there is deliberately **no global database key**, because one key can never be right for two domains in different Resend accounts. That is why two domains in **different Resend accounts** both work (that is why "same domain, verified in my dashboard" can still fail: the key used to send belonged to the other account). Keys / default senders are editable in-app from a domain chip's health badge (**✓ / ? / 红色 ! → 修改该域专属 Key / 默认发件人**); changes take effect immediately, no redeploy. Env vars (`RESEND_API_KEY` / `SEND_FROM_ADDRESS`) are only a **bootstrap fallback** — a purely env-configured deployment is imported into D1 once on first request, after which the env vars can be deleted (one env key / one sender is simply not enough for several domains, and an env key silently shadowing the saved one looked exactly like "Resend shows the domain verified, but sending says it is not").
+> ✅ **The database is the source of truth, and every domain has its own Resend key.** A key is **bound to a domain** (`domains.resend_api_key`) with env `RESEND_API_KEY` as the only fallback — there is deliberately **no global database key**, because one key can never be right for two domains in different Resend accounts. That is why two domains in **different Resend accounts** both work (that is why "same domain, verified in my dashboard" can still fail: the key used to send belonged to the other account). The key of a domain is editable in-app, no redeploy: click the **health marker** after the domain name (**✓** = check passed · **?** = not checked yet · **!** = problem) → **Edit the sending key for <domain>** → **Save and re-check**. Env vars (`RESEND_API_KEY` / `SEND_FROM_ADDRESS`) are only a **bootstrap fallback** — a purely env-configured deployment is imported into D1 once on first request, after which the env vars can be deleted (one env key / one sender is simply not enough for several domains, and an env key silently shadowing the saved one looked exactly like "Resend shows the domain verified, but sending says it is not").
 > The Cloudflare token is **used once during setup and never stored**.
-> DNS changes can take a few minutes to propagate. Every domain chip carries a **health badge** at its top-right corner: blue **✓** = the check passed, gray **?** = not checked yet, red **✕** = something is wrong. The check runs **by itself** (on page load, then at most every 30 minutes) and verifies — with the key that actually sends — the Resend status per domain plus MX/DKIM/SPF/DMARC via public DNS (no token needed). Click the badge for the detail list and the key/sender settings.
+> DNS changes can take a few minutes to propagate. Each domain chip reports its state in two places: the **health marker right after the domain name** (blue **✓** = the check passed, gray **?** = not checked yet, red **!** = something is wrong) and the **unread count** in the chip's top-right corner (`99+` above 99, hidden at zero). The check runs **by itself** (on page load, then at most every 30 minutes) and verifies, with the key that actually sends, the Resend status per domain plus MX/DKIM/SPF/DMARC via public DNS (no token needed). Click the health marker for that domain's detail tables and its key settings.
 
 ---
 
@@ -74,7 +76,7 @@ npm run dev            # http://localhost:8787
 ```
 
 > `RESEND_API_KEY` / `SEND_FROM_ADDRESS` in `.dev.vars` are **bootstrap only**: they are imported into the local D1 on the
-> first request, after which D1 wins (edit them in-app from the domain chip badge → 修改发信 Key). `API_USERNAME` / `API_PASSWORD` stay env-only.
+> first request, after which D1 wins (edit them in-app from the domain chip: health marker → Edit the sending key). `API_USERNAME` / `API_PASSWORD` stay env-only.
 
 To self-host on your own Cloudflare account, use the **local config file** (gitignored, never made public):
 
@@ -179,43 +181,52 @@ wrangler.local.toml self-host config (gitignored)
 
 That error comes from the **API key used for sending**, not from DNS: the key cannot use that domain. The usual causes, in order:
 
-1. **Different Team / account** — the key that serves this domain belongs to another Resend team than the dashboard you are looking at. Domains send with **their own** key (`domains.resend_api_key`) and fall back to the global one, so two domains in two Resend accounts each need their own key: **badge → 修改该域专属 Key**.
+1. **Different Team / account** — the key that serves this domain belongs to another Resend team than the dashboard you are looking at. A domain sends with **its own** key (`domains.resend_api_key`, falling back only to env `RESEND_API_KEY`), so two domains in two Resend accounts each need their own key: **health marker → Edit the sending key**.
 2. **Domain-restricted sending key** — a `Sending access` key limited to another domain may only send from that domain.
 3. **Subdomain ≠ root domain** — verifying `mail.example.com` does not allow sending from `@example.com` (and vice versa).
-4. **A stale copy is still around** — the key served for this domain is not the one you think (e.g. an old global key). The health panel reports the source per domain (`发信 Key · <domain>`: 域名绑定 / 环境变量), so you can see exactly which key is used.
+4. **A stale copy is still around** — the key used for this domain is not the one you think (for example an env var that still holds the old key). The health panel names the source per domain (`Sending key · <domain>`: bound to domain / environment fallback, plus the masked key), so you can see exactly which key is in play.
 
-Check all of it in one place: click the **health badge** at the top-right of a domain chip (it also refreshes automatically, at most every 30 minutes), or call `GET /api/setup/check` directly. It queries
-`GET https://api.resend.com/domains` **with the key that actually sends** and prints, for each configured domain:
+Check all of it in one place: click the **health marker** after a domain's name (it also refreshes automatically, at most every 30 minutes), or call `GET /api/setup/check` directly. The panel describes **one domain only**, split into two tables — *Sending (Resend)* and *Receiving (Cloudflare Email Routing)* — and it queries `GET https://api.resend.com/domains` **with the key that actually sends**:
 
-| Self-check row | Meaning |
+| Sending (Resend) table row | Meaning |
 |---|---|
-| `Resend · <domain>` ✓ verified | this key can send from it |
-| `Resend · <domain>` ✕ not listed | the key cannot see the domain → wrong Team or a restricted key (DNS is irrelevant) |
-| `Resend · <domain>` ✕ status ≠ verified | the domain really is still pending in Resend — wait for DNS, then refresh |
-| `发信 Key` `!` (warning) | an env var still holds a *different* key; it is ignored (D1 wins) — delete it to avoid confusion |
+| `Sending key` ✓ bound to domain | this domain uses its own key (`re_***`) — what you want when two domains live in two Resend accounts |
+| `Sending key` ✓ environment fallback | no key is bound to this domain, so env `RESEND_API_KEY` is used — bind a key to make it independent |
+| `Sending key` ✕ | no key at all → nothing can be sent from this domain (bind one right below the tables) |
+| `Resend` ✓ verified | this key can send from this domain |
+| `Resend` ✕ not listed | the key cannot see the domain → wrong Team or a restricted key (DNS is irrelevant) |
+| `Resend` ✕ status ≠ verified | the domain really is still pending in Resend — wait for DNS, then re-check |
+| `Sending MX` / `DKIM` / `SPF` | Resend sending records (`send.<domain>` MX + TXT, `resend._domainkey`) |
+| `DMARC` `!` | advisory only — a missing `_dmarc` never turns the health marker red |
 
-Found a wrong key? Fix it right there: **badge → 修改发信 Key / 默认发件人 → 保存并重新检查**. The new key is verified
+| Receiving (Cloudflare Email Routing) table row | Meaning |
+|---|---|
+| `Receiving MX` | `mx.cloudflare.net` records — required for inbound mail |
+
+Found a wrong key? Fix it right there: **health marker → Edit the sending key for <domain> → Save and re-check**. The new key is verified
 against Resend *before* it is stored (a typo never replaces a working key), and the panel re-runs immediately. Same thing over
-HTTP: `POST /api/settings/send {domain, resend_key?, from_address?, from_name?}`.
+HTTP: `POST /api/settings/send {domain, resend_key}` — a key always needs `domain`; `from_address` / `from_name` still set the
+**global default sender** for API callers, but the UI no longer asks for them because the sender is chosen when you compose.
 
 ### `This API key is restricted to only send emails`
 
 The key is `Sending access`. Creating / reading / verifying domains needs a **Full access** key (Resend → API Keys). After
-that, run the in-app **＋ 域名** flow again (or wait for the next automatic check / click the badge to confirm the new key can see the domains).
+that, run the in-app **＋ Domain** flow again (or wait for the next automatic check / click the health marker to confirm the new key can see the domains).
 
 ### Mail is not arriving
 
-the badge panel → `收信 MX · <domain>` must show a `mx.cloudflare.net` record. If it is missing, Email Routing is not enabled for
+In the health panel's **Receiving** table → `Receiving MX` must show a `mx.cloudflare.net` record. If it is missing, Email Routing is not enabled for
 that zone (re-run the wizard, or enable it in the Cloudflare dashboard).
 
 ## Known limitations
 
 - Cloudflare Email Routing enforces a 25 MiB inbound limit (larger mail is rejected), so practical attachment size is ~18–19 MB.
 - The list is flat per message (thread aggregation lives inside the detail view; **the Sent folder is never grouped** — one row per message). Drafts are a global list, never narrowed by the "all mailboxes / domain" filters.
-- Every domain has its own colour (a dot on its chip, plus the tint and left bar of mail sent from / received at it); the colour is derived from the domain name, so there is nothing to configure.
+- Every domain has its own colour from a fixed eight-colour palette: the **chip background** carries it (light while the filter is off, solid while it is on) and the same hue tints the rows of mail sent from / received at that domain. Nothing to configure.
+- The domain chips are a **filter**, not a shortcut: with no domain ticked the list is empty (the empty state says so); ticking none never means "all domains".
 - Replies don't quote inline images, only plain-text quoting.
 - Single admin account only.
-- The UI is **bilingual (Chinese / English)**: one click on `EN / 中文` in the top-right switches language and the choice is remembered in the browser (localStorage). Only interface elements are translated — **mail content (subject, sender, body, attachment names) is always shown verbatim**; server-side diagnostic errors stay in Chinese.
+- The UI is **bilingual**: one click on the language toggle in the top bar switches between Chinese and English and the choice is remembered in the browser (localStorage). Only interface elements are translated — **mail content (subject, sender, body, attachment names) is always shown verbatim**; server-side diagnostic errors stay in Chinese.
 
 ## License
 
