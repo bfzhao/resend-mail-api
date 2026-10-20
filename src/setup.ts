@@ -519,33 +519,6 @@ export async function deleteDomainAndCleanup(
   return { ok: steps.every((s) => s.ok || s.warn), steps };
 }
 
-/** Remove every domain + the domain-scoped config (the admin account and session secret are kept). */
-export async function resetConfiguration(
-  env: Env,
-  input: { confirm?: unknown; purgeMessages?: unknown }
-): Promise<{ ok: boolean; steps: StepResult[]; error?: string }> {
-  if (input.confirm !== 'reset') return { ok: false, steps: [], error: '请确认（confirm: "reset"）' };
-  const steps: StepResult[] = [];
-  const rows = await repo.listDomains(env).catch(() => [] as repo.DomainRow[]);
-  if (input.purgeMessages === true) {
-    let messages = 0;
-    let objects = 0;
-    for (const r of rows) {
-      const purged = await repo.purgeDomainData(env, r.domain).catch(() => null);
-      if (purged) {
-        messages += purged.messages;
-        objects += purged.objects;
-      }
-    }
-    steps.push({ name: '邮件数据', ok: true, detail: `已删除 ${messages} 封邮件、${objects} 个 R2 对象` });
-  } else {
-    steps.push({ name: '邮件数据', ok: true, detail: '保留所有历史邮件（它们不再出现在任何域名下，但仍占存储）' });
-  }
-  const reset = await repo.resetConfig(env, { keepSession: true });
-  steps.push({ name: '配置', ok: true, detail: `已清空 ${reset.domains} 个域名与所有域名级配置（管理员账号保留）` });
-  return { ok: true, steps };
-}
-
 /* ---------------- Self-check ---------------- */
 
 interface DnsAnswer {

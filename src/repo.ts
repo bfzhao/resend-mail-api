@@ -108,6 +108,18 @@ function mailboxCond(mailbox: string): { sql: string; params: unknown[] } {
  * The domain filter as SQL. `undefined` = no filter at all (every domain), while an **empty list** (the caller passed
  * `''`, i.e. "no domain ticked in the UI") matches **no rows**: ticking nothing must show nothing, not everything.
  */
+/**
+ * Turn a user search term into a LIKE pattern that means **exactly what was typed**.
+ *
+ * Values are always bound, so this is not about injection: it is about `%` and `_` being wildcards. Typing `%` used to
+ * match every message, and `a_b` matched `axb` — a search for a literal underscore silently returned the wrong rows.
+ * The paired SQL must use `ESCAPE '\\'`.
+ */
+export function likePattern(term: string): string {
+  const escaped = String(term ?? '').replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
+  return `%${escaped}%`;
+}
+
 function domainCond(domain: string): { sql: string; params: unknown[] } {
   const list = String(domain)
     .split(',')
@@ -155,8 +167,8 @@ function whereForFolder(
     params.push(...c.params);
   }
   if (q) {
-    const like = `%${q}%`;
-    conds.push('(subject LIKE ? OR from_name LIKE ? OR from_email LIKE ? OR body_text LIKE ? OR to_emails LIKE ?)');
+    const like = likePattern(q);
+    conds.push("(subject LIKE ? ESCAPE '\\' OR from_name LIKE ? ESCAPE '\\' OR from_email LIKE ? ESCAPE '\\' OR body_text LIKE ? ESCAPE '\\' OR to_emails LIKE ? ESCAPE '\\')");
     params.push(like, like, like, like, like);
   }
   return { sql: conds.join(' AND '), params };
@@ -343,8 +355,8 @@ export async function listDrafts(
   const conds: string[] = [];
   const params: unknown[] = [];
   if (opts.q) {
-    const like = `%${opts.q}%`;
-    conds.push('(subject LIKE ? OR to_emails LIKE ? OR body_text LIKE ?)');
+    const like = likePattern(opts.q);
+    conds.push("(subject LIKE ? ESCAPE '\\' OR to_emails LIKE ? ESCAPE '\\' OR body_text LIKE ? ESCAPE '\\')");
     params.push(like, like, like);
   }
   const whereSql = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
@@ -709,6 +721,18 @@ export async function upsertDomain(env: Env, d: DomainInput): Promise<void> {
   }
 }
 
+/**
+ * Guard for the few places where an identifier (table / column) is interpolated into SQL instead of being bound.
+ * Values are always bound with `?`; identifiers cannot be, so they go through this check — anything that is not a plain
+ * SQLite identifier is rejected instead of reaching the statement. The names come from `sqlite_master` / `pragma_table_info`
+ * today, but the guard keeps a future refactor from piping a request value in here.
+ */
+export function sqlIdentifier(name: string): string {
+  const n = String(name || '');
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(n)) throw new Error(`unsafe SQL identifier: ${JSON.stringify(n)}`);
+  return `"${n}"`;
+}
+
 /** Drop one configured domain (the row only — messages are a separate decision, see purgeDomainData). */
 export async function deleteDomain(env: Env, domain: string): Promise<boolean> {
   const d = String(domain || '').trim().toLowerCase();
@@ -813,19 +837,6 @@ async function purgeRaws(env: Env, domain: string): Promise<{ raws: number; obje
     await env.DB.prepare(`DELETE FROM inbound_raw WHERE id IN (${ph})`).bind(...rows.map((r) => r.id)).run();
   }
   return { raws: rows.length, objects };
-}
-
-/** Delete every domain row and the domain-scoped config (installation state is kept unless asked otherwise). */
-export async function resetConfig(env: Env, opts: { keepSession?: boolean } = {}): Promise<{ domains: number }> {
-  const before = Number((await env.DB.prepare('SELECT COUNT(*) AS n FROM domains').first<{ n: number }>())?.n || 0);
-  await env.DB.prepare('DELETE FROM domains').run();
-  const keep = opts.keepSession === false ? [] : ['session_secret'];
-  if (keep.length) {
-    await env.DB.prepare(`DELETE FROM app_config WHERE key NOT IN (${keep.map(() => '?').join(', ')})`).bind(...keep).run();
-  } else {
-    await env.DB.prepare('DELETE FROM app_config').run();
-  }
-  return { domains: before };
 }
 
 export interface ContactRow {
@@ -1503,15 +1514,15 @@ async function estimateD1Bytes(env: Env): Promise<number> {
   ).all<{ name: string }>();
   let total = 0;
   for (const t of tables.results ?? []) {
-    const ident = t.name.replace(/"/g, '""');
+    const ident = sqlIdentifier(t.name);
     const cols = await env.DB.prepare(
       `SELECT name FROM pragma_table_info('${t.name.replace(/'/g, "''")}')
         WHERE type LIKE '%TEXT%' OR type LIKE '%BLOB%'`
     ).all<{ name: string }>();
     const names = (cols.results ?? []).map((c) => c.name);
     if (!names.length) continue;
-    const expr = names.map((n) => `LENGTH(CAST(COALESCE("${n.replace(/"/g, '""')}",'') AS BLOB))`).join(' + ');
-    const row = await env.DB.prepare(`SELECT COALESCE(SUM(${expr}), 0) AS b FROM "${ident}"`).first<{ b: number }>();
+    const expr = names.map((n) => `LENGTH(CAST(COALESCE(${sqlIdentifier(n)},'') AS BLOB))`).join(' + ');
+    const row = await env.DB.prepare(`SELECT COALESCE(SUM(${expr}), 0) AS b FROM ${ident}`).first<{ b: number }>();
     total += Number(row?.b || 0);
   }
   return total;

@@ -577,15 +577,6 @@ const RESEND_KEY = 're_totally_secret_key';
   ok(/已删除 1 封/.test(mailStep.detail || ''), '⭐ 勾选后历史邮件被删除', mailStep.detail);
   ok(!db.query("SELECT id FROM messages WHERE id='msg-gone2'").length, '邮件行已删除');
 
-  // 清空配置
-  let reset = await call('POST', '/api/setup/reset', { confirm: 'reset' }, cookie);
-  ok(reset.status === 200 && reset.json && reset.json.ok === true, '重置成功', reset.status);
-  ok(db.query('SELECT domain FROM domains').length === 0, '⭐ domains 表清空');
-  const cfgLeft = db.query('SELECT key FROM app_config ORDER BY key').map((r) => r.key).join(',');
-  ok(cfgLeft === 'session_secret', '⭐ app_config 只留 session_secret（管理员/登录不受影响）', cfgLeft);
-  const after = await call('GET', '/api/setup/status', undefined, cookie);
-  ok(after.json && after.json.authenticated === true, '重置后当前会话仍然有效', JSON.stringify(after.json && after.json.authenticated));
-
   // 显式 false 仍然可以保留（API 兼容 / 特殊场景）
   db.run("INSERT INTO domains (domain, zone_id, resend_domain_id, resend_api_key, from_address, from_name, worker_name, enabled, created_at, updated_at) VALUES ('keep.com','zone-1','dom-keep','re_keep_key','hi@keep.com','', 'resend-mail-api', 1, 1792000020, 1792000020)");
   db.run("INSERT INTO messages (id, direction, mailbox, mailbox_domain, from_email, to_emails, subject, received_at, status, read, starred, deleted, created_at, updated_at) VALUES ('msg-keep','inbound','hi@keep.com','keep.com','a@b.com','[\"hi@keep.com\"]','keep',1792000021,'received',0,0,0,1792000021,1792000021)");
@@ -594,6 +585,9 @@ const RESEND_KEY = 're_totally_secret_key';
   ok(db.query("SELECT id FROM messages WHERE id='msg-keep'").length === 1, '⭐ 显式 purge_messages:false 会保留邮件', 'kept');
   ok(!db.query("SELECT domain FROM domains WHERE domain='keep.com'").length, '但域名行仍然删掉了',
     JSON.stringify(db.query('SELECT domain FROM domains').map((r) => r.domain)));
+
+  const noReset = await call('POST', '/api/setup/reset', { confirm: 'reset' }, cookie);
+  ok(noReset.status === 404, '⭐ /api/setup/reset 已移除（只支持按域删除）', noReset.status);
 
   console.log(`\n===== 结果: ${pass} passed, ${failures.length} failed =====`);
   if (failures.length) console.log(`失败项：\n- ${failures.join('\n- ')}`);
