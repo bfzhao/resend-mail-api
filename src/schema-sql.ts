@@ -126,6 +126,7 @@ CREATE TABLE IF NOT EXISTS domains (
     from_address     TEXT,
     from_name        TEXT,
     worker_name      TEXT,
+    app_host         TEXT,
     enabled          INTEGER NOT NULL DEFAULT 1,
     created_at       INTEGER NOT NULL,
     updated_at       INTEGER NOT NULL
