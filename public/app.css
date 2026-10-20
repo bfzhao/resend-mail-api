@@ -224,8 +224,9 @@ html, body {
   accent-color: var(--accent);
   cursor: pointer;
 }
+/* Selected = the filter is on. Only the border/text weight changes: a filled background made the ticked chip look like a
+   different colour from the domain's rows and detail header, which all use the domain colour. */
 .domain-chip.on {
-  background: var(--accent-weak);
   border-color: var(--accent);
   color: #0b57d0;
   font-weight: 600;
@@ -236,8 +237,8 @@ html, body {
    dot, the list rows (mail sent from / received at that domain) and the envelope card.
    Tints sit at 88–94% lightness so text stays legible; the saturated variant is only used for dots, bars and unread
    avatars. ---- */
-/* The domain colour **is** the chip background** (no extra dot): a light tint when unticked, the saturated colour when
-   ticked, with white text — the same hue the domain's mail rows use, so the chip and the rows read as the same domain. */
+/* The domain colour **is** the chip background** (no extra dot): always the same light tint, ticked or not, so the chip
+   keeps matching the domain's mail rows and detail header. Selection is shown by the checkbox and a darker border. */
 .domain-chip.has-dom-color {
   background: hsl(var(--dom-h, 214) var(--dom-s, 62%) 95%);
   border-color: hsl(var(--dom-h, 214) var(--dom-s, 62%) 80%);
@@ -245,12 +246,9 @@ html, body {
 }
 .domain-chip.has-dom-color:hover { border-color: hsl(var(--dom-h, 214) var(--dom-s, 62%) 48%); }
 .domain-chip.has-dom-color.on {
-  background: hsl(var(--dom-h, 214) var(--dom-s, 62%) 48%);
-  border-color: hsl(var(--dom-h, 214) var(--dom-s, 62%) 42%);
-  color: #fff;
+  /* Same background as the unticked chip — only the border gets stronger. */
+  border-color: hsl(var(--dom-h, 214) var(--dom-s, 62%) 45%);
 }
-.domain-chip.has-dom-color.on:hover { background: hsl(var(--dom-h, 214) var(--dom-s, 62%) 44%); }
-.domain-chip.has-dom-color.on input[type="checkbox"] { accent-color: #fff; }
 /* Domain self-check health badge: a tiny status dot at the chip's top-right corner.
    blue ✓ = the automatic check passed · gray ? = not checked yet · red **!** = a problem (an ✕ read as "close").
    It lives outside the <label>, so clicking it never ticks the filter checkbox. */
