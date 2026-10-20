@@ -5,6 +5,8 @@ Collect mail for your own domains into a **self-hosted** web inbox:
 - **Inbound**: Cloudflare Email Routing receives mail and **never loses mail**.
 - **Outbound**: send through [Resend](https://resend.com) (HTML + attachments supported).
 - **Web UI**: a simplified Gmail-style interface with read / unread / star / delete (trash) / compose / reply / multi-address switching / search.
+- **Multi-domain**: add as many domains as possible and process mails from them at single place
+- **Easy to Manage**: want to add a new account, just send a mail to it!
 
 All data lives in **your own** Cloudflare account (D1 / R2 / Queue), and the Resend key is stored in your own D1 — no secrets leave your account.
 
